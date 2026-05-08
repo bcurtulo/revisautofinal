@@ -1,0 +1,180 @@
+export const VEHICLE_COLORS = [
+  "Amarelo", "Azul", "Azul Marinho", "Bege", "Bordô", "Branco", "Bronze", "Cinza", "Cobre", "Dourado", 
+  "Laranja", "Marrom", "Prata", "Preto", "Rosa", "Roxo", "Verde", "Verde Escuro", "Verde Lima", "Vermelho", 
+  "Vinho", "Violeta", "Customizado", "Outra"
+];
+
+export const CAR_BRANDS = [
+  "Agrale", "Alfa Romeo", "Aston Martin", "Audi", "BMW", "BYD", "Bentley", "Bugatti", "Caoa Chery", "Chevrolet", 
+  "Chrysler", "Citroën", "Dodge", "Effa", "Ferrari", "Fiat", "Ford", "GWM", "Geely", "Honda", 
+  "Hyundai", "Iveco", "JAC", "Jaguar", "Jeep", "Kia", "Lamborghini", "Land Rover", "Lexus", "Lifan", 
+  "Mahindra", "Maserati", "McLaren", "Mercedes-Benz", "Mini", "Mitsubishi", "Nissan", "Outra", "Peugeot", "Porsche", 
+  "Ram", "Renault", "Rolls-Royce", "Shineray", "SsangYong", "Subaru", "Suzuki", "Toyota", "Troller", "Volkswagen", "Volvo"
+];
+
+export const MOTO_BRANDS = [
+  "Avelloz", "BMW", "Bajaj", "Bull", "Dafra", "Dayun", "Ducati", "Flash", "Fym", 
+  "Haojue", "Harley-Davidson", "Honda", "Iros", "Jonny", "KTM", "Kasinski", 
+  "Kawasaki", "Kymco", "Mottu", "MV Agusta", "Outra", "Piaggio", "Pro Tork", 
+  "Royal Enfield", "Shineray", "Sousa", "Sundown", "Super Soco", "Suzuki", "Traxx", "Triumph", 
+  "Voltz", "Watts", "Wuyang", "Yamaha", "Zontes"
+];
+
+export const EBIKE_BRANDS = [
+  "Audax", "Biobike", "Blitz", "Caloi", "Cannondale", "Draisiana", "Giant", "Groove", "Houston", "Lev", 
+  "Merida", "Monark", "Oggi", "Outra", "Pedalla", "Scott", "Sense", "Sousa", "Specialized", "TSW", "Trek", "Two Dogs", "Watts"
+];
+
+export const CAR_MODELS: Record<string, string[]> = {
+  "Agrale": ["Marruá"],
+  "Alfa Romeo": ["145", "147", "155", "156", "164", "166", "2300", "Giulia", "Giulietta", "Mito", "Spider", "Stelvio"],
+  "Aston Martin": ["DB11", "DB9", "DBS", "DBX", "Rapide", "V12 Vantage", "V8 Vantage", "Vanquish", "Virage"],
+  "Audi": ["A1", "A3", "A4", "A5", "A6", "A7", "A8", "e-tron", "e-tron GT", "Q3", "Q5", "Q7", "Q8", "R8", "RS3", "RS4", "RS5", "RS6", "RS7", "RSQ3", "RSQ8", "S3", "S4", "S5", "S6", "S7", "S8", "SQ5", "SQ7", "SQ8", "TT", "TTS"],
+  "BMW": ["116i", "118i", "120i", "125i", "130i", "135i", "218i", "220i", "225i", "316i", "318i", "320i", "323i", "325i", "328i", "330e", "330i", "335i", "420i", "428i", "430i", "528i", "530e", "530i", "535i", "540i", "550i", "745Le", "750i", "i3", "i4", "i7", "i8", "iX", "iX1", "iX3", "M135i", "M140i", "M2", "M235i", "M240i", "M3", "M340i", "M4", "M440i", "M5", "M550i", "M6", "M8", "X1", "X2", "X3", "X4", "X5", "X6", "X7", "Z4"],
+  "BYD": ["Dolphin", "Han", "Song Plus", "Tan", "Yuan Plus"],
+  "Bentley": ["Bentayga", "Continental GT", "Flying Spur"],
+  "Bugatti": ["Chiron", "Veyron"],
+  "Caoa Chery": ["Arrizo 5", "Arrizo 6", "iCar", "QQ", "Tiggo 2", "Tiggo 3x", "Tiggo 5x", "Tiggo 7", "Tiggo 8"],
+  "Chevrolet": ["Agile", "Astra", "Blazer", "Bolt", "Camaro", "Captiva", "Celta", "Chevette", "Classic", "Cobalt", "Corsa", "Corvette", "Cruze", "Equinox", "Kadett", "Malibu", "Meriva", "Montana", "Monza", "Omega", "Onix", "Onix Plus", "Opala", "Prisma", "S10", "Silverado", "Sonic", "Spin", "Tracker", "Trailblazer", "Vectra", "Zafira"],
+  "Chrysler": ["300C", "Caravan", "Grand Caravan", "PT Cruiser", "Town & Country"],
+  "Citroën": ["Aircross", "Berlingo", "C3", "C3 Aircross", "C3 Picasso", "C4", "C4 Cactus", "C4 Lounge", "C4 Pallas", "C4 Picasso", "C5", "DS3", "DS4", "DS5", "Grand C4 Picasso", "Jumper", "Xsara", "Xsara Picasso"],
+  "Dodge": ["Challenger", "Charger", "Dakota", "Durango", "Journey", "Ram"],
+  "Effa": ["K01", "K02", "M100", "Plutus", "V21", "V22", "V25"],
+  "Ferrari": ["296 GTB", "458 Italia", "488 GTB", "488 Spider", "812 Superfast", "California", "F12berlinetta", "F430", "F8 Spider", "F8 Tributo", "GTC4Lusso", "Portofino", "Roma", "SF90 Stradale"],
+  "Fiat": ["147", "500", "500e", "Argo", "Brava", "Bravo", "Cronos", "Doblo", "Ducato", "Elba", "Fastback", "Fiorino", "Freemont", "Grand Siena", "Idea", "Linea", "Marea", "Mobi", "Oggi", "Palio", "Palio Weekend", "Panorama", "Premio", "Pulse", "Punto", "Scudo", "Siena", "Stilo", "Strada", "Tempra", "Tipo", "Toro", "Uno"],
+  "Ford": ["Belina", "Bronco Sport", "Corcel", "Courier", "Del Rey", "EcoSport", "Edge", "Escort", "Explorer", "F-1000", "F-250", "Fiesta", "Focus", "Fusion", "Ka", "Maverick", "Mustang", "Pampa", "Ranger", "Territory", "Transit", "Verona", "Versailles"],
+  "GWM": ["Haval H6", "Ora 03"],
+  "Geely": ["EC7", "GC2"],
+  "Honda": ["Accord", "City", "Civic", "CR-V", "Fit", "HR-V", "WR-V", "ZR-V"],
+  "Hyundai": ["Azera", "Creta", "Elantra", "HB20", "HB20S", "HB20X", "HR", "i30", "i30 CW", "Ioniq 5", "IX35", "Kona", "Palisade", "Santa Fe", "Sonata", "Tucson", "Veloster", "Veracruz"],
+  "Iveco": ["Daily"],
+  "JAC": ["E-JS1", "E-JS4", "E-J7", "iEV20", "iEV40", "J2", "J3", "J3 Turin", "J5", "J6", "T40", "T5", "T50", "T6", "T60", "T8", "T80"],
+  "Jaguar": ["E-Pace", "F-Pace", "F-Type", "I-Pace", "XE", "XF", "XJ"],
+  "Jeep": ["Cherokee", "Commander", "Compass", "Gladiator", "Grand Cherokee", "Renegade", "Wrangler"],
+  "Kia": ["Bongo", "Cadenza", "Carens", "Carnival", "Cerato", "Mohave", "Niro", "Optima", "Picanto", "Sorento", "Soul", "Sportage", "Stonic"],
+  "Lamborghini": ["Aventador", "Huracán", "Urus"],
+  "Land Rover": ["Defender", "Discovery", "Discovery Sport", "Freelander 2", "Range Rover", "Range Rover Evoque", "Range Rover Sport", "Range Rover Velar"],
+  "Lexus": ["CT 200h", "ES 300h", "LS 500h", "NX 300", "NX 350h", "RX 450h", "UX 250h"],
+  "Lifan": ["320", "530", "620", "X60", "X80"],
+  "Mahindra": ["Scorpio"],
+  "Maserati": ["Ghibli", "GranCabrio", "GranTurismo", "Grecale", "Levante", "Quattroporte"],
+  "McLaren": ["540C", "570S", "720S", "Artura", "GT"],
+  "Mercedes-Benz": ["A 200", "A 250", "A 35 AMG", "A 45 AMG", "B 200", "C 180", "C 200", "C 250", "C 300", "C 43 AMG", "C 63 AMG", "CLA 180", "CLA 200", "CLA 250", "CLA 35 AMG", "CLA 45 AMG", "CLS 63 AMG", "E 250", "E 300", "E 63 AMG", "EQA", "EQB", "EQC", "EQE", "EQS", "G 63 AMG", "GLA 200", "GLA 250", "GLB 200", "GLC 220", "GLC 250", "GLC 300", "GLE 400", "GLE 53 AMG", "GLS 450", "S 500", "SL 63 AMG", "SLC 300", "Sprinter"],
+  "Mini": ["Cooper", "Cooper Countryman", "Cooper S", "Cooper S Cabrio", "Cooper S Clubman", "Cooper S Countryman", "Cooper SE", "John Cooper Works"],
+  "Mitsubishi": ["ASX", "Eclipse Cross", "L200 Outdoor", "L200 Savana", "L200 Triton", "Lancer", "Outlander", "Outlander Sport", "Pajero Dakar", "Pajero Full", "Pajero Sport", "Pajero TR4"],
+  "Nissan": ["Frontier", "Grand Livina", "Kicks", "Leaf", "Livina", "March", "Sentra", "Tiida", "Versa", "X-Trail"],
+  "Peugeot": ["2008", "206", "207", "208", "3008", "307", "308", "408", "5008", "Expert", "Hoggar", "Partner", "RCZ", "e-2008", "e-208"],
+  "Porsche": ["718 Boxster", "718 Cayman", "911", "Cayenne", "Macan", "Panamera", "Taycan"],
+  "Ram": ["1500", "2500", "3500", "Classic", "Rampage"],
+  "Renault": ["Captur", "Clio", "Duster", "Fluence", "Kangoo", "Kwid", "Logan", "Master", "Megane", "Megane E-Tech", "Oroch", "Sandero", "Scenic", "Stepway", "Symbol", "Zoe"],
+  "Rolls-Royce": ["Cullinan", "Ghost", "Phantom"],
+  "Shineray": ["T20", "T22"],
+  "SsangYong": ["Actyon", "Actyon Sports", "Korando", "Kyron", "Rexton", "Tivoli", "XLV"],
+  "Subaru": ["Forester", "Impreza", "Legacy", "Outback", "WRX", "XV"],
+  "Suzuki": ["Grand Vitara", "Jimny", "Jimny Sierra", "S-Cross", "Swift", "Vitara"],
+  "Toyota": ["Bandeirante", "Camry", "Corolla", "Corolla Cross", "Corolla Fielder", "Etios", "Etios Sedan", "Hilux", "Hilux SW4", "Prius", "RAV4", "SW4", "Yaris", "Yaris Sedan"],
+  "Troller": ["T4"],
+  "Volkswagen": ["Amarok", "Apollo", "Bora", "Brasilia", "CrossFox", "Fox", "Fusca", "Gol", "Golf", "ID.4", "ID.Buzz", "Jetta", "Kombi", "Logus", "Nivus", "Parati", "Passat", "Pointer", "Polo", "Polo Sedan", "Quantum", "Santana", "Saveiro", "SpaceFox", "T-Cross", "Taos", "Tiguan", "Touareg", "Up!", "Virtus", "Voyage"],
+  "Volvo": ["C30", "C40", "EX30", "EX90", "S60", "S90", "V40", "V60", "XC40", "XC60", "XC90"]
+};
+
+export const MOTO_MODELS: Record<string, string[]> = {
+  "Avelloz": ["AZ1"],
+  "BMW": ["C 400 X", "F 750 GS", "F 850 GS", "F 900 R", "G 310 GS", "G 310 R", "K 1600 B", "K 1600 GTL", "R 1250 GS", "R 1250 RT", "R 18", "S 1000 RR"],
+  "Bajaj": ["Dominar 160", "Dominar 200", "Dominar 400"],
+  "Bull": ["KRC 50"],
+  "Dafra": ["Apache RTR 200", "Citycom 300i", "Citycom HD 300", "Cruisym 150", "Cruisym 300", "Horizon 150", "Maxsym 400", "NH 190", "NH 300", "Next 250", "Next 300", "Riva 150", "Zig 50"],
+  "Dayun": ["DY 150-7"],
+  "Ducati": ["DesertX", "Diavel 1260", "Hypermotard 950", "Monster", "Multistrada V2", "Multistrada V4", "Panigale V4", "Scrambler Icon", "Streetfighter V4"],
+  "Flash": ["MV City 150"],
+  "Fym": ["FY 125"],
+  "Haojue": ["Chopper Road 150", "DK 150", "DK 160", "DR 160", "Lindt 125", "Master Ride 150", "NK 150", "Nex 115", "VR 150"],
+  "Harley-Davidson": ["Breakout 117", "Fat Bob 114", "Fat Boy 114", "Heritage Classic 114", "Low Rider S", "Low Rider ST", "Nightster Special", "Pan America 1250", "Road Glide Limited", "Road Glide Special", "Road King Special", "Sportster S", "Street Glide Special", "Ultra Limited"],
+  "Honda": ["ADV", "Biz 110i", "Biz 125", "CB 1000R", "CB 250F Twister", "CB 300F Twister", "CB 500F", "CB 500X", "CB 650R", "CBR 1000RR-R Fireblade", "CBR 650R", "CG 160 Cargo", "CG 160 Fan", "CG 160 Start", "CG 160 Titan", "CRF 1100L Africa Twin", "CRF 250F", "Elite 125", "GL 1800 Gold Wing", "NC 750X", "NXR 160 Bros", "PCX", "PCX 160", "Pop 110i", "X-ADV", "XRE 190", "XRE 300", "XRE 300 Sahara"],
+  "Iros": ["One 125"],
+  "Jonny": ["Hype 50"],
+  "KTM": ["200 Duke", "390 Adventure", "390 Duke", "890 Adventure"],
+  "Kasinski": ["Comet 250", "Comet GT 250", "Mirage 150", "Mirage 250"],
+  "Kawasaki": ["Ninja 300", "Ninja 400", "Ninja 650", "Ninja ZX-10R", "Ninja ZX-4R", "Ninja ZX-6R", "Versys 1000", "Versys 300", "Versys 650", "Vulcan S", "Z1000", "Z400", "Z650", "Z650RS", "Z900", "Z900RS"],
+  "Kymco": ["AK 550", "Downtown 300i", "People GT 300i"],
+  "Mottu": ["Sport 110i"],
+  "MV Agusta": ["Brutale 800", "Dragster 800", "F3 800", "Superveloce 800", "Turismo Veloce 800"],
+  "Piaggio": ["Beverly 300", "Medley 150"],
+  "Pro Tork": ["TR 100", "TR 50"],
+  "Royal Enfield": ["Classic 350", "Continental GT 650", "Himalayan", "Hunter 350", "Interceptor 650", "Meteor 350", "Scram 411", "Super Meteor 650"],
+  "Shineray": ["Free 150", "Jef 150", "Jet 125", "Jet 50", "Phoenix 50", "Ray 50", "Rio 125", "SHI 175", "Urban 150", "Worker 125", "XY 50"],
+  "Sousa": ["AS 110", "AS 150"],
+  "Sundown": ["Future 125", "Hunter 100", "Max 125", "Web 100"],
+  "Super Soco": ["CPX", "TC", "TC Max", "TS", "TSX"],
+  "Suzuki": ["Address 115", "Burgman 125", "Burgman 400", "DL 1000 V-Strom", "DL 1050 V-Strom", "DL 650 V-Strom", "GSX-8S", "GSX-R1000", "GSX-S1000", "GSX-S1000GT", "GSX-S750", "Hayabusa", "Intruder 125", "Yes 125"],
+  "Traxx": ["Joto 125", "Mob 50", "Sky 125", "Star 50", "TSS 150"],
+  "Triumph": ["Bonneville Bobber", "Bonneville Speedmaster", "Bonneville T100", "Bonneville T120", "Rocket 3", "Scrambler 1200", "Scrambler 400 X", "Scrambler 900", "Speed 400", "Speed Triple 1200", "Speed Twin 1200", "Speed Twin 900", "Street Triple 765", "Tiger 1200", "Tiger 660 Sport", "Tiger 800", "Tiger 900"],
+  "Voltz": ["EV1 Sport", "EVS"],
+  "Watts": ["W125", "W160"],
+  "Wuyang": ["WY 48"],
+  "Yamaha": ["Crosser 150", "Crypton 115", "Factor 125", "Factor 150", "Fazer 150", "Fazer 250", "Fazer FZ15", "Fazer FZ25", "Fluo 125", "Lander 250", "MT-03", "MT-07", "MT-09", "NMAX 160", "Neo 125", "R15", "R3", "TT-R 230", "Tracer 900 GT", "XMAX 250", "XT 660", "XTZ 150 Crosser", "XTZ 250 Lander", "XJ6", "YZF-R3"],
+  "Zontes": ["E350", "R310", "T310", "V310"]
+};
+
+export const EBIKE_MODELS: Record<string, string[]> = {
+  "Audax": ["Havok E-Bike", "Pampero E-Bike"],
+  "Biobike": ["JS", "Urbana", "Nia"],
+  "Blitz": ["Avanti", "Comodo", "Life", "Velo"],
+  "Caloi": ["E-Vibe City Tour", "E-Vibe Easy Rider", "E-Vibe Elite", "E-Vibe Urbam"],
+  "Cannondale": ["Adventure Neo", "Moterra", "Topstone Neo", "Treadwell Neo"],
+  "Draisiana": ["Classica", "Sport"],
+  "Giant": ["Explore E+", "Fathom E+", "Reign E+", "Talon E+", "Trance X E+"],
+  "Groove": ["E-Slap", "E-Urban"],
+  "Houston": ["E-Bike"],
+  "Lev": ["E-Bike", "L", "S", "Sport"],
+  "Merida": ["eBIG.NINE", "eONE-FORTY", "eONE-SIXTY"],
+  "Monark": ["E-Bike"],
+  "Oggi": ["Big Wheel 8.0", "Big Wheel 8.2", "Big Wheel 8.3", "Flex 700", "Potenza"],
+  "Pedalla": ["Gioia", "Lille", "Rodrigo", "Spectra"],
+  "Scott": ["Aspect eRIDE", "Genius eRIDE", "Patron eRIDE", "Strike eRIDE"],
+  "Sense": ["Breeze", "Easy", "Exalt E-Trail", "Impulse E-Trail", "Prologue"],
+  "Sousa": ["Bike Sousa", "Eco 350"],
+  "Specialized": ["Creo SL", "Kenevo", "Levo", "Tero", "Vado"],
+  "TSW": ["E-Quest"],
+  "Trek": ["Allant+", "Domane+", "Fuel EXe", "Powerfly", "Rail", "Verve+"],
+  "Two Dogs": ["Pliage"],
+  "Watts": ["W-Bike", "W-City"]
+};
+
+export const OFFENSIVE_WORDS = [
+  "pau", "pauzudo", "pauzão", "pauzao", "pauzinho",
+  "caralho", "caralhão", "caralhao", "caralhinho",
+  "buceta", "bucetão", "bucetao", "bucetinha",
+  "cu", "cusão", "cusao", "cuzão", "cuzao", "cuzinho",
+  "puta", "putão", "putao", "putinha",
+  "viado", "viadão", "viadao", "viadinho",
+  "corno", "cornão", "cornao", "corninho",
+  "bosta", "merda", "cacete", "porra",
+  "foda", "foder", "fodido", "fodida",
+  "arrombado", "arrombada",
+  "piranha", "vagabunda", "vagabundo",
+  "idiota", "imbecil", "retardado", "retardada",
+  "burro", "burra", "besta",
+  "pinto", "pintão", "pintao", "pintinho",
+  "rola", "rolão", "rolao", "rolinha",
+  "xoxota", "perereca",
+  "chupa", "chupar", "boquete",
+  "siririca", "punheta",
+  "gozo", "gozar", "esperma",
+  "orgia", "sexo", "transa",
+  "estupro", "pedofilo", "pedofilia",
+  "nazista", "hitler",
+  "macaco", "macaca", // Contexto racista
+  "preto", "preta", // Contexto racista (dependendo do uso, mas melhor evitar em nicknames se for usado pejorativamente)
+  "negro", "negra", // Idem
+  "viadagem", "gayzice",
+  "sapatão", "sapatao",
+  "bicha", "bichinha",
+  "traveco",
+  "boiola",
+  "baitola",
+  "mariquinha",
+  "feio", "feia", "gordo", "gorda", // Ofensas leves mas indesejadas
+  "otario", "otaria",
+  "trouxa"
+];
