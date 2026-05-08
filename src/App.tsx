@@ -13,6 +13,11 @@ import {
   type DateFormat,
 } from './utils/format';
 
+// Base URL para chamadas de API. Em produção (Vercel/Render) DEVE ser
+// definida via VITE_API_URL apontando para o backend. Em dev local fica
+// vazia e usamos o proxy do Vite (vite.config.js -> server.proxy['/api']).
+const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+
 // Inline WhatsApp brand glyph. lucide-react omits brand logos for trademark
 // reasons, so we ship a minimal SVG here to avoid adding a dependency.
 const WhatsAppIcon = ({ className }: { className?: string }) => (
@@ -910,7 +915,7 @@ export default function App() {
     const uid = userId ?? user?.id;
     if (uid == null || uid === '') return;
     try {
-      const res = await fetch(`/api/user?userId=${encodeURIComponent(String(uid))}`);
+      const res = await fetch(`${API_BASE_URL}/api/user?userId=${encodeURIComponent(String(uid))}`);
       if (res.ok) {
         const data = await res.json();
         setUser(data);
@@ -924,7 +929,7 @@ export default function App() {
     const uid = userId || user?.id;
     if (!uid) return;
     try {
-      const res = await fetch(`/api/vehicles?userId=${uid}`);
+      const res = await fetch(`${API_BASE_URL}/api/vehicles?userId=${uid}`);
       if (!res.ok) {
         console.error("Failed to fetch vehicles", res.status);
         alert(t('errorLoadingData'));
@@ -945,7 +950,7 @@ export default function App() {
     if (!selectedVehicle) return;
     
     try {
-      const res = await fetch(`/api/vehicles/${selectedVehicle.id}/archive`, {
+      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/archive`, {
         method: 'POST'
       });
       
@@ -968,7 +973,7 @@ export default function App() {
 
   const fetchLogs = async (vehicleId: number) => {
     try {
-      const res = await fetch(`/api/vehicles/${vehicleId}/logs`);
+      const res = await fetch(`${API_BASE_URL}/api/vehicles/${vehicleId}/logs`);
       if (!res.ok) {
         console.error("Failed to fetch logs", res.status);
         alert(t('errorLoadingData'));
@@ -984,7 +989,7 @@ export default function App() {
 
   const fetchMileageLogs = async (vehicleId: number) => {
     try {
-      const res = await fetch(`/api/vehicles/${vehicleId}/mileage`);
+      const res = await fetch(`${API_BASE_URL}/api/vehicles/${vehicleId}/mileage`);
       if (!res.ok) {
         console.error("Failed to fetch mileage logs", res.status);
         alert(t('errorLoadingData'));
@@ -1002,7 +1007,7 @@ export default function App() {
 
   const fetchFinancialRecords = async (vehicleId: number) => {
     try {
-      const res = await fetch(`/api/vehicles/${vehicleId}/financial`);
+      const res = await fetch(`${API_BASE_URL}/api/vehicles/${vehicleId}/financial`);
       if (!res.ok) {
         console.error("Failed to fetch financial records", res.status);
         alert(t('errorLoadingData'));
@@ -1020,7 +1025,7 @@ export default function App() {
     e.preventDefault();
     setAuthError('');
     try {
-      const res = await fetch('/api/login', {
+      const res = await fetch(`${API_BASE_URL}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: authForm.email, password: authForm.password })
@@ -1050,7 +1055,7 @@ export default function App() {
     setRecoverMessage('');
     setRecoverLoading(true);
     try {
-      const res = await fetch('/api/recover-password', {
+      const res = await fetch(`${API_BASE_URL}/api/recover-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: recoverEmail })
@@ -1084,7 +1089,7 @@ export default function App() {
     }
     setResetLoading(true);
     try {
-      const res = await fetch('/api/reset-password', {
+      const res = await fetch(`${API_BASE_URL}/api/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ access_token: resetToken, new_password: resetPassword })
@@ -1141,7 +1146,7 @@ export default function App() {
     const payload = { ...authForm, birth_date };
 
     try {
-      const res = await fetch('/api/register', {
+      const res = await fetch(`${API_BASE_URL}/api/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -1180,8 +1185,8 @@ export default function App() {
     try {
       const isEdit = !!editingMileageLogId;
       const url = isEdit
-        ? `/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`
-        : `/api/vehicles/${selectedVehicle.id}/mileage`;
+        ? `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`
+        : `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/mileage`;
 
       const res = await fetch(url, {
         method: isEdit ? 'PUT' : 'POST',
@@ -1216,7 +1221,7 @@ export default function App() {
     if (!window.confirm(t('confirmDeleteRecord'))) return;
     setIsDeletingRecord(true);
     try {
-      const res = await fetch(`/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
@@ -1264,13 +1269,13 @@ export default function App() {
     try {
       let res: Response;
       if (isEditingVehicle && selectedVehicle) {
-        res = await fetch(`/api/vehicles/${selectedVehicle.id}`, {
+        res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...vehicleToSubmit })
         });
       } else {
-        res = await fetch('/api/vehicles', {
+        res = await fetch(`${API_BASE_URL}/api/vehicles`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...vehicleToSubmit, user_id: user?.id })
@@ -1343,8 +1348,8 @@ export default function App() {
       const isEdit = editingMaintenanceLogId !== null;
       const res = await fetch(
         isEdit
-          ? `/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`
-          : '/api/logs',
+          ? `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`
+          : `${API_BASE_URL}/api/logs`,
         {
           method: isEdit ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1372,7 +1377,7 @@ export default function App() {
     if (!window.confirm(t('confirmDeleteRecord'))) return;
     setIsDeletingRecord(true);
     try {
-      const res = await fetch(`/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
@@ -1399,8 +1404,8 @@ export default function App() {
       const isEdit = editingFinancialRecordId !== null;
       const res = await fetch(
         isEdit
-          ? `/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`
-          : '/api/financial',
+          ? `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`
+          : `${API_BASE_URL}/api/financial`,
         {
           method: isEdit ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1428,7 +1433,7 @@ export default function App() {
     if (!window.confirm(t('confirmDeleteRecord'))) return;
     setIsDeletingRecord(true);
     try {
-      const res = await fetch(`/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
@@ -1451,7 +1456,7 @@ export default function App() {
   const fetchChatSessions = async () => {
     if (!user) return;
     try {
-      const res = await fetch(`/api/chat/sessions?userId=${user.id}`);
+      const res = await fetch(`${API_BASE_URL}/api/chat/sessions?userId=${user.id}`);
       if (res.ok) {
         const raw = await res.json();
         const sessions = Array.isArray(raw) ? raw : [];
@@ -1466,7 +1471,7 @@ export default function App() {
     if (!chatSessionToDelete) return;
     
     try {
-      const res = await fetch(`/api/chat/sessions/${chatSessionToDelete}`, {
+      const res = await fetch(`${API_BASE_URL}/api/chat/sessions/${chatSessionToDelete}`, {
         method: 'DELETE'
       });
       if (res.ok) {
@@ -1485,7 +1490,7 @@ export default function App() {
 
   const loadChatSession = async (sessionId: number) => {
     try {
-      const res = await fetch(`/api/chat/sessions/${sessionId}/messages`);
+      const res = await fetch(`${API_BASE_URL}/api/chat/sessions/${sessionId}/messages`);
       if (res.ok) {
         const raw = await res.json();
         setChatMessages(Array.isArray(raw) ? raw : []);
@@ -1500,7 +1505,7 @@ export default function App() {
   const createNewSession = async () => {
     if (!user) return;
     try {
-      const res = await fetch('/api/chat/sessions', {
+      const res = await fetch(`${API_BASE_URL}/api/chat/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1552,7 +1557,7 @@ export default function App() {
     setChatMessages(prev => [...prev, userMsg]);
 
     try {
-      await fetch('/api/chat/messages', {
+      await fetch(`${API_BASE_URL}/api/chat/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1564,7 +1569,7 @@ export default function App() {
 
       // SEGURANÇA: Prompt e Contexto movidos para o Backend
       // O Frontend envia apenas os identificadores e a mensagem do usuário
-      const response = await fetch('/api/chat', {
+      const response = await fetch(`${API_BASE_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1587,7 +1592,7 @@ export default function App() {
       };
       setChatMessages(prev => [...prev, aiMsg]);
 
-      await fetch('/api/chat/messages', {
+      await fetch(`${API_BASE_URL}/api/chat/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
