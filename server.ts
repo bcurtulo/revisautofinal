@@ -298,6 +298,9 @@ async function startServer() {
         email,
         location: finalLocation,
         plan: "free" as const,
+        plan_type: "free" as const,
+        plan_status: "none",
+        mp_preapproval_id: null,
       };
 
       const { data: profileRow, error: dbError } = await supabaseAdmin
@@ -1181,30 +1184,71 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
     }
   });
 
-  async function upgradeUserToPremium(userId: string, sourceLog: string) {
-    const { error } = await supabaseAdmin
-      .from("users")
-      .update({ plan: "premium" })
-      .eq("id", String(userId));
+  type MpPlanMeta = {
+    /** Status espelhado do MP (authorized, active, approved, ...) */
+    planStatus?: string;
+    /** Só atualiza quando informado — evita sobrescrever mp_preapproval_id nos upgrades via payment-only */
+    mpPreapprovalId?: string | null;
+  };
+
+  async function upgradeUserToPremium(
+    userId: string,
+    sourceLog: string,
+    meta: MpPlanMeta = {},
+  ) {
+    const planStatus =
+      typeof meta.planStatus === "string" && meta.planStatus.trim()
+        ? meta.planStatus.trim()
+        : "active";
+
+    const row: Record<string, unknown> = {
+      plan: "premium",
+      plan_type: "premium",
+      plan_status: planStatus,
+    };
+
+    if (meta.mpPreapprovalId != null && meta.mpPreapprovalId !== "") {
+      row.mp_preapproval_id = String(meta.mpPreapprovalId);
+    }
+
+    const { error } = await supabaseAdmin.from("users").update(row).eq("id", String(userId));
 
     if (error) {
-      console.error("🚨 [MP Webhook] Erro ao atualizar plano premium:", error);
+      console.error("🚨 [MP Webhook] Erro ao atualizar plano premium (users):", error);
       return;
     }
-    console.log(`✅ [MP Webhook] Usuário ${userId} promovido a premium (${sourceLog}).`);
+    console.log(
+      `[MP Webhook] UPGRADE premium user=${userId} (${sourceLog}) plan_status=${planStatus}`,
+    );
   }
 
-  async function downgradeUserToFree(userId: string, reason: string) {
+  async function downgradeUserToFree(
+    userId: string,
+    reason: string,
+    meta: MpPlanMeta = {},
+  ) {
+    const planStatus =
+      typeof meta.planStatus === "string" && meta.planStatus.trim()
+        ? meta.planStatus.trim()
+        : "inactive";
+
     const { error } = await supabaseAdmin
       .from("users")
-      .update({ plan: "free" })
+      .update({
+        plan: "free",
+        plan_type: "free",
+        plan_status: planStatus,
+        mp_preapproval_id: null,
+      })
       .eq("id", String(userId));
 
     if (error) {
-      console.error("🚨 [MP Webhook] Erro ao rebaixar para free:", error);
+      console.error("🚨 [MP Webhook] Erro ao rebaixar para free (users):", error);
       return;
     }
-    console.log(`[MP Webhook] DOWNGRADE usuário=${userId} motivo=${reason}`);
+    console.log(
+      `[MP Webhook] DOWNGRADE free user=${userId} motivo=${reason} plan_status=${planStatus}`,
+    );
   }
 
   /**
@@ -1363,10 +1407,10 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         // authorized/active → manter garantido como premium (idempotente)
         if (mpStatus === "authorized" || mpStatus === "active") {
           console.log("[MP Webhook] plan_action=ensure_premium user=", userId);
-          await upgradeUserToPremium(
-            String(userId),
-            `preapproval ${sub.id} ${mpStatus}`,
-          );
+          await upgradeUserToPremium(String(userId), `preapproval ${sub.id} ${mpStatus}`, {
+            mpPreapprovalId: sub.id != null ? String(sub.id) : undefined,
+            planStatus: mpStatus,
+          });
           console.log("[MP Webhook] plan_action_done=ensure_premium");
           return;
         }
@@ -1374,10 +1418,9 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         // cancelled / paused / unpaid → downgrade imediato
         if (mpStatus === "cancelled" || mpStatus === "paused" || mpStatus === "unpaid") {
           console.log("[MP Webhook] plan_action=downgrade_to_free user=", userId);
-          await downgradeUserToFree(
-            String(userId),
-            `preapproval ${sub.id} ${mpStatus}`,
-          );
+          await downgradeUserToFree(String(userId), `preapproval ${sub.id} ${mpStatus}`, {
+            planStatus: mpStatus,
+          });
           console.log("[MP Webhook] plan_action_done=downgrade_to_free");
           return;
         }
@@ -1411,10 +1454,9 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
           switch (payment?.status) {
             case "approved":
               console.log("[MP Webhook] plan_action=ensure_premium_via_payment user=", userId);
-              await upgradeUserToPremium(
-                String(userId),
-                `authorized_payment ${payment.id} approved`,
-              );
+              await upgradeUserToPremium(String(userId), `authorized_payment ${payment.id} approved`, {
+                planStatus: payment.status ?? "approved",
+              });
               console.log("[MP Webhook] plan_action_done=ensure_premium_via_payment");
               break;
             case "rejected":
@@ -1425,6 +1467,7 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
               await downgradeUserToFree(
                 String(userId),
                 `authorized_payment ${payment.id} ${payment.status}`,
+                { planStatus: payment.status ?? "inactive" },
               );
               console.log("[MP Webhook] plan_action_done=downgrade_payment");
               break;
@@ -1462,7 +1505,9 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         switch (payment?.status) {
           case "approved":
             console.log("[MP Webhook] plan_action=ensure_premium_oneoff user=", userId);
-            await upgradeUserToPremium(String(userId), `payment ${payment.id} approved`);
+            await upgradeUserToPremium(String(userId), `payment ${payment.id} approved`, {
+              planStatus: payment.status ?? "approved",
+            });
             console.log("[MP Webhook] plan_action_done=ensure_premium_oneoff");
             break;
           case "rejected":
@@ -1470,10 +1515,9 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
           case "refunded":
           case "charged_back":
             console.log("[MP Webhook] plan_action=downgrade_oneoff user=", userId, payment?.status);
-            await downgradeUserToFree(
-              String(userId),
-              `payment ${payment.id} ${payment.status}`,
-            );
+            await downgradeUserToFree(String(userId), `payment ${payment.id} ${payment.status}`, {
+              planStatus: payment.status ?? "inactive",
+            });
             console.log("[MP Webhook] plan_action_done=downgrade_oneoff");
             break;
           default:
