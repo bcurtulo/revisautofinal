@@ -11,6 +11,7 @@ export interface User {
   city?: string;
   location: string; // Keep for backward compatibility or computed
   plan?: 'free' | 'premium';
+  access_token?: string;
 }
 
 export interface MileageLog {

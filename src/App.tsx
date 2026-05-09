@@ -18,6 +18,33 @@ import {
 // vazia e usamos o proxy do Vite (vite.config.js -> server.proxy['/api']).
 const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
+// Lê o JWT do Supabase a partir do user persistido em localStorage.
+// Lemos do storage (em vez do estado React) para que a função possa ser
+// chamada logo depois de setUser(...) sem esperar o re-render.
+function getStoredAccessToken(): string | undefined {
+  try {
+    const raw = localStorage.getItem('revis_user');
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.access_token === 'string' ? parsed.access_token : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Wrapper de fetch que injeta automaticamente o header
+// `Authorization: Bearer <access_token>` quando disponível, e força o
+// Content-Type: application/json em requisições com corpo.
+async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers || {});
+  const token = getStoredAccessToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (init.body != null && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+}
+
 // Inline WhatsApp brand glyph. lucide-react omits brand logos for trademark
 // reasons, so we ship a minimal SVG here to avoid adding a dependency.
 const WhatsAppIcon = ({ className }: { className?: string }) => (
@@ -95,7 +122,7 @@ export default function App() {
         const parsedUser = JSON.parse(storedUser);
         setUser(parsedUser);
         setAuthScreen('app');
-        fetchVehicles(parsedUser.id);
+        fetchVehicles();
       } catch (e) {
         console.error("Failed to parse stored user", e);
         localStorage.removeItem('revis_user');
@@ -603,19 +630,36 @@ export default function App() {
 
   const handleNativePurchase = async () => {
     if (!user) return;
+    if (isUpgrading) return;
 
     setIsUpgrading(true);
 
-    setTimeout(() => {
-      alert(t('revenueCatSimulation'));
+    try {
+      const res = await apiFetch(`/api/checkout`, {
+        method: 'POST',
+        body: JSON.stringify({
+          userEmail: user.email,
+          userName: user.name,
+        }),
+      });
 
-      const updatedUser = { ...user, plan: 'premium' as const };
-      setUser(updatedUser);
-      localStorage.setItem('revis_user', JSON.stringify(updatedUser));
+      const data = await res.json().catch(() => null);
 
+      if (!res.ok || !data?.init_point) {
+        const message =
+          (data && typeof data.message === 'string' && data.message) ||
+          'Não foi possível iniciar o pagamento. Tente novamente.';
+        throw new Error(message);
+      }
+
+      // Redireciona para o checkout do Mercado Pago.
+      // Mantém isUpgrading=true para o botão seguir em loading durante o redirect.
+      window.location.href = data.init_point;
+    } catch (err: any) {
+      console.error('Erro ao iniciar checkout Mercado Pago:', err);
+      alert(err?.message || 'Erro ao iniciar pagamento. Tente novamente.');
       setIsUpgrading(false);
-      setShowUpgradeModal(false);
-    }, 1500);
+    }
   };
 
   // New Vehicle State
@@ -911,25 +955,28 @@ export default function App() {
     }
   }, [authScreen, activeTermsTab]);
 
-  const fetchUser = async (userId?: string | number) => {
-    const uid = userId ?? user?.id;
-    if (uid == null || uid === '') return;
+  const fetchUser = async () => {
+    if (!getStoredAccessToken()) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/user?userId=${encodeURIComponent(String(uid))}`);
+      const res = await apiFetch(`/api/user`);
       if (res.ok) {
         const data = await res.json();
-        setUser(data);
+        // Preserva o access_token (a rota /api/user não retorna token).
+        setUser(prev => {
+          const merged = { ...data, access_token: prev?.access_token };
+          localStorage.setItem('revis_user', JSON.stringify(merged));
+          return merged;
+        });
       }
     } catch (e) {
       console.error("Failed to fetch user", e);
     }
   };
 
-  const fetchVehicles = async (userId?: number) => {
-    const uid = userId || user?.id;
-    if (!uid) return;
+  const fetchVehicles = async () => {
+    if (!getStoredAccessToken()) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles?userId=${uid}`);
+      const res = await apiFetch(`/api/vehicles`);
       if (!res.ok) {
         console.error("Failed to fetch vehicles", res.status);
         alert(t('errorLoadingData'));
@@ -950,7 +997,7 @@ export default function App() {
     if (!selectedVehicle) return;
     
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/archive`, {
+      const res = await apiFetch(`/api/vehicles/${selectedVehicle.id}/archive`, {
         method: 'POST'
       });
       
@@ -973,7 +1020,7 @@ export default function App() {
 
   const fetchLogs = async (vehicleId: number) => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles/${vehicleId}/logs`);
+      const res = await apiFetch(`/api/vehicles/${vehicleId}/logs`);
       if (!res.ok) {
         console.error("Failed to fetch logs", res.status);
         alert(t('errorLoadingData'));
@@ -989,7 +1036,7 @@ export default function App() {
 
   const fetchMileageLogs = async (vehicleId: number) => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles/${vehicleId}/mileage`);
+      const res = await apiFetch(`/api/vehicles/${vehicleId}/mileage`);
       if (!res.ok) {
         console.error("Failed to fetch mileage logs", res.status);
         alert(t('errorLoadingData'));
@@ -1007,7 +1054,7 @@ export default function App() {
 
   const fetchFinancialRecords = async (vehicleId: number) => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles/${vehicleId}/financial`);
+      const res = await apiFetch(`/api/vehicles/${vehicleId}/financial`);
       if (!res.ok) {
         console.error("Failed to fetch financial records", res.status);
         alert(t('errorLoadingData'));
@@ -1025,9 +1072,8 @@ export default function App() {
     e.preventDefault();
     setAuthError('');
     try {
-      const res = await fetch(`${API_BASE_URL}/api/login`, {
+      const res = await apiFetch(`/api/login`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: authForm.email, password: authForm.password })
       });
 
@@ -1039,10 +1085,22 @@ export default function App() {
         return;
       }
 
-      setUser(data.user);
-      localStorage.setItem('revis_user', JSON.stringify(data.user));
+      // Garante que o access_token sempre persista, vindo de user.access_token
+      // (shape antigo) ou de session.access_token (shape novo do backend).
+      const accessToken: string | undefined =
+        data.user?.access_token ?? data.session?.access_token;
+
+      if (!accessToken) {
+        console.error('🚨 Login retornou sem access_token:', data);
+        setAuthError(mapAuthError({ message: 'missing_access_token' }) || t('unexpectedError'));
+        return;
+      }
+
+      const userToStore = { ...data.user, access_token: accessToken };
+      setUser(userToStore);
+      localStorage.setItem('revis_user', JSON.stringify(userToStore));
       setAuthScreen('app');
-      fetchVehicles(data.user.id);
+      fetchVehicles();
     } catch (err: any) {
       console.error('Erro detalhado no login (rede/JS):', err);
       setAuthError(mapAuthError({ message: err?.message }) || t('unexpectedError'));
@@ -1055,9 +1113,8 @@ export default function App() {
     setRecoverMessage('');
     setRecoverLoading(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/recover-password`, {
+      const res = await apiFetch(`/api/recover-password`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: recoverEmail })
       });
       const data = await res.json().catch(() => ({} as any));
@@ -1089,9 +1146,8 @@ export default function App() {
     }
     setResetLoading(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/reset-password`, {
+      const res = await apiFetch(`/api/reset-password`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ access_token: resetToken, new_password: resetPassword })
       });
       const data = await res.json().catch(() => ({} as any));
@@ -1146,9 +1202,8 @@ export default function App() {
     const payload = { ...authForm, birth_date };
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/register`, {
+      const res = await apiFetch(`/api/register`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
 
@@ -1163,7 +1218,7 @@ export default function App() {
 
       setUser(errorData.user);
       localStorage.setItem('revis_user', JSON.stringify(errorData.user));
-      fetchVehicles(errorData.user.id);
+      fetchVehicles();
       setAuthScreen('onboarding_preferences');
     } catch (err: any) {
       console.error('Erro detalhado no registro (rede/JS):', err);
@@ -1185,12 +1240,11 @@ export default function App() {
     try {
       const isEdit = !!editingMileageLogId;
       const url = isEdit
-        ? `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`
-        : `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/mileage`;
+        ? `/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`
+        : `/api/vehicles/${selectedVehicle.id}/mileage`;
 
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         method: isEdit ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mileage, date: newMileage.date })
       });
       if (!res.ok) {
@@ -1221,7 +1275,7 @@ export default function App() {
     if (!window.confirm(t('confirmDeleteRecord'))) return;
     setIsDeletingRecord(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`, {
+      const res = await apiFetch(`/api/vehicles/${selectedVehicle.id}/mileage/${editingMileageLogId}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
@@ -1231,7 +1285,7 @@ export default function App() {
       }
       await fetchMileageLogs(selectedVehicle.id);
       // re-busca veículos para refletir current_mileage recalculado pelo backend
-      await fetchVehicles(user?.id);
+      await fetchVehicles();
       setShowAddMileage(false);
       setEditingMileageLogId(null);
       setNewMileage({ date: '', mileage: '' });
@@ -1269,16 +1323,14 @@ export default function App() {
     try {
       let res: Response;
       if (isEditingVehicle && selectedVehicle) {
-        res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}`, {
+        res = await apiFetch(`/api/vehicles/${selectedVehicle.id}`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...vehicleToSubmit })
         });
       } else {
-        res = await fetch(`${API_BASE_URL}/api/vehicles`, {
+        res = await apiFetch(`/api/vehicles`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...vehicleToSubmit, user_id: user?.id })
+          body: JSON.stringify({ ...vehicleToSubmit })
         });
       }
 
@@ -1346,13 +1398,12 @@ export default function App() {
     setIsSubmittingLog(true);
     try {
       const isEdit = editingMaintenanceLogId !== null;
-      const res = await fetch(
+      const res = await apiFetch(
         isEdit
-          ? `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`
-          : `${API_BASE_URL}/api/logs`,
+          ? `/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`
+          : `/api/logs`,
         {
           method: isEdit ? 'PUT' : 'POST',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(isEdit ? newLog : { ...newLog, vehicle_id: selectedVehicle.id }),
         },
       );
@@ -1377,7 +1428,7 @@ export default function App() {
     if (!window.confirm(t('confirmDeleteRecord'))) return;
     setIsDeletingRecord(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`, {
+      const res = await apiFetch(`/api/vehicles/${selectedVehicle.id}/maintenance/${editingMaintenanceLogId}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
@@ -1402,13 +1453,12 @@ export default function App() {
     setIsSubmittingFinancial(true);
     try {
       const isEdit = editingFinancialRecordId !== null;
-      const res = await fetch(
+      const res = await apiFetch(
         isEdit
-          ? `${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`
-          : `${API_BASE_URL}/api/financial`,
+          ? `/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`
+          : `/api/financial`,
         {
           method: isEdit ? 'PUT' : 'POST',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(isEdit ? newFinancial : { ...newFinancial, vehicle_id: selectedVehicle.id }),
         },
       );
@@ -1433,7 +1483,7 @@ export default function App() {
     if (!window.confirm(t('confirmDeleteRecord'))) return;
     setIsDeletingRecord(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`, {
+      const res = await apiFetch(`/api/vehicles/${selectedVehicle.id}/financial/${editingFinancialRecordId}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
@@ -1456,10 +1506,11 @@ export default function App() {
   const fetchChatSessions = async () => {
     if (!user) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/chat/sessions?userId=${user.id}`);
+      const res = await apiFetch(`/api/chat/sessions`);
       if (res.ok) {
         const raw = await res.json();
         const sessions = Array.isArray(raw) ? raw : [];
+        // Backend já filtra pelo user autenticado; mantemos a checagem por defesa
         setChatSessions(sessions.filter((s: ChatSession) => String(s.user_id) === String(user.id)));
       }
     } catch (error) {
@@ -1471,7 +1522,7 @@ export default function App() {
     if (!chatSessionToDelete) return;
     
     try {
-      const res = await fetch(`${API_BASE_URL}/api/chat/sessions/${chatSessionToDelete}`, {
+      const res = await apiFetch(`/api/chat/sessions/${chatSessionToDelete}`, {
         method: 'DELETE'
       });
       if (res.ok) {
@@ -1490,7 +1541,7 @@ export default function App() {
 
   const loadChatSession = async (sessionId: number) => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/chat/sessions/${sessionId}/messages`);
+      const res = await apiFetch(`/api/chat/sessions/${sessionId}/messages`);
       if (res.ok) {
         const raw = await res.json();
         setChatMessages(Array.isArray(raw) ? raw : []);
@@ -1505,11 +1556,9 @@ export default function App() {
   const createNewSession = async () => {
     if (!user) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/chat/sessions`, {
+      const res = await apiFetch(`/api/chat/sessions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          user_id: user.id,
           vehicle_id: selectedVehicle?.id,
           title: selectedVehicle
             ? t('chatSessionAbout').replace('{brand}', selectedVehicle.brand).replace('{model}', selectedVehicle.model)
@@ -1557,9 +1606,8 @@ export default function App() {
     setChatMessages(prev => [...prev, userMsg]);
 
     try {
-      await fetch(`${API_BASE_URL}/api/chat/messages`, {
+      await apiFetch(`/api/chat/messages`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
           sender: 'user',
@@ -1568,14 +1616,13 @@ export default function App() {
       });
 
       // SEGURANÇA: Prompt e Contexto movidos para o Backend
-      // O Frontend envia apenas os identificadores e a mensagem do usuário
-      const response = await fetch(`${API_BASE_URL}/api/chat`, {
+      // O Frontend envia apenas os identificadores e a mensagem do usuário.
+      // O backend identifica o usuário via JWT (Authorization header).
+      const response = await apiFetch(`/api/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: userMessageText,
           vehicleId: selectedVehicle?.id,
-          userId: user?.id
         })
       });
       
@@ -1592,9 +1639,8 @@ export default function App() {
       };
       setChatMessages(prev => [...prev, aiMsg]);
 
-      await fetch(`${API_BASE_URL}/api/chat/messages`, {
+      await apiFetch(`/api/chat/messages`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
           sender: 'ai',
@@ -5337,7 +5383,7 @@ export default function App() {
             <div className="bg-revis-black/30 rounded-xl p-4 mb-6 text-center border border-revis-gray/10">
               <span className="text-xs text-revis-gray block mb-1">{t('premiumSubscriptionLabel')}</span>
               <div className="flex items-end justify-center gap-1">
-                <span className="text-3xl font-bold text-revis-heading">R$ 29,90</span>
+                <span className="text-3xl font-bold text-revis-heading">R$ 14,90</span>
                 <span className="text-sm text-revis-gray mb-1">{t('premiumPerMonth')}</span>
               </div>
             </div>

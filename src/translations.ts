@@ -253,7 +253,7 @@ export const translations = {
     premiumPerMonth: '/mês',
     premiumSubscribeNow: 'Assinar agora',
     premiumMaybeLater: 'Talvez depois',
-    premiumFooterNote: 'Cancelamento a qualquer momento. Pagamento seguro via Apple Store e Google Play.',
+    premiumFooterNote: 'Assinatura mensal recorrente. Cancele quando quiser. Pagamento seguro via Mercado Pago.',
     loading: 'Carregando...',
     confirmCancelAddVehicle: 'Confirma cancelamento?',
     newMaintenanceTitle: 'Nova manutenção'
@@ -512,7 +512,7 @@ export const translations = {
     premiumPerMonth: '/month',
     premiumSubscribeNow: 'Subscribe now',
     premiumMaybeLater: 'Maybe later',
-    premiumFooterNote: 'Cancel anytime. Secure payment via Apple App Store and Google Play.',
+    premiumFooterNote: 'Recurring monthly subscription. Cancel anytime. Secure payment via Mercado Pago.',
     loading: 'Loading...',
     confirmCancelAddVehicle: 'Confirm cancel?',
     newMaintenanceTitle: 'New maintenance entry'
@@ -771,7 +771,7 @@ export const translations = {
     premiumPerMonth: '/mes',
     premiumSubscribeNow: 'Suscribirme',
     premiumMaybeLater: 'Quizá después',
-    premiumFooterNote: 'Cancela cuando quieras. Pago seguro en App Store y Google Play.',
+    premiumFooterNote: 'Suscripción mensual recurrente. Cancela cuando quieras. Pago seguro vía Mercado Pago.',
     loading: 'Cargando...',
     confirmCancelAddVehicle: '¿Confirmar cancelación?',
     newMaintenanceTitle: 'Nuevo mantenimiento'
@@ -1030,7 +1030,7 @@ export const translations = {
     premiumPerMonth: '/mês',
     premiumSubscribeNow: 'Subscrever agora',
     premiumMaybeLater: 'Talvez mais tarde',
-    premiumFooterNote: 'Cancelamento a qualquer momento. Pagamento seguro via Apple Store e Google Play.',
+    premiumFooterNote: 'Subscrição mensal recorrente. Cancela quando quiseres. Pagamento seguro via Mercado Pago.',
     loading: 'A carregar...',
     confirmCancelAddVehicle: 'Confirmas o cancelamento?',
     newMaintenanceTitle: 'Nova manutenção'

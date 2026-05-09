@@ -1,11 +1,22 @@
 import express from "express";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
+import { MercadoPagoConfig, PreApproval, Payment } from "mercadopago";
 import fetch from "cross-fetch";
 import type { User, Vehicle, MaintenanceLog, FinancialRecord } from "./src/types.ts";
 
 dotenv.config();
+
+const mpAccessToken = process.env.MP_ACCESS_TOKEN || "";
+if (!mpAccessToken) {
+  console.error("🚨 MP_ACCESS_TOKEN ausente no .env — Pagamentos Premium não funcionarão.");
+}
+const mpClient = new MercadoPagoConfig({
+  accessToken: mpAccessToken,
+  options: { timeout: 10000 },
+});
 
 function pickFields<T extends object, K extends keyof T>(
   source: Partial<T> | undefined | null,
@@ -153,6 +164,73 @@ async function startServer() {
     return next(err);
   });
 
+  // --- MIDDLEWARE DE AUTENTICAÇÃO (Supabase JWT) ---
+
+  type AuthedUser = { id: string; email?: string | null };
+  type AuthedRequest = express.Request & { user: AuthedUser };
+
+  async function authenticateUser(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ) {
+    const authHeader = req.headers.authorization;
+    const token =
+      typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")
+        ? authHeader.slice(7).trim()
+        : "";
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "Token de autenticação ausente.",
+      });
+    }
+
+    try {
+      const { data, error } = await supabase.auth.getUser(token);
+      if (error || !data?.user) {
+        return res.status(401).json({
+          success: false,
+          message: "Token inválido ou expirado.",
+        });
+      }
+      (req as AuthedRequest).user = {
+        id: data.user.id,
+        email: data.user.email,
+      };
+      return next();
+    } catch (err: any) {
+      console.error("🚨 authenticateUser:", err?.message || err);
+      return res.status(401).json({
+        success: false,
+        message: "Falha ao validar token.",
+      });
+    }
+  }
+
+  async function vehicleBelongsToUser(userId: string, vehicleId: number): Promise<boolean> {
+    if (Number.isNaN(vehicleId)) return false;
+    const { data, error } = await supabaseAdmin
+      .from("vehicles")
+      .select("user_id")
+      .eq("id", vehicleId)
+      .maybeSingle();
+    if (error || !data) return false;
+    return String(data.user_id) === String(userId);
+  }
+
+  async function chatSessionBelongsToUser(userId: string, sessionId: number): Promise<boolean> {
+    if (Number.isNaN(sessionId)) return false;
+    const { data, error } = await supabaseAdmin
+      .from("chat_sessions")
+      .select("user_id")
+      .eq("id", sessionId)
+      .maybeSingle();
+    if (error || !data) return false;
+    return String(data.user_id) === String(userId);
+  }
+
   // --- AUTENTICAÇÃO ---
 
   app.post("/api/register", async (req, res) => {
@@ -243,7 +321,28 @@ async function startServer() {
 
       const fullUser = profileRow ?? upsertPayload;
 
-      return res.status(200).json({ success: true, user: fullUser });
+      // Faz signInWithPassword logo após criar o usuário para já entregar
+      // um access_token válido ao frontend (sem isso ele cairia em 401 nas
+      // rotas protegidas durante o onboarding).
+      let accessToken: string | undefined;
+      try {
+        const { data: signIn, error: signInErr } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+        if (signInErr) {
+          console.error("⚠️ register: falha no signIn pós-create:", signInErr.message);
+        } else {
+          accessToken = signIn.session?.access_token;
+        }
+      } catch (e: any) {
+        console.error("⚠️ register: exceção no signIn pós-create:", e?.message || e);
+      }
+
+      return res.status(200).json({
+        success: true,
+        user: { ...fullUser, access_token: accessToken },
+      });
     } catch (error: any) {
       console.error("🚨 ERRO FATAL REGISTRO:", error);
       return res.status(500).json({
@@ -255,15 +354,56 @@ async function startServer() {
   });
 
   app.post("/api/login", async (req, res) => {
-    const email = req.body.email?.trim().toLowerCase();
-    const { password } = req.body;
+    const email = req.body?.email?.trim().toLowerCase();
+    const password = req.body?.password;
+
+    if (!email || !password) {
+      console.error("🚨 [LOGIN] payload inválido:", {
+        hasEmail: !!email,
+        hasPassword: !!password,
+      });
+      return res.status(400).json({
+        success: false,
+        message: "E-mail e senha são obrigatórios.",
+      });
+    }
+
     try {
-      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({ email, password });
+      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+
       if (authError) {
-        const msg = authError.message.includes("Email not confirmed")
+        // Logging detalhado para diagnóstico — mostra o erro REAL do Supabase
+        console.error("🚨 [LOGIN] supabase.auth.signInWithPassword falhou:", {
+          email,
+          status: (authError as any)?.status,
+          code: (authError as any)?.code,
+          name: authError.name,
+          message: authError.message,
+          stack: authError.stack,
+        });
+
+        const msg = authError.message?.toLowerCase().includes("email not confirmed")
           ? "Verifique seu e-mail antes de acessar."
           : "E-mail ou senha incorretos.";
-        return res.status(401).json({ success: false, message: msg });
+        return res.status(401).json({
+          success: false,
+          message: msg,
+          // expõe o detalhe real só em dev (NODE_ENV != production)
+          ...(process.env.NODE_ENV !== "production"
+            ? { details: authError.message }
+            : {}),
+        });
+      }
+
+      if (!authData?.user || !authData?.session?.access_token) {
+        console.error("🚨 [LOGIN] resposta do Supabase sem user/session:", authData);
+        return res.status(500).json({
+          success: false,
+          message: "Falha ao autenticar (sessão ausente).",
+        });
       }
 
       const { data: profile, error: profileError } = await supabaseAdmin
@@ -273,24 +413,48 @@ async function startServer() {
         .maybeSingle();
 
       if (profileError) {
-        console.error("Erro na Rota /api/login (users):", profileError);
-        return res.status(500).json({ success: false, message: "Erro ao carregar perfil." });
+        console.error("🚨 [LOGIN] erro lendo profile (users):", profileError);
+        return res.status(500).json({
+          success: false,
+          message: "Erro ao carregar perfil.",
+          details: profileError.message,
+        });
       }
 
       if (!profile) {
+        console.error("🚨 [LOGIN] PROFILE_NOT_FOUND para auth user:", authData.user.id);
         return res.status(404).json({
           success: false,
           message: "PROFILE_NOT_FOUND",
         });
       }
 
-      res.json({
+      // Devolve o objeto completo: user (com access_token mergeado para
+      // compatibilidade com o helper getStoredAccessToken do front) E
+      // o session no topo, conforme exigido.
+      return res.json({
         success: true,
-        user: { ...profile, access_token: authData.session?.access_token },
+        user: { ...profile, access_token: authData.session.access_token },
+        session: {
+          access_token: authData.session.access_token,
+          refresh_token: authData.session.refresh_token,
+          expires_at: authData.session.expires_at,
+          expires_in: authData.session.expires_in,
+          token_type: authData.session.token_type,
+        },
       });
     } catch (error: any) {
-      console.error("Erro na Rota /api/login:", error);
-      res.status(500).json({ success: false, message: "Erro interno no servidor." });
+      console.error("🚨 [LOGIN] exceção inesperada:", {
+        message: error?.message,
+        name: error?.name,
+        stack: error?.stack,
+        error,
+      });
+      res.status(500).json({
+        success: false,
+        message: "Erro interno no servidor.",
+        details: error?.message || String(error),
+      });
     }
   });
 
@@ -339,11 +503,8 @@ async function startServer() {
 
   // --- USUÁRIO ---
 
-  app.get("/api/user", async (req, res) => {
-    const userId = req.query.userId as string;
-    if (!userId) {
-      return res.status(400).json({ error: "userId is required" });
-    }
+  app.get("/api/user", authenticateUser, async (req, res) => {
+    const userId = (req as AuthedRequest).user.id;
     try {
       const { data, error } = await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle();
       if (error) return res.status(400).json({ error: error.message });
@@ -357,20 +518,16 @@ async function startServer() {
 
   // --- VEÍCULOS (service role: compatível com RLS no cliente anônimo) ---
 
-  app.get("/api/vehicles", async (req, res) => {
-    const userId = req.query.userId as string;
-    if (!userId) return res.status(400).json({ error: "userId is required" });
+  app.get("/api/vehicles", authenticateUser, async (req, res) => {
+    const userId = (req as AuthedRequest).user.id;
     const { data: vehicles, error } = await supabaseAdmin.from("vehicles").select("*").eq("user_id", userId);
     if (error) return res.status(400).json({ error: error.message });
     res.json(vehicles ?? []);
   });
 
-  app.post("/api/vehicles", async (req, res) => {
+  app.post("/api/vehicles", authenticateUser, async (req, res) => {
     const body = (req.body ?? {}) as VehicleCreatePayload;
-    const user_id = body.user_id;
-    if (user_id == null) {
-      return res.status(400).json({ error: "user_id is required" });
-    }
+    const user_id = (req as AuthedRequest).user.id;
 
     const vehicleData = pickFields<Vehicle, (typeof VEHICLE_INSERT_FIELDS)[number]>(
       body as Partial<Vehicle>,
@@ -418,10 +575,11 @@ async function startServer() {
     return res.status(200).json(createdVehicle);
   });
 
-  app.put("/api/vehicles/:id", async (req, res) => {
+  app.put("/api/vehicles/:id", authenticateUser, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid vehicle id" });
 
+    const userId = (req as AuthedRequest).user.id;
     const { data: existing, error: exErr } = await supabaseAdmin
       .from("vehicles")
       .select("user_id")
@@ -429,6 +587,9 @@ async function startServer() {
       .maybeSingle();
     if (exErr) return res.status(400).json({ error: exErr.message });
     if (!existing) return res.status(404).json({ error: "Vehicle not found" });
+    if (String(existing.user_id) !== String(userId)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
     const body = (req.body ?? {}) as Partial<Vehicle>;
     const filtered = pickFields<Vehicle, (typeof VEHICLE_UPDATE_FIELDS)[number]>(
@@ -448,9 +609,13 @@ async function startServer() {
     res.json(data);
   });
 
-  app.post("/api/vehicles/:id/archive", async (req, res) => {
+  app.post("/api/vehicles/:id/archive", authenticateUser, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid vehicle id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await vehicleBelongsToUser(userId, id))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const deleted_at = new Date().toISOString();
     const { data, error } = await supabaseAdmin
       .from("vehicles")
@@ -462,9 +627,13 @@ async function startServer() {
     res.json(data);
   });
 
-  app.post("/api/vehicles/:id/mileage", async (req, res) => {
+  app.post("/api/vehicles/:id/mileage", authenticateUser, async (req, res) => {
     const vehicleId = parseInt(req.params.id, 10);
     if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const mileage = Number(req.body.mileage);
     const date = (req.body.date as string) || new Date().toISOString().split("T")[0];
     if (Number.isNaN(mileage)) return res.status(400).json({ error: "Invalid mileage" });
@@ -482,9 +651,13 @@ async function startServer() {
     res.json(v);
   });
 
-  app.get("/api/vehicles/:vehicleId/mileage", async (req, res) => {
+  app.get("/api/vehicles/:vehicleId/mileage", authenticateUser, async (req, res) => {
     const vehicleId = parseInt(req.params.vehicleId, 10);
     if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const { data, error } = await supabaseAdmin
       .from("mileage_logs")
       .select("*")
@@ -497,12 +670,16 @@ async function startServer() {
     res.json(data ?? []);
   });
 
-  app.put("/api/vehicles/:vehicleId/mileage/:logId", async (req, res) => {
+  app.put("/api/vehicles/:vehicleId/mileage/:logId", authenticateUser, async (req, res) => {
     try {
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const logId = req.params.logId;
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (!logId) return res.status(400).json({ error: "Invalid log id" });
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
       const filtered = pickFields<{ date: string; mileage: number; notes: string }, (typeof MILEAGE_LOG_FIELDS)[number]>(
         (req.body ?? {}) as Partial<{ date: string; mileage: number; notes: string }>,
@@ -528,12 +705,16 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/vehicles/:vehicleId/mileage/:logId", async (req, res) => {
+  app.delete("/api/vehicles/:vehicleId/mileage/:logId", authenticateUser, async (req, res) => {
     try {
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const logId = req.params.logId;
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (!logId) return res.status(400).json({ error: "Invalid log id" });
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
       const { error } = await supabaseAdmin
         .from("mileage_logs")
@@ -562,9 +743,13 @@ async function startServer() {
     }
   });
 
-  app.get("/api/vehicles/:vehicleId/logs", async (req, res) => {
+  app.get("/api/vehicles/:vehicleId/logs", authenticateUser, async (req, res) => {
     const vehicleId = parseInt(req.params.vehicleId, 10);
     if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const { data, error } = await supabaseAdmin
       .from("maintenance_logs")
       .select("*")
@@ -574,12 +759,16 @@ async function startServer() {
     res.json(data ?? []);
   });
 
-  app.put("/api/vehicles/:vehicleId/maintenance/:recordId", async (req, res) => {
+  app.put("/api/vehicles/:vehicleId/maintenance/:recordId", authenticateUser, async (req, res) => {
     try {
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const recordId = parseInt(req.params.recordId, 10);
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (Number.isNaN(recordId)) return res.status(400).json({ error: "Invalid record id" });
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
       const filtered = pickFields<MaintenanceLog, (typeof MAINTENANCE_LOG_FIELDS)[number]>(
         (req.body ?? {}) as Partial<MaintenanceLog>,
@@ -604,12 +793,16 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/vehicles/:vehicleId/maintenance/:recordId", async (req, res) => {
+  app.delete("/api/vehicles/:vehicleId/maintenance/:recordId", authenticateUser, async (req, res) => {
     try {
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const recordId = parseInt(req.params.recordId, 10);
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (Number.isNaN(recordId)) return res.status(400).json({ error: "Invalid record id" });
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
       const { error } = await supabaseAdmin
         .from("maintenance_logs")
@@ -627,12 +820,16 @@ async function startServer() {
     }
   });
 
-  app.put("/api/vehicles/:vehicleId/financial/:recordId", async (req, res) => {
+  app.put("/api/vehicles/:vehicleId/financial/:recordId", authenticateUser, async (req, res) => {
     try {
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const recordId = parseInt(req.params.recordId, 10);
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (Number.isNaN(recordId)) return res.status(400).json({ error: "Invalid record id" });
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
       const filtered = pickFields<FinancialRecord, (typeof FINANCIAL_RECORD_FIELDS)[number]>(
         (req.body ?? {}) as Partial<FinancialRecord>,
@@ -657,12 +854,16 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/vehicles/:vehicleId/financial/:recordId", async (req, res) => {
+  app.delete("/api/vehicles/:vehicleId/financial/:recordId", authenticateUser, async (req, res) => {
     try {
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const recordId = parseInt(req.params.recordId, 10);
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (Number.isNaN(recordId)) return res.status(400).json({ error: "Invalid record id" });
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
       const { error } = await supabaseAdmin
         .from("financial_records")
@@ -680,9 +881,13 @@ async function startServer() {
     }
   });
 
-  app.get("/api/vehicles/:vehicleId/financial", async (req, res) => {
+  app.get("/api/vehicles/:vehicleId/financial", authenticateUser, async (req, res) => {
     const vehicleId = parseInt(req.params.vehicleId, 10);
     if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await vehicleBelongsToUser(userId, vehicleId))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const { data, error } = await supabaseAdmin.from("financial_records").select("*").eq("vehicle_id", vehicleId);
     if (error) return res.status(400).json({ error: error.message });
     res.json(data ?? []);
@@ -690,9 +895,13 @@ async function startServer() {
 
   // --- MANUTENÇÃO / FINANCEIRO ---
 
-  app.post("/api/logs", async (req, res) => {
+  app.post("/api/logs", authenticateUser, async (req, res) => {
     const { id: _id, vehicle_id, ...fields } = req.body;
     if (!vehicle_id) return res.status(400).json({ error: "vehicle_id is required" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await vehicleBelongsToUser(userId, Number(vehicle_id)))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const { data, error } = await supabaseAdmin
       .from("maintenance_logs")
       .insert({ vehicle_id, ...fields })
@@ -702,9 +911,13 @@ async function startServer() {
     res.json(data);
   });
 
-  app.post("/api/financial", async (req, res) => {
+  app.post("/api/financial", authenticateUser, async (req, res) => {
     const { id: _id, vehicle_id, ...fields } = req.body;
     if (!vehicle_id) return res.status(400).json({ error: "vehicle_id is required" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await vehicleBelongsToUser(userId, Number(vehicle_id)))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const { data, error } = await supabaseAdmin
       .from("financial_records")
       .insert({ vehicle_id, ...fields })
@@ -716,9 +929,8 @@ async function startServer() {
 
   // --- CHAT ---
 
-  app.get("/api/chat/sessions", async (req, res) => {
-    const userId = req.query.userId as string;
-    if (!userId) return res.status(400).json({ error: "userId is required" });
+  app.get("/api/chat/sessions", authenticateUser, async (req, res) => {
+    const userId = (req as AuthedRequest).user.id;
     const { data, error } = await supabaseAdmin
       .from("chat_sessions")
       .select("*")
@@ -728,10 +940,14 @@ async function startServer() {
     res.json(data ?? []);
   });
 
-  app.post("/api/chat/sessions", async (req, res) => {
+  app.post("/api/chat/sessions", authenticateUser, async (req, res) => {
     try {
-      const { user_id, vehicle_id, title } = req.body ?? {};
-      if (!user_id) return res.status(400).json({ error: "user_id is required" });
+      const { vehicle_id, title } = req.body ?? {};
+      const user_id = (req as AuthedRequest).user.id;
+      // Se um vehicle_id veio, garante que pertence ao usuário autenticado
+      if (vehicle_id != null && !(await vehicleBelongsToUser(user_id, Number(vehicle_id)))) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
       const { data, error } = await supabaseAdmin
         .from("chat_sessions")
         .insert({
@@ -752,17 +968,25 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/chat/sessions/:id", async (req, res) => {
+  app.delete("/api/chat/sessions/:id", authenticateUser, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid session id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await chatSessionBelongsToUser(userId, id))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const { error } = await supabaseAdmin.from("chat_sessions").delete().eq("id", id);
     if (error) return res.status(400).json({ error: error.message });
     res.json({ success: true });
   });
 
-  app.get("/api/chat/sessions/:sessionId/messages", async (req, res) => {
+  app.get("/api/chat/sessions/:sessionId/messages", authenticateUser, async (req, res) => {
     const sessionId = parseInt(req.params.sessionId, 10);
     if (Number.isNaN(sessionId)) return res.status(400).json({ error: "Invalid session id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await chatSessionBelongsToUser(userId, sessionId))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const { data, error } = await supabaseAdmin
       .from("chat_messages")
       .select("*")
@@ -772,11 +996,15 @@ async function startServer() {
     res.json(data ?? []);
   });
 
-  app.post("/api/chat/messages", async (req, res) => {
+  app.post("/api/chat/messages", authenticateUser, async (req, res) => {
     try {
       const { session_id, sender, content } = req.body ?? {};
       if (!session_id || !sender || content == null) {
         return res.status(400).json({ error: "session_id, sender and content are required" });
+      }
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await chatSessionBelongsToUser(userId, Number(session_id)))) {
+        return res.status(403).json({ error: "Forbidden" });
       }
       const { data, error } = await supabaseAdmin
         .from("chat_messages")
@@ -801,8 +1029,9 @@ async function startServer() {
     }
   });
 
-  app.post("/api/chat", async (req, res) => {
-    const { message, vehicleId, userId } = req.body ?? {};
+  app.post("/api/chat", authenticateUser, async (req, res) => {
+    const { message, vehicleId } = req.body ?? {};
+    const userId = (req as AuthedRequest).user.id;
 
     if (!geminiApiKey) {
       console.error("🚨 ERRO CHAT IA: GEMINI_API_KEY ausente no servidor.");
@@ -817,15 +1046,26 @@ async function startServer() {
     }
 
     try {
-      const { data: user, error: userErr } = userId
-        ? await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle()
-        : { data: null, error: null };
+      const { data: user, error: userErr } = await supabaseAdmin
+        .from("users")
+        .select("*")
+        .eq("id", userId)
+        .maybeSingle();
       if (userErr) console.error("⚠️ chat: erro lendo users:", userErr);
 
-      const { data: vehicle, error: vehErr } = vehicleId
-        ? await supabaseAdmin.from("vehicles").select("*").eq("id", vehicleId).maybeSingle()
-        : { data: null, error: null };
-      if (vehErr) console.error("⚠️ chat: erro lendo vehicles:", vehErr);
+      // Só carrega o veículo se ele pertencer ao usuário autenticado
+      let vehicle: any = null;
+      if (vehicleId != null) {
+        if (await vehicleBelongsToUser(userId, Number(vehicleId))) {
+          const { data: v, error: vehErr } = await supabaseAdmin
+            .from("vehicles")
+            .select("*")
+            .eq("id", vehicleId)
+            .maybeSingle();
+          if (vehErr) console.error("⚠️ chat: erro lendo vehicles:", vehErr);
+          vehicle = v ?? null;
+        }
+      }
 
       const vehicleContext = vehicle
         ? `${vehicle.brand ?? ""} ${vehicle.model ?? ""} (${vehicle.year ?? "?"})`.trim()
@@ -860,6 +1100,396 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         text: "O Dr. Graxa está em manutenção. Tente logo mais.",
         details: error?.message || String(error),
       });
+    }
+  });
+
+  // --- PAGAMENTOS / MERCADO PAGO ---
+
+  app.post("/api/checkout", authenticateUser, async (req, res) => {
+    try {
+      if (!mpAccessToken) {
+        return res.status(500).json({
+          success: false,
+          message: "Mercado Pago não configurado no servidor.",
+        });
+      }
+
+      const userId = (req as AuthedRequest).user.id;
+      const tokenEmail = (req as AuthedRequest).user.email || "";
+      const { userEmail: bodyEmail } = (req.body ?? {}) as { userEmail?: string };
+      const userEmail =
+        typeof bodyEmail === "string" && bodyEmail.trim() ? bodyEmail : tokenEmail;
+
+      if (typeof userEmail !== "string" || !userEmail.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: "userEmail é obrigatório para criar assinatura no Mercado Pago.",
+        });
+      }
+
+      // Retorno ao app após fluxo Mercado Pago: PreApproval só aceita o campo
+      // singular `back_url` (não há `back_urls` como em Preference).
+      // MP_BACK_URL deve ser o deep link revisauto://... ou HTTPS (App Link).
+      const backUrl = (process.env.MP_BACK_URL || "").trim();
+      if (!backUrl) {
+        console.error("[MP Checkout] MP_BACK_URL ausente no ambiente.");
+        return res.status(500).json({
+          success: false,
+          message: "Configuração de retorno Mercado Pago ausente (MP_BACK_URL).",
+        });
+      }
+      console.log("[MP Checkout] Criando PreApproval", { back_url: backUrl, user_id: userId });
+
+      // PreApproval (Assinatura recorrente)
+      const preApprovalClient = new PreApproval(mpClient);
+      const preApprovalBody: Record<string, any> = {
+        reason: "RevisAuto Premium - Assinatura Mensal",
+        auto_recurring: {
+          frequency: 1,
+          frequency_type: "months",
+          transaction_amount: 14.9,
+          currency_id: "BRL",
+        },
+        back_url: backUrl,
+        external_reference: userId,
+        payer_email: userEmail.trim().toLowerCase(),
+        status: "pending" as const,
+      };
+
+      const preApproval = await preApprovalClient.create({ body: preApprovalBody as any });
+
+      if (!preApproval?.init_point) {
+        console.error("🚨 ERRO CHECKOUT MP (PreApproval): init_point ausente", preApproval);
+        return res.status(502).json({
+          success: false,
+          message: "Mercado Pago não retornou um link de assinatura.",
+        });
+      }
+
+      return res.json({
+        success: true,
+        init_point: preApproval.init_point,
+        preapproval_id: preApproval.id,
+      });
+    } catch (error: any) {
+      console.error("🚨 ERRO CHECKOUT MP (PreApproval):", error);
+      return res.status(500).json({
+        success: false,
+        message: "Erro ao gerar assinatura do Mercado Pago.",
+        details: error?.message || String(error),
+      });
+    }
+  });
+
+  async function upgradeUserToPremium(userId: string, sourceLog: string) {
+    const { error } = await supabaseAdmin
+      .from("users")
+      .update({ plan: "premium" })
+      .eq("id", String(userId));
+
+    if (error) {
+      console.error("🚨 [MP Webhook] Erro ao atualizar plano premium:", error);
+      return;
+    }
+    console.log(`✅ [MP Webhook] Usuário ${userId} promovido a premium (${sourceLog}).`);
+  }
+
+  async function downgradeUserToFree(userId: string, reason: string) {
+    const { error } = await supabaseAdmin
+      .from("users")
+      .update({ plan: "free" })
+      .eq("id", String(userId));
+
+    if (error) {
+      console.error("🚨 [MP Webhook] Erro ao rebaixar para free:", error);
+      return;
+    }
+    console.log(`[MP Webhook] DOWNGRADE usuário=${userId} motivo=${reason}`);
+  }
+
+  /**
+   * Valida a assinatura HMAC-SHA256 do webhook do Mercado Pago.
+   *
+   * Cabeçalhos enviados pelo MP:
+   *   x-signature: ts=<unix_ts>,v1=<hex_hmac>
+   *   x-request-id: <uuid>
+   *
+   * Manifest oficial:
+   *   id:{data.id};request-id:{x-request-id};ts:{ts};
+   *
+   * Compara HMAC-SHA256(secret, manifest) com v1 em tempo constante.
+   * O secret vem do painel do MP (Webhooks → "Chave secreta") e deve
+   * estar em process.env.MP_WEBHOOK_SECRET.
+   *
+   * Dev local: só se NODE_ENV≠production pode-se definir MP_WEBHOOK_SKIP_SIGNATURE=true
+   * para ignorar headers (uso com ngrok/mock); não use em Render.
+   */
+  function verifyMercadoPagoSignature(req: express.Request): {
+    ok: boolean;
+    reason?: string;
+  } {
+    const secret = (process.env.MP_WEBHOOK_SECRET || "").trim();
+    const allowSkip =
+      process.env.MP_WEBHOOK_SKIP_SIGNATURE === "true" && process.env.NODE_ENV !== "production";
+
+    // MP_WEBHOOK_SECRET obrigatório (Render/produção). Em dev apenas, permite
+    // MP_WEBHOOK_SKIP_SIGNATURE=true para testes sem assinatura fake.
+    if (!secret && !allowSkip) {
+      return { ok: false, reason: "MP_WEBHOOK_SECRET ausente — configure no painel do MP." };
+    }
+    if (!secret && allowSkip) {
+      console.warn("[MP Webhook] Assinatura ignorada (MP_WEBHOOK_SKIP_SIGNATURE=true, dev apenas).");
+      return { ok: true };
+    }
+
+    const sigHeader = req.headers["x-signature"];
+    const requestId = req.headers["x-request-id"];
+
+    if (typeof sigHeader !== "string" || typeof requestId !== "string") {
+      return { ok: false, reason: "x-signature/x-request-id ausentes." };
+    }
+
+    // Parse "ts=...,v1=..."
+    let ts: string | null = null;
+    let v1: string | null = null;
+    for (const part of sigHeader.split(",")) {
+      const [k, v] = part.trim().split("=");
+      if (k === "ts") ts = v;
+      if (k === "v1") v1 = v;
+    }
+    if (!ts || !v1) {
+      return { ok: false, reason: "x-signature mal formado." };
+    }
+
+    // data.id pode chegar via query (?data.id=123) ou no corpo (data.id)
+    const dataIdQuery = (req.query as any)?.["data.id"];
+    const dataIdBody = (req.body as any)?.data?.id;
+    const dataId =
+      typeof dataIdQuery === "string"
+        ? dataIdQuery
+        : dataIdBody != null
+          ? String(dataIdBody)
+          : "";
+
+    const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
+    const expected = crypto.createHmac("sha256", secret).update(manifest).digest("hex");
+
+    let a: Buffer;
+    let b: Buffer;
+    try {
+      a = Buffer.from(expected, "hex");
+      b = Buffer.from(v1, "hex");
+    } catch {
+      return { ok: false, reason: "v1 não é hex válido." };
+    }
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return { ok: false, reason: "HMAC mismatch." };
+    }
+    console.log("[MP Webhook] x_signature_valid", {
+      requestId,
+      manifestLength: manifest.length,
+    });
+    return { ok: true };
+  }
+
+  app.post("/api/webhook", async (req, res) => {
+    const receivedAt = new Date().toISOString();
+    const queryDataId =
+      typeof (req.query as Record<string, string>)?.["data.id"] === "string"
+        ? (req.query as Record<string, string>)["data.id"]
+        : undefined;
+    console.log("[MP Webhook] event_received", receivedAt, {
+      path: req.path,
+      query_data_id: queryDataId,
+      x_request_id: req.headers["x-request-id"],
+      has_x_signature: typeof req.headers["x-signature"] === "string",
+    });
+
+    // 1) Validação HMAC usando MP_WEBHOOK_SECRET + headers x-signature / x-request-id
+    const sigCheck = verifyMercadoPagoSignature(req);
+    if (!sigCheck.ok) {
+      console.error("[MP Webhook] signature_REJECTED:", sigCheck.reason);
+      return res.status(401).json({ ok: false, error: "invalid_signature" });
+    }
+    console.log("[MP Webhook] signature_VERIFIED_ok");
+
+    // 2) Responde 200 cedo para o MP não reenviar
+    res.status(200).send("ok");
+    console.log("[MP Webhook] response_sent_200");
+
+    try {
+      const body = (req.body ?? {}) as Record<string, any>;
+      console.log("[MP Webhook] body_received", JSON.stringify(body));
+
+      if (!mpAccessToken) {
+        console.error("[MP Webhook] SKIP no MP_ACCESS_TOKEN");
+        return;
+      }
+
+      const type: string = body.type || body.topic || "";
+      const resourceId =
+        body?.data?.id ||
+        body?.resource ||
+        (typeof body?.id !== "undefined" ? body.id : undefined);
+
+      console.log("[MP Webhook] parsed", {
+        type,
+        resourceId,
+        action: body.action,
+      });
+
+      if (!type || !resourceId) {
+        console.log("[MP Webhook] ignored_missing_type_or_id", { type, resourceId });
+        return;
+      }
+
+      // --- PreApproval (assinatura) ---
+      if (type === "subscription_preapproval" || type === "preapproval") {
+        console.log("[MP Webhook] branch=subscription_preapproval", { resourceId });
+        const sub = await new PreApproval(mpClient).get({ id: String(resourceId) });
+        const mpStatus = (sub?.status || "").toLowerCase();
+        console.log("[MP Webhook] api_preapproval_loaded", {
+          id: sub?.id,
+          status: sub?.status,
+          status_normalized: mpStatus,
+        });
+
+        const userId = sub?.external_reference;
+        if (!userId) {
+          console.error("[MP Webhook] preapproval_missing_external_reference", { mpId: sub?.id });
+          return;
+        }
+
+        // authorized/active → manter garantido como premium (idempotente)
+        if (mpStatus === "authorized" || mpStatus === "active") {
+          console.log("[MP Webhook] plan_action=ensure_premium user=", userId);
+          await upgradeUserToPremium(
+            String(userId),
+            `preapproval ${sub.id} ${mpStatus}`,
+          );
+          console.log("[MP Webhook] plan_action_done=ensure_premium");
+          return;
+        }
+
+        // cancelled / paused / unpaid → downgrade imediato
+        if (mpStatus === "cancelled" || mpStatus === "paused" || mpStatus === "unpaid") {
+          console.log("[MP Webhook] plan_action=downgrade_to_free user=", userId);
+          await downgradeUserToFree(
+            String(userId),
+            `preapproval ${sub.id} ${mpStatus}`,
+          );
+          console.log("[MP Webhook] plan_action_done=downgrade_to_free");
+          return;
+        }
+
+        console.log("[MP Webhook] preapproval_no_plan_change", {
+          id: sub?.id,
+          status: sub?.status,
+        });
+        return;
+      }
+
+      // Cobrança recorrente dentro de uma assinatura.
+      // Pagamento aprovado mantém premium; recusado/charged_back/refunded
+      // = inadimplência → rebaixa pra free.
+      if (type === "subscription_authorized_payment") {
+        console.log("[MP Webhook] branch=subscription_authorized_payment", { resourceId });
+        try {
+          const payment = await new Payment(mpClient).get({ id: String(resourceId) });
+          const payStatus = (payment?.status || "").toLowerCase();
+          console.log("[MP Webhook] api_payment_loaded", {
+            id: payment?.id,
+            status: payment?.status,
+            status_normalized: payStatus,
+          });
+
+          const userId = payment?.external_reference;
+          if (!userId) {
+            console.error("[MP Webhook] authorized_payment_missing_external_reference id=", payment?.id);
+            return;
+          }
+          switch (payment?.status) {
+            case "approved":
+              console.log("[MP Webhook] plan_action=ensure_premium_via_payment user=", userId);
+              await upgradeUserToPremium(
+                String(userId),
+                `authorized_payment ${payment.id} approved`,
+              );
+              console.log("[MP Webhook] plan_action_done=ensure_premium_via_payment");
+              break;
+            case "rejected":
+            case "cancelled":
+            case "refunded":
+            case "charged_back":
+              console.log("[MP Webhook] plan_action=downgrade_payment user=", userId, payment?.status);
+              await downgradeUserToFree(
+                String(userId),
+                `authorized_payment ${payment.id} ${payment.status}`,
+              );
+              console.log("[MP Webhook] plan_action_done=downgrade_payment");
+              break;
+            default:
+              console.log(
+                "[MP Webhook] authorized_payment_no_action id=",
+                payment?.id,
+                "status=",
+                payment?.status,
+              );
+          }
+        } catch (err: any) {
+          console.error(
+            "[MP Webhook] subscription_authorized_payment_FETCH_ERROR:",
+            err?.message || err,
+          );
+        }
+        return;
+      }
+
+      // Pagamento avulso (compatibilidade — não é o fluxo principal)
+      if (type === "payment") {
+        console.log("[MP Webhook] branch=payment", { resourceId });
+        const payment = await new Payment(mpClient).get({ id: String(resourceId) });
+        console.log("[MP Webhook] api_payment_loaded", {
+          id: payment?.id,
+          status: payment?.status,
+        });
+
+        const userId = payment?.external_reference;
+        if (!userId) {
+          console.error("[MP Webhook] payment_missing_external_reference id=", payment?.id);
+          return;
+        }
+        switch (payment?.status) {
+          case "approved":
+            console.log("[MP Webhook] plan_action=ensure_premium_oneoff user=", userId);
+            await upgradeUserToPremium(String(userId), `payment ${payment.id} approved`);
+            console.log("[MP Webhook] plan_action_done=ensure_premium_oneoff");
+            break;
+          case "rejected":
+          case "cancelled":
+          case "refunded":
+          case "charged_back":
+            console.log("[MP Webhook] plan_action=downgrade_oneoff user=", userId, payment?.status);
+            await downgradeUserToFree(
+              String(userId),
+              `payment ${payment.id} ${payment.status}`,
+            );
+            console.log("[MP Webhook] plan_action_done=downgrade_oneoff");
+            break;
+          default:
+            console.log(
+              "[MP Webhook] payment_no_action id=",
+              payment?.id,
+              "status=",
+              payment?.status,
+            );
+        }
+        return;
+      }
+
+      console.log("[MP Webhook] type_unhandled=", type);
+    } catch (error: any) {
+      console.error("🚨 ERRO WEBHOOK MP (pós-200):", error?.message || error);
     }
   });
 
