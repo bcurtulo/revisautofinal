@@ -6,6 +6,18 @@ import { GoogleGenAI } from "@google/genai";
 import { MercadoPagoConfig, PreApproval, Payment } from "mercadopago";
 import fetch from "cross-fetch";
 import type { User, Vehicle, MaintenanceLog, FinancialRecord } from "./src/types.ts";
+import {
+  normalizePlan,
+  type PlanTier,
+  VEHICLE_LIMIT,
+  AI_MESSAGE_MONTHLY_LIMIT,
+  CHECKOUT_PRICES_BRL,
+  buildMpExternalReference,
+  parseMpExternalReference,
+  normalizeCheckoutPeriod,
+  type CheckoutPlan,
+  type CheckoutPeriod,
+} from "./src/plans.ts";
 
 dotenv.config();
 
@@ -52,6 +64,87 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   global: { fetch },
 });
 
+function utcYearMonth(d: Date): string {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+async function countActiveVehiclesForUser(userId: string): Promise<number> {
+  const { count, error } = await supabaseAdmin
+    .from("vehicles")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .neq("status", "archived");
+  if (error) {
+    console.error("countActiveVehiclesForUser:", error);
+    return 999;
+  }
+  return count ?? 0;
+}
+
+/** Reseta contador IA no banco se mudou o mês UTC; retorna uso efetivo. */
+async function getEffectiveAiUsage(userId: string): Promise<{
+  tier: PlanTier;
+  count: number;
+  limit: number;
+}> {
+  const { data: row, error } = await supabaseAdmin
+    .from("users")
+    .select("plan, plan_type, ai_messages_count, last_ai_message_date")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) console.error("getEffectiveAiUsage select:", error);
+  const tier = effectivePlanTierFromRow(row?.plan as string | undefined, row?.plan_type as string | undefined);
+  const lim = AI_MESSAGE_MONTHLY_LIMIT[tier];
+  let count = Number(row?.ai_messages_count ?? 0) || 0;
+  const last = row?.last_ai_message_date;
+  const now = new Date();
+  if (last) {
+    const lastYm = utcYearMonth(new Date(last));
+    if (lastYm !== utcYearMonth(now)) {
+      count = 0;
+      await supabaseAdmin.from("users").update({ ai_messages_count: 0 }).eq("id", userId);
+    }
+  }
+  return { tier, count, limit: lim };
+}
+
+async function incrementAiMessageCount(userId: string, previousCount: number): Promise<void> {
+  await supabaseAdmin
+    .from("users")
+    .update({
+      ai_messages_count: previousCount + 1,
+      last_ai_message_date: new Date().toISOString(),
+    })
+    .eq("id", userId);
+}
+
+function effectivePlanTierFromRow(plan?: string | null, plan_type?: string | null): PlanTier {
+  const raw =
+    typeof plan_type === "string" && plan_type.trim() ? plan_type : typeof plan === "string" ? plan : "";
+  return normalizePlan(raw || "free");
+}
+
+async function fetchUserTier(userId: string): Promise<PlanTier> {
+  const { data, error } = await supabaseAdmin
+    .from("users")
+    .select("plan, plan_type")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) console.error("fetchUserTier:", error);
+  return effectivePlanTierFromRow(data?.plan as string | undefined, data?.plan_type as string | undefined);
+}
+
+async function userHasFinancialAccess(userId: string): Promise<boolean> {
+  const tier = await fetchUserTier(userId);
+  return tier !== "free";
+}
+
+/** Dr. Graxa e histórico de chat: Plus ou Premium. */
+async function userCanUseAdvisor(userId: string): Promise<boolean> {
+  const tier = await fetchUserTier(userId);
+  return tier !== "free";
+}
+
 const geminiApiKey = process.env.GEMINI_API_KEY || "";
 if (!geminiApiKey) {
   console.error("🚨 GEMINI_API_KEY ausente no .env — Dr. Graxa não funcionará.");
@@ -97,7 +190,7 @@ type RegisterPayload = Partial<User> & {
 
 type VehicleCreatePayload = Partial<Vehicle> & { user_id?: Vehicle["user_id"] };
 
-const MILEAGE_LOG_FIELDS = ["date", "mileage", "notes"] as const;
+const MILEAGE_LOG_FIELDS = ["date", "mileage", "notes", "valor", "litros"] as const;
 
 const MAINTENANCE_LOG_FIELDS = [
   "type",
@@ -541,10 +634,22 @@ async function startServer() {
       return res.status(400).json({ error: "Missing required vehicle fields (type, brand, model, year)" });
     }
 
-    const { data: userRow } = await supabaseAdmin.from("users").select("plan").eq("id", user_id).single();
+    const { data: userRow } = await supabaseAdmin.from("users").select("plan, plan_type").eq("id", user_id).single();
+    const tier = effectivePlanTierFromRow(userRow?.plan as string | undefined, userRow?.plan_type as string | undefined);
+    const maxV = VEHICLE_LIMIT[tier];
+
+    const activeCount = await countActiveVehiclesForUser(user_id);
+    if (activeCount >= maxV) {
+      return res.status(403).json({
+        error: "vehicle_limit_reached",
+        message: `Limite de veículos do plano atingido (${maxV}). Faça upgrade para adicionar mais.`,
+        maxVehicles: maxV,
+        plan: tier,
+      });
+    }
 
     const insertPayload: Record<string, unknown> = { user_id, ...vehicleData };
-    if (userRow?.plan !== "premium") {
+    if (tier === "free") {
       insertPayload.nickname = null;
       insertPayload.color = null;
     }
@@ -563,7 +668,6 @@ async function startServer() {
     const initialMileage = Number(vehicleData.current_mileage ?? 0);
     const { error: mileageLogError } = await supabaseAdmin.from("mileage_logs").insert({
       vehicle_id: createdVehicle.id,
-      user_id,
       date: new Date().toISOString().split("T")[0],
       mileage: initialMileage,
       notes: "Registro inicial",
@@ -601,8 +705,13 @@ async function startServer() {
     );
     const payload: Record<string, unknown> = { ...filtered };
 
-    const { data: owner } = await supabaseAdmin.from("users").select("plan").eq("id", existing.user_id).single();
-    if (owner?.plan !== "premium") {
+    const { data: owner } = await supabaseAdmin
+      .from("users")
+      .select("plan, plan_type")
+      .eq("id", existing.user_id)
+      .single();
+    const ownerTier = effectivePlanTierFromRow(owner?.plan as string | undefined, owner?.plan_type as string | undefined);
+    if (ownerTier === "free") {
       payload.nickname = null;
       payload.color = null;
     }
@@ -641,7 +750,22 @@ async function startServer() {
     const date = (req.body.date as string) || new Date().toISOString().split("T")[0];
     if (Number.isNaN(mileage)) return res.status(400).json({ error: "Invalid mileage" });
 
-    const { error: insErr } = await supabaseAdmin.from("mileage_logs").insert({ vehicle_id: vehicleId, date, mileage });
+    const valorRaw = req.body.valor;
+    const litrosRaw = req.body.litros;
+    const valor =
+      valorRaw === undefined || valorRaw === null || valorRaw === ""
+        ? null
+        : Number(valorRaw);
+    const litros =
+      litrosRaw === undefined || litrosRaw === null || litrosRaw === ""
+        ? null
+        : Number(litrosRaw);
+    if (valor !== null && Number.isNaN(valor)) return res.status(400).json({ error: "Invalid valor" });
+    if (litros !== null && Number.isNaN(litros)) return res.status(400).json({ error: "Invalid litros" });
+
+    const { error: insErr } = await supabaseAdmin
+      .from("mileage_logs")
+      .insert({ vehicle_id: vehicleId, date, mileage, valor, litros });
     if (insErr) return res.status(400).json({ error: insErr.message });
 
     const { data: v, error: upErr } = await supabaseAdmin
@@ -684,11 +808,30 @@ async function startServer() {
         return res.status(403).json({ error: "Forbidden" });
       }
 
-      const filtered = pickFields<{ date: string; mileage: number; notes: string }, (typeof MILEAGE_LOG_FIELDS)[number]>(
-        (req.body ?? {}) as Partial<{ date: string; mileage: number; notes: string }>,
+      type MileageLogUpdate = {
+        date: string;
+        mileage: number;
+        notes: string;
+        valor: number | null;
+        litros: number | null;
+      };
+      const filtered = pickFields<MileageLogUpdate, (typeof MILEAGE_LOG_FIELDS)[number]>(
+        (req.body ?? {}) as Partial<MileageLogUpdate>,
         MILEAGE_LOG_FIELDS,
       );
       if (filtered.mileage !== undefined) filtered.mileage = Number(filtered.mileage) as any;
+      if (filtered.valor !== undefined) {
+        filtered.valor =
+          filtered.valor === null || (filtered.valor as unknown) === ""
+            ? null
+            : (Number(filtered.valor) as any);
+      }
+      if (filtered.litros !== undefined) {
+        filtered.litros =
+          filtered.litros === null || (filtered.litros as unknown) === ""
+            ? null
+            : (Number(filtered.litros) as any);
+      }
 
       const { data, error } = await supabaseAdmin
         .from("mileage_logs")
@@ -825,11 +968,17 @@ async function startServer() {
 
   app.put("/api/vehicles/:vehicleId/financial/:recordId", authenticateUser, async (req, res) => {
     try {
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await userHasFinancialAccess(userId))) {
+        return res.status(403).json({
+          error: "financial_plan_required",
+          message: "Impostos e multas estão disponíveis nos planos Plus e Premium.",
+        });
+      }
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const recordId = parseInt(req.params.recordId, 10);
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (Number.isNaN(recordId)) return res.status(400).json({ error: "Invalid record id" });
-      const userId = (req as AuthedRequest).user.id;
       if (!(await vehicleBelongsToUser(userId, vehicleId))) {
         return res.status(403).json({ error: "Forbidden" });
       }
@@ -859,11 +1008,17 @@ async function startServer() {
 
   app.delete("/api/vehicles/:vehicleId/financial/:recordId", authenticateUser, async (req, res) => {
     try {
+      const userId = (req as AuthedRequest).user.id;
+      if (!(await userHasFinancialAccess(userId))) {
+        return res.status(403).json({
+          error: "financial_plan_required",
+          message: "Impostos e multas estão disponíveis nos planos Plus e Premium.",
+        });
+      }
       const vehicleId = parseInt(req.params.vehicleId, 10);
       const recordId = parseInt(req.params.recordId, 10);
       if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
       if (Number.isNaN(recordId)) return res.status(400).json({ error: "Invalid record id" });
-      const userId = (req as AuthedRequest).user.id;
       if (!(await vehicleBelongsToUser(userId, vehicleId))) {
         return res.status(403).json({ error: "Forbidden" });
       }
@@ -888,6 +1043,12 @@ async function startServer() {
     const vehicleId = parseInt(req.params.vehicleId, 10);
     if (Number.isNaN(vehicleId)) return res.status(400).json({ error: "Invalid vehicle id" });
     const userId = (req as AuthedRequest).user.id;
+    if (!(await userHasFinancialAccess(userId))) {
+      return res.status(403).json({
+        error: "financial_plan_required",
+        message: "Impostos e multas estão disponíveis nos planos Plus e Premium.",
+      });
+    }
     if (!(await vehicleBelongsToUser(userId, vehicleId))) {
       return res.status(403).json({ error: "Forbidden" });
     }
@@ -915,9 +1076,15 @@ async function startServer() {
   });
 
   app.post("/api/financial", authenticateUser, async (req, res) => {
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await userHasFinancialAccess(userId))) {
+      return res.status(403).json({
+        error: "financial_plan_required",
+        message: "Impostos e multas estão disponíveis nos planos Plus e Premium.",
+      });
+    }
     const { id: _id, vehicle_id, ...fields } = req.body;
     if (!vehicle_id) return res.status(400).json({ error: "vehicle_id is required" });
-    const userId = (req as AuthedRequest).user.id;
     if (!(await vehicleBelongsToUser(userId, Number(vehicle_id)))) {
       return res.status(403).json({ error: "Forbidden" });
     }
@@ -934,6 +1101,12 @@ async function startServer() {
 
   app.get("/api/chat/sessions", authenticateUser, async (req, res) => {
     const userId = (req as AuthedRequest).user.id;
+    if (!(await userCanUseAdvisor(userId))) {
+      return res.status(403).json({
+        error: "advisor_plan_required",
+        message: "Histórico de conversas com o Dr. Graxa está nos planos Plus e Premium.",
+      });
+    }
     const { data, error } = await supabaseAdmin
       .from("chat_sessions")
       .select("*")
@@ -945,8 +1118,14 @@ async function startServer() {
 
   app.post("/api/chat/sessions", authenticateUser, async (req, res) => {
     try {
-      const { vehicle_id, title } = req.body ?? {};
       const user_id = (req as AuthedRequest).user.id;
+      if (!(await userCanUseAdvisor(user_id))) {
+        return res.status(403).json({
+          error: "advisor_plan_required",
+          message: "O Dr. Graxa está nos planos Plus e Premium.",
+        });
+      }
+      const { vehicle_id, title } = req.body ?? {};
       // Se um vehicle_id veio, garante que pertence ao usuário autenticado
       if (vehicle_id != null && !(await vehicleBelongsToUser(user_id, Number(vehicle_id)))) {
         return res.status(403).json({ error: "Forbidden" });
@@ -975,6 +1154,12 @@ async function startServer() {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid session id" });
     const userId = (req as AuthedRequest).user.id;
+    if (!(await userCanUseAdvisor(userId))) {
+      return res.status(403).json({
+        error: "advisor_plan_required",
+        message: "O Dr. Graxa está nos planos Plus e Premium.",
+      });
+    }
     if (!(await chatSessionBelongsToUser(userId, id))) {
       return res.status(403).json({ error: "Forbidden" });
     }
@@ -983,10 +1168,46 @@ async function startServer() {
     res.json({ success: true });
   });
 
+  /** Atualiza título da conversa (ex.: primeira pergunta do usuário como título automático). */
+  app.patch("/api/chat/sessions/:id", authenticateUser, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid session id" });
+    const userId = (req as AuthedRequest).user.id;
+    if (!(await userCanUseAdvisor(userId))) {
+      return res.status(403).json({
+        error: "advisor_plan_required",
+        message: "O Dr. Graxa está nos planos Plus e Premium.",
+      });
+    }
+    if (!(await chatSessionBelongsToUser(userId, id))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    const { title } = (req.body ?? {}) as { title?: unknown };
+    if (typeof title !== "string") {
+      return res.status(400).json({ error: "title is required string" });
+    }
+    const safe = title.trim().replace(/\s+/g, " ").slice(0, 200);
+    if (!safe) return res.status(400).json({ error: "title cannot be empty" });
+    const { data, error } = await supabaseAdmin
+      .from("chat_sessions")
+      .update({ title: safe, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .select("id, title, updated_at")
+      .single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  });
+
   app.get("/api/chat/sessions/:sessionId/messages", authenticateUser, async (req, res) => {
     const sessionId = parseInt(req.params.sessionId, 10);
     if (Number.isNaN(sessionId)) return res.status(400).json({ error: "Invalid session id" });
     const userId = (req as AuthedRequest).user.id;
+    if (!(await userCanUseAdvisor(userId))) {
+      return res.status(403).json({
+        error: "advisor_plan_required",
+        message: "Histórico de conversas está nos planos Plus e Premium.",
+      });
+    }
     if (!(await chatSessionBelongsToUser(userId, sessionId))) {
       return res.status(403).json({ error: "Forbidden" });
     }
@@ -1006,6 +1227,12 @@ async function startServer() {
         return res.status(400).json({ error: "session_id, sender and content are required" });
       }
       const userId = (req as AuthedRequest).user.id;
+      if (!(await userCanUseAdvisor(userId))) {
+        return res.status(403).json({
+          error: "advisor_plan_required",
+          message: "O Dr. Graxa está nos planos Plus e Premium.",
+        });
+      }
       if (!(await chatSessionBelongsToUser(userId, Number(session_id)))) {
         return res.status(403).json({ error: "Forbidden" });
       }
@@ -1049,6 +1276,24 @@ async function startServer() {
     }
 
     try {
+      const usage = await getEffectiveAiUsage(userId);
+      if (usage.tier === "free") {
+        return res.status(403).json({
+          error: "advisor_plan_required",
+          message: "O Dr. Graxa está disponível nos planos Plus e Premium.",
+          text: "O Dr. Graxa está disponível nos planos Plus e Premium. Conheça nossos planos para continuar.",
+        });
+      }
+      if (usage.limit > 0 && usage.count >= usage.limit) {
+        return res.status(429).json({
+          error: "ai_limit_exceeded",
+          limit: usage.limit,
+          count: usage.count,
+          message: `Limite de ${usage.limit} mensagens mensais do Dr. Graxa atingido. Faça upgrade para aumentar sua cota.`,
+          text: `Você atingiu o limite de ${usage.limit} mensagens com o Dr. Graxa neste mês. Faça upgrade do plano para continuar.`,
+        });
+      }
+
       const { data: user, error: userErr } = await supabaseAdmin
         .from("users")
         .select("*")
@@ -1096,7 +1341,12 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         });
       }
 
-      res.json({ text });
+      await incrementAiMessageCount(userId, usage.count);
+      res.json({
+        text,
+        ai_messages_used: usage.count + 1,
+        ai_messages_limit: usage.limit,
+      });
     } catch (error: any) {
       console.error("🚨 ERRO CHAT IA:", error);
       res.status(500).json({
@@ -1143,18 +1393,34 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
       }
       console.log("[MP Checkout] Criando PreApproval", { back_url: backUrl, user_id: userId });
 
+      const rawBody = (req.body ?? {}) as { userEmail?: string; plan_type?: string; period?: string };
+      const planType: CheckoutPlan = rawBody.plan_type === "premium" ? "premium" : "plus";
+      const period: CheckoutPeriod = normalizeCheckoutPeriod(rawBody.period);
+      const amount = CHECKOUT_PRICES_BRL[planType][period === "monthly" ? "monthly" : "annual"];
+      const frequency = period === "annual" ? 12 : 1;
+      const reason =
+        planType === "plus"
+          ? period === "annual"
+            ? "RevisAuto Plus - Assinatura Anual"
+            : "RevisAuto Plus - Assinatura Mensal"
+          : period === "annual"
+            ? "RevisAuto Premium - Assinatura Anual"
+            : "RevisAuto Premium - Assinatura Mensal";
+
+      console.log("[MP Checkout] Plano", { planType, period, amount, frequency, reason });
+
       // PreApproval (Assinatura recorrente)
       const preApprovalClient = new PreApproval(mpClient);
       const preApprovalBody: Record<string, any> = {
-        reason: "RevisAuto Premium - Assinatura Mensal",
+        reason,
         auto_recurring: {
-          frequency: 1,
+          frequency,
           frequency_type: "months",
-          transaction_amount: 14.9,
+          transaction_amount: amount,
           currency_id: "BRL",
         },
         back_url: backUrl,
-        external_reference: userId,
+        external_reference: buildMpExternalReference(userId, planType, period),
         payer_email: userEmail.trim().toLowerCase(),
         status: "pending" as const,
       };
@@ -1191,8 +1457,9 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
     mpPreapprovalId?: string | null;
   };
 
-  async function upgradeUserToPremium(
+  async function upgradeUserPlan(
     userId: string,
+    planTier: CheckoutPlan,
     sourceLog: string,
     meta: MpPlanMeta = {},
   ) {
@@ -1202,8 +1469,8 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         : "active";
 
     const row: Record<string, unknown> = {
-      plan: "premium",
-      plan_type: "premium",
+      plan: planTier,
+      plan_type: planTier,
       plan_status: planStatus,
     };
 
@@ -1214,11 +1481,11 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
     const { error } = await supabaseAdmin.from("users").update(row).eq("id", String(userId));
 
     if (error) {
-      console.error("🚨 [MP Webhook] Erro ao atualizar plano premium (users):", error);
+      console.error("🚨 [MP Webhook] Erro ao atualizar plano (users):", error);
       return;
     }
     console.log(
-      `[MP Webhook] UPGRADE premium user=${userId} (${sourceLog}) plan_status=${planStatus}`,
+      `[MP Webhook] UPGRADE ${planTier} user=${userId} (${sourceLog}) plan_status=${planStatus}`,
     );
   }
 
@@ -1398,27 +1665,30 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
           status_normalized: mpStatus,
         });
 
-        const userId = sub?.external_reference;
-        if (!userId) {
+        const rawRef = sub?.external_reference;
+        const { userId: extUserId, planTier } = parseMpExternalReference(
+          rawRef != null ? String(rawRef) : "",
+        );
+        if (!extUserId) {
           console.error("[MP Webhook] preapproval_missing_external_reference", { mpId: sub?.id });
           return;
         }
 
-        // authorized/active → manter garantido como premium (idempotente)
+        // authorized/active → ativa Plus ou Premium conforme checkout (idempotente)
         if (mpStatus === "authorized" || mpStatus === "active") {
-          console.log("[MP Webhook] plan_action=ensure_premium user=", userId);
-          await upgradeUserToPremium(String(userId), `preapproval ${sub.id} ${mpStatus}`, {
+          console.log("[MP Webhook] plan_action=ensure_plan user=", extUserId, "tier=", planTier);
+          await upgradeUserPlan(extUserId, planTier, `preapproval ${sub.id} ${mpStatus}`, {
             mpPreapprovalId: sub.id != null ? String(sub.id) : undefined,
             planStatus: mpStatus,
           });
-          console.log("[MP Webhook] plan_action_done=ensure_premium");
+          console.log("[MP Webhook] plan_action_done=ensure_plan");
           return;
         }
 
         // cancelled / paused / unpaid → downgrade imediato
         if (mpStatus === "cancelled" || mpStatus === "paused" || mpStatus === "unpaid") {
-          console.log("[MP Webhook] plan_action=downgrade_to_free user=", userId);
-          await downgradeUserToFree(String(userId), `preapproval ${sub.id} ${mpStatus}`, {
+          console.log("[MP Webhook] plan_action=downgrade_to_free user=", extUserId);
+          await downgradeUserToFree(extUserId, `preapproval ${sub.id} ${mpStatus}`, {
             planStatus: mpStatus,
           });
           console.log("[MP Webhook] plan_action_done=downgrade_to_free");
@@ -1446,26 +1716,29 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
             status_normalized: payStatus,
           });
 
-          const userId = payment?.external_reference;
-          if (!userId) {
+          const rawRefPay = payment?.external_reference;
+          const { userId: extUserId, planTier } = parseMpExternalReference(
+            rawRefPay != null ? String(rawRefPay) : "",
+          );
+          if (!extUserId) {
             console.error("[MP Webhook] authorized_payment_missing_external_reference id=", payment?.id);
             return;
           }
           switch (payment?.status) {
             case "approved":
-              console.log("[MP Webhook] plan_action=ensure_premium_via_payment user=", userId);
-              await upgradeUserToPremium(String(userId), `authorized_payment ${payment.id} approved`, {
+              console.log("[MP Webhook] plan_action=ensure_plan_via_payment user=", extUserId);
+              await upgradeUserPlan(extUserId, planTier, `authorized_payment ${payment.id} approved`, {
                 planStatus: payment.status ?? "approved",
               });
-              console.log("[MP Webhook] plan_action_done=ensure_premium_via_payment");
+              console.log("[MP Webhook] plan_action_done=ensure_plan_via_payment");
               break;
             case "rejected":
             case "cancelled":
             case "refunded":
             case "charged_back":
-              console.log("[MP Webhook] plan_action=downgrade_payment user=", userId, payment?.status);
+              console.log("[MP Webhook] plan_action=downgrade_payment user=", extUserId, payment?.status);
               await downgradeUserToFree(
-                String(userId),
+                extUserId,
                 `authorized_payment ${payment.id} ${payment.status}`,
                 { planStatus: payment.status ?? "inactive" },
               );
@@ -1497,25 +1770,28 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
           status: payment?.status,
         });
 
-        const userId = payment?.external_reference;
-        if (!userId) {
+        const rawRefPay = payment?.external_reference;
+        const { userId: extUserId, planTier } = parseMpExternalReference(
+          rawRefPay != null ? String(rawRefPay) : "",
+        );
+        if (!extUserId) {
           console.error("[MP Webhook] payment_missing_external_reference id=", payment?.id);
           return;
         }
         switch (payment?.status) {
           case "approved":
-            console.log("[MP Webhook] plan_action=ensure_premium_oneoff user=", userId);
-            await upgradeUserToPremium(String(userId), `payment ${payment.id} approved`, {
+            console.log("[MP Webhook] plan_action=ensure_plan_oneoff user=", extUserId);
+            await upgradeUserPlan(extUserId, planTier, `payment ${payment.id} approved`, {
               planStatus: payment.status ?? "approved",
             });
-            console.log("[MP Webhook] plan_action_done=ensure_premium_oneoff");
+            console.log("[MP Webhook] plan_action_done=ensure_plan_oneoff");
             break;
           case "rejected":
           case "cancelled":
           case "refunded":
           case "charged_back":
-            console.log("[MP Webhook] plan_action=downgrade_oneoff user=", userId, payment?.status);
-            await downgradeUserToFree(String(userId), `payment ${payment.id} ${payment.status}`, {
+            console.log("[MP Webhook] plan_action=downgrade_oneoff user=", extUserId, payment?.status);
+            await downgradeUserToFree(extUserId, `payment ${payment.id} ${payment.status}`, {
               planStatus: payment.status ?? "inactive",
             });
             console.log("[MP Webhook] plan_action_done=downgrade_oneoff");

@@ -10,7 +10,9 @@ export interface User {
   state?: string;
   city?: string;
   location: string; // Keep for backward compatibility or computed
-  plan?: 'free' | 'premium';
+  plan?: 'free' | 'plus' | 'premium';
+  ai_messages_count?: number;
+  last_ai_message_date?: string | null;
   access_token?: string;
 }
 
@@ -18,6 +20,8 @@ export interface MileageLog {
   id?: string;
   date: string;
   mileage: number;
+  valor?: number | null;
+  litros?: number | null;
 }
 
 export interface Vehicle {
@@ -63,7 +67,7 @@ export interface ChatSession {
   id: number;
   user_id: number;
   vehicle_id?: number;
-  title: string;
+  title: string | null;
   created_at: string;
   updated_at: string;
 }

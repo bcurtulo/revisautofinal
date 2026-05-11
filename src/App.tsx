@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { Car, Bike, Zap, Wrench, Droplets, FileText, Plus, Activity, MessageSquare, MapPin, Calendar, Clock, Gauge, ChevronLeft, Hop as Home, Menu, Eye, EyeOff, Check, X, Search, Warehouse, ChevronDown, ChevronUp, Shield, Send, Globe, Type, Crown, Pencil, Paintbrush, Trash2, Archive, History, Settings, User as UserIcon, DollarSign, CalendarDays, Mail, ArrowLeft } from 'lucide-react';
+import { Car, Bike, Zap, Wrench, Droplets, FileText, Plus, Activity, MessageSquare, MapPin, Calendar, Clock, Gauge, ChevronLeft, ChevronRight, Hop as Home, Menu, Eye, EyeOff, Check, X, Search, Warehouse, ChevronDown, ChevronUp, Shield, Send, Globe, Type, Pencil, Paintbrush, Trash2, Archive, History, Settings, User as UserIcon, DollarSign, CalendarDays, Mail, ArrowLeft, Lightbulb, Layers } from 'lucide-react';
 import { Vehicle, MaintenanceLog, User, MileageLog, FinancialRecord, ChatSession, ChatMessage } from './types';
+import { PremiumCrown } from './components/PremiumCrown';
 import { CAR_BRANDS, CAR_MODELS, MOTO_BRANDS, MOTO_MODELS, EBIKE_BRANDS, EBIKE_MODELS, OFFENSIVE_WORDS, VEHICLE_COLORS } from './constants';
 import { translations } from './translations';
 import {
@@ -9,9 +10,20 @@ import {
   formatAppCurrency,
   getDefaultDateFormatForLanguage,
   getDateFormatDisplay,
+  getLocaleFromLanguage,
   CURRENCY_OPTIONS,
   type DateFormat,
 } from './utils/format';
+import {
+  isFreePlan,
+  isPlusOrPremium,
+  isPremiumPlan,
+  maxVehiclesForPlan,
+  CHECKOUT_PRICES_BRL,
+  normalizePlan,
+  aiMonthlyLimitForPlan,
+  type PlanTier,
+} from './plans';
 
 // Base URL para chamadas de API. Em produção (Vercel/Render) DEVE ser
 // definida via VITE_API_URL apontando para o backend. Em dev local fica
@@ -45,6 +57,315 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<Response>
   return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
 }
 
+// Quantos dias um mês tem, sem depender de `new Date()` para evitar shift de
+// fuso horário ao validar entradas digitadas pelo usuário.
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  if ([4, 6, 9, 11].includes(month)) return 30;
+  return 31;
+}
+
+// Soma N dias a uma string ISO (YYYY-MM-DD), retornando outra ISO sem shift de
+// timezone (usamos UTC para o cálculo aritmético).
+function addDaysISO(iso: string, days: number): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || '');
+  if (!match) return '';
+  const y = Number(match[1]);
+  const mo = Number(match[2]) - 1;
+  const d = Number(match[3]);
+  const dt = new Date(Date.UTC(y, mo, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  const yy = String(dt.getUTCFullYear());
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
+// Retorna o símbolo da moeda (R$, US$, €, etc.) compatível com o locale do
+// usuário. Usado em labels de inputs para indicar a moeda dinamicamente.
+function getCurrencySymbol(code: string, locale: string): string {
+  try {
+    const parts = new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency: code,
+      currencyDisplay: 'narrowSymbol',
+    }).formatToParts(0);
+    return parts.find(p => p.type === 'currency')?.value || code;
+  } catch {
+    return code;
+  }
+}
+
+// Input de data que respeita a preferência de formato do app
+// (dd/mm/yyyy ou mm/dd/yyyy). Armazena o valor em ISO (YYYY-MM-DD)
+// para compatibilidade com Supabase/back-end e nunca cria um objeto
+// Date a partir da string para evitar deslocamentos por timezone.
+//
+// UX híbrida: o usuário pode (a) digitar com máscara automática
+// respeitando a preferência de formato, ou (b) clicar no ícone de
+// calendário para abrir um popover visual de seleção.
+function LocalizedDateInput({
+  value,
+  onChange,
+  dateFormat,
+  required,
+  className,
+  ariaLabel,
+  locale = 'pt-BR',
+}: {
+  value: string;
+  onChange: (iso: string) => void;
+  dateFormat: DateFormat;
+  required?: boolean;
+  className?: string;
+  ariaLabel?: string;
+  locale?: string;
+}) {
+  const isoToText = (iso: string): string => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || '');
+    if (!match) return '';
+    const [, yyyy, mm, dd] = match;
+    return dateFormat === 'mm/dd/yyyy' ? `${mm}/${dd}/${yyyy}` : `${dd}/${mm}/${yyyy}`;
+  };
+
+  const [text, setText] = useState<string>(() => isoToText(value));
+  const [isCalendarOpen, setIsCalendarOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  // Resolve a "view month" inicial a partir do valor atual, ou hoje quando vazio.
+  const computeInitialView = (): { year: number; month: number } => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || '');
+    if (match) return { year: Number(match[1]), month: Number(match[2]) };
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() + 1 };
+  };
+  const [viewYear, setViewYear] = useState<number>(() => computeInitialView().year);
+  const [viewMonth, setViewMonth] = useState<number>(() => computeInitialView().month);
+
+  // Mantém o input sincronizado quando o valor externo muda
+  // (ex.: ao abrir o modal em modo edição com data pré-preenchida).
+  useEffect(() => {
+    setText(isoToText(value));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, dateFormat]);
+
+  // Ao abrir o calendário, posiciona a "view" no mês do valor selecionado.
+  useEffect(() => {
+    if (!isCalendarOpen) return;
+    const init = computeInitialView();
+    setViewYear(init.year);
+    setViewMonth(init.month);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCalendarOpen]);
+
+  // Fecha o popover ao clicar fora ou apertar Esc.
+  useEffect(() => {
+    if (!isCalendarOpen) return;
+    const onPointer = (e: MouseEvent | TouchEvent) => {
+      const node = wrapperRef.current;
+      if (node && e.target instanceof Node && !node.contains(e.target)) {
+        setIsCalendarOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setIsCalendarOpen(false);
+    };
+    document.addEventListener('mousedown', onPointer);
+    document.addEventListener('touchstart', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointer);
+      document.removeEventListener('touchstart', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [isCalendarOpen]);
+
+  const placeholder = dateFormat === 'mm/dd/yyyy' ? 'MM/DD/YYYY' : 'DD/MM/YYYY';
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const digits = e.target.value.replace(/\D/g, '').slice(0, 8);
+    let masked = digits;
+    if (digits.length > 4) masked = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+    else if (digits.length > 2) masked = `${digits.slice(0, 2)}/${digits.slice(2)}`;
+    setText(masked);
+
+    if (digits.length === 0) {
+      onChange('');
+      return;
+    }
+    if (digits.length === 8) {
+      let dd: string, mm: string, yyyy: string;
+      if (dateFormat === 'mm/dd/yyyy') {
+        mm = digits.slice(0, 2);
+        dd = digits.slice(2, 4);
+        yyyy = digits.slice(4, 8);
+      } else {
+        dd = digits.slice(0, 2);
+        mm = digits.slice(2, 4);
+        yyyy = digits.slice(4, 8);
+      }
+      const day = Number(dd);
+      const month = Number(mm);
+      const year = Number(yyyy);
+      if (
+        year >= 1900 &&
+        month >= 1 && month <= 12 &&
+        day >= 1 && day <= daysInMonth(year, month)
+      ) {
+        onChange(`${yyyy}-${mm}-${dd}`);
+      } else {
+        onChange('');
+      }
+    }
+  };
+
+  const goPrevMonth = () => {
+    let m = viewMonth - 1;
+    let y = viewYear;
+    if (m < 1) { m = 12; y -= 1; }
+    setViewMonth(m);
+    setViewYear(y);
+  };
+  const goNextMonth = () => {
+    let m = viewMonth + 1;
+    let y = viewYear;
+    if (m > 12) { m = 1; y += 1; }
+    setViewMonth(m);
+    setViewYear(y);
+  };
+
+  const handleDayClick = (day: number) => {
+    const yy = String(viewYear).padStart(4, '0');
+    const mm = String(viewMonth).padStart(2, '0');
+    const dd = String(day).padStart(2, '0');
+    onChange(`${yy}-${mm}-${dd}`);
+    setIsCalendarOpen(false);
+  };
+
+  // Cabeçalho do calendário (mês + ano) localizado via Intl.
+  const headerLabel = (() => {
+    try {
+      return new Intl.DateTimeFormat(locale, { month: 'long', year: 'numeric' })
+        .format(new Date(viewYear, viewMonth - 1, 1));
+    } catch {
+      return `${viewMonth}/${viewYear}`;
+    }
+  })();
+
+  // Nomes curtos dos dias da semana (Dom..Sáb) localizados.
+  const weekdayLabels = (() => {
+    try {
+      const fmt = new Intl.DateTimeFormat(locale, { weekday: 'short' });
+      // 4 jan 1970 caiu num domingo (em qualquer fuso, basta usar UTC).
+      return Array.from({ length: 7 }, (_, i) =>
+        fmt.format(new Date(Date.UTC(1970, 0, 4 + i))).replace('.', '').slice(0, 3),
+      );
+    } catch {
+      return ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+    }
+  })();
+
+  const firstWeekday = new Date(viewYear, viewMonth - 1, 1).getDay();
+  const totalDays = daysInMonth(viewYear, viewMonth);
+  const today = new Date();
+  const selectedISO = value;
+
+  return (
+    <div ref={wrapperRef} className="relative">
+      <input
+        type="text"
+        inputMode="numeric"
+        placeholder={placeholder}
+        value={text}
+        onChange={handleChange}
+        required={required}
+        aria-label={ariaLabel}
+        maxLength={10}
+        className={`${className ?? ''} pr-9`}
+      />
+      <button
+        type="button"
+        onClick={() => setIsCalendarOpen(prev => !prev)}
+        aria-label="Abrir calendário"
+        aria-expanded={isCalendarOpen}
+        className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-revis-gray hover:text-revis-green transition-colors"
+      >
+        <CalendarDays className="w-4 h-4" />
+      </button>
+
+      {isCalendarOpen && (
+        <div
+          role="dialog"
+          aria-modal="false"
+          className="absolute left-0 top-full mt-2 z-50 w-[260px] max-w-[calc(100vw-2rem)] bg-revis-dark-gray border border-revis-gray/30 rounded-xl p-3 shadow-xl"
+          onClick={e => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between mb-3">
+            <button
+              type="button"
+              onClick={goPrevMonth}
+              aria-label="Mês anterior"
+              className="p-1 text-revis-gray hover:text-revis-green hover:bg-revis-gray/10 rounded-md transition-colors"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <span className="text-xs font-medium text-revis-heading capitalize">
+              {headerLabel}
+            </span>
+            <button
+              type="button"
+              onClick={goNextMonth}
+              aria-label="Próximo mês"
+              className="p-1 text-revis-gray hover:text-revis-green hover:bg-revis-gray/10 rounded-md transition-colors"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-7 gap-1 mb-1 text-[10px] text-revis-gray text-center capitalize">
+            {weekdayLabels.map((w, idx) => (
+              <span key={`${w}-${idx}`}>{w}</span>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-7 gap-1">
+            {Array.from({ length: firstWeekday }).map((_, i) => (
+              <span key={`blank-${i}`} />
+            ))}
+            {Array.from({ length: totalDays }, (_, i) => i + 1).map(day => {
+              const iso = `${String(viewYear).padStart(4, '0')}-${String(viewMonth).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+              const isSelected = selectedISO === iso;
+              const isToday =
+                today.getFullYear() === viewYear &&
+                today.getMonth() + 1 === viewMonth &&
+                today.getDate() === day;
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  onClick={() => handleDayClick(day)}
+                  className={`h-7 text-[11px] rounded-md transition-colors ${
+                    isSelected
+                      ? 'bg-revis-green text-black font-bold'
+                      : isToday
+                      ? 'bg-revis-gray/20 text-revis-heading'
+                      : 'text-revis-light-gray hover:bg-revis-gray/20'
+                  }`}
+                >
+                  {day}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Inline WhatsApp brand glyph. lucide-react omits brand logos for trademark
 // reasons, so we ship a minimal SVG here to avoid adding a dependency.
 const WhatsAppIcon = ({ className }: { className?: string }) => (
@@ -58,6 +379,12 @@ const WhatsAppIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
+function chatTitleFromFirstQuestion(text: string, maxLen = 120): string {
+  const c = text.trim().replace(/\s+/g, ' ');
+  if (!c) return '';
+  return c.length <= maxLen ? c : `${c.slice(0, maxLen - 1).trimEnd()}…`;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'garage' | 'advisor' | 'menu' | 'preferences'>('garage');
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
@@ -70,9 +397,8 @@ export default function App() {
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [showChatHistory, setShowChatHistory] = useState(false);
-  const [chatHistoryStartDate, setChatHistoryStartDate] = useState('');
-  const [chatHistoryEndDate, setChatHistoryEndDate] = useState('');
+  const [drGraxaUIMode, setDrGraxaUIMode] = useState<'list' | 'chat'>('list');
+  const [showDrGraxaManualModal, setShowDrGraxaManualModal] = useState(false);
   const [showVehicleHistory, setShowVehicleHistory] = useState(false);
   const [archivedVehicles, setArchivedVehicles] = useState<Vehicle[]>([]);
   
@@ -262,14 +588,18 @@ export default function App() {
 
   // Forms State
   const [showAddVehicle, setShowAddVehicle] = useState(false);
-  const [isUpgrading, setIsUpgrading] = useState(false);
+  /** Qual plano está em checkout Mercado Pago (null = nenhum). */
+  const [checkoutLoadingPlan, setCheckoutLoadingPlan] = useState<null | 'plus' | 'premium'>(null);
 
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [pricingPeriod, setPricingPeriod] = useState<'monthly' | 'annual'>('monthly');
   const [showAddLog, setShowAddLog] = useState(false);
   const [showAddFinancial, setShowAddFinancial] = useState(false);
   const [expandedCards, setExpandedCards] = useState({ mileage: false, services: false, financial: false });
   const [showAddMileage, setShowAddMileage] = useState(false);
-  const [newMileage, setNewMileage] = useState({ date: '', mileage: '' });
+  const [newMileage, setNewMileage] = useState({ date: '', mileage: '', valor: '', litros: '' });
+  const [showMileageHelp, setShowMileageHelp] = useState(false);
+  const mileageHelpRef = useRef<HTMLDivElement | null>(null);
   const [isSubmittingVehicle, setIsSubmittingVehicle] = useState(false);
   const [isSubmittingLog, setIsSubmittingLog] = useState(false);
   const [isSubmittingFinancial, setIsSubmittingFinancial] = useState(false);
@@ -298,17 +628,17 @@ export default function App() {
   };
 
   // Filter and Pagination State
-  const [mileageFilterDate, setMileageFilterDate] = useState(() => ({ start: new Date().toISOString().split('T')[0], end: new Date(new Date().getFullYear(), 11, 31).toISOString().split('T')[0] }));
+  const [mileageFilterDate, setMileageFilterDate] = useState<{ start: string; end: string }>({ start: '', end: '' });
   const [activeMileageFilter, setActiveMileageFilter] = useState<{start: string, end: string} | null>(null);
-  const [mileageLimit, setMileageLimit] = useState(10);
+  const [mileageLimit, setMileageLimit] = useState(3);
 
-  const [servicesFilterDate, setServicesFilterDate] = useState(() => ({ start: new Date().toISOString().split('T')[0], end: new Date(new Date().getFullYear(), 11, 31).toISOString().split('T')[0] }));
+  const [servicesFilterDate, setServicesFilterDate] = useState<{ start: string; end: string }>({ start: '', end: '' });
   const [activeServicesFilter, setActiveServicesFilter] = useState<{start: string, end: string} | null>(null);
-  const [servicesLimit, setServicesLimit] = useState(10);
+  const [servicesLimit, setServicesLimit] = useState(3);
 
-  const [financialFilterDate, setFinancialFilterDate] = useState(() => ({ start: new Date().toISOString().split('T')[0], end: new Date(new Date().getFullYear(), 11, 31).toISOString().split('T')[0] }));
+  const [financialFilterDate, setFinancialFilterDate] = useState<{ start: string; end: string }>({ start: '', end: '' });
   const [activeFinancialFilter, setActiveFinancialFilter] = useState<{start: string, end: string} | null>(null);
-  const [financialLimit, setFinancialLimit] = useState(10);
+  const [financialLimit, setFinancialLimit] = useState(3);
   
   // Edit State
   const [editingMileageIndex, setEditingMileageIndex] = useState<number | null>(null);
@@ -436,6 +766,31 @@ export default function App() {
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiResponse, setAiResponse] = useState('');
   const [isLoadingAi, setIsLoadingAi] = useState(false);
+  /** Impede dois envios concorrentes (duplo Enter/clique antes do primeiro setState). */
+  const drGraxaSendInFlightRef = useRef(false);
+
+  /** Limpa dados da sessão após logout (memória sensível — não cobre apenas localStorage). */
+  const resetSensitiveSessionState = () => {
+    setVehicles([]);
+    setArchivedVehicles([]);
+    setSelectedVehicle(null);
+    setLogs([]);
+    setFinancialRecords([]);
+    setChatSessions([]);
+    setCurrentSessionId(null);
+    setChatMessages([]);
+    setDrGraxaUIMode('list');
+    setShowDrGraxaManualModal(false);
+    setAiPrompt('');
+    setAiResponse('');
+    drGraxaSendInFlightRef.current = false;
+    setIsLoadingAi(false);
+    setCheckoutLoadingPlan(null);
+    setShowUpgradeModal(false);
+    setChatSessionToDelete(null);
+    setShowDeleteChatModal(false);
+    setExpandedCards({ mileage: false, services: false, financial: false });
+  };
 
   // Apply theme and font size
   useEffect(() => {
@@ -473,6 +828,13 @@ export default function App() {
     return translations[language]?.[key] || translations['Português (Brasil)'][key];
   };
 
+  const vehicleLimit = maxVehiclesForPlan(user?.plan);
+  const atVehicleLimit = vehicles.length >= vehicleLimit;
+
+  const toggleDateFilters = () => {
+    setShowDateFilters(prev => !prev);
+  };
+
   const authLangOptions: { code: string; value: keyof typeof translations }[] = [
     { code: 'EN', value: 'English' },
     { code: 'PT-BR', value: 'Português (Brasil)' },
@@ -497,12 +859,13 @@ export default function App() {
         <button
           type="button"
           onClick={() => setAuthLangMenuOpen((o) => !o)}
-          className="p-2 rounded-full bg-revis-dark-gray text-revis-green hover:bg-revis-gray/20 transition-colors"
+          className="px-4 py-2 rounded-full bg-revis-dark-gray text-revis-green hover:bg-revis-gray/20 transition-colors flex items-center gap-2 text-xs font-bold"
           aria-expanded={authLangMenuOpen}
           aria-label={t('language')}
           aria-haspopup="listbox"
         >
-          <Globe className="w-5 h-5" />
+          <Globe className="w-4 h-4 shrink-0" />
+          <span>{t('languageLabel')}</span>
         </button>
         {authLangMenuOpen && (
           <div
@@ -628,18 +991,26 @@ export default function App() {
     return vals.map((val, i) => ({ val, label: t(keys[i]) }));
   }, [language]);
 
-  const handleNativePurchase = async () => {
+  const handleNativePurchase = async (
+    plan_type: 'plus' | 'premium' = 'plus',
+    period: 'monthly' | 'annual' = 'monthly',
+  ) => {
     if (!user) return;
-    if (isUpgrading) return;
+    if (checkoutLoadingPlan) return;
 
-    setIsUpgrading(true);
+    setCheckoutLoadingPlan(plan_type);
 
+    const ac = new AbortController();
+    const timeoutId = window.setTimeout(() => ac.abort(), 45_000);
     try {
       const res = await apiFetch(`/api/checkout`, {
         method: 'POST',
+        signal: ac.signal,
         body: JSON.stringify({
           userEmail: user.email,
           userName: user.name,
+          plan_type,
+          period: period === 'annual' ? 'anual' : 'mensal',
         }),
       });
 
@@ -648,17 +1019,25 @@ export default function App() {
       if (!res.ok || !data?.init_point) {
         const message =
           (data && typeof data.message === 'string' && data.message) ||
-          'Não foi possível iniciar o pagamento. Tente novamente.';
+          t('checkoutRequestFailed');
         throw new Error(message);
       }
 
       // Redireciona para o checkout do Mercado Pago.
-      // Mantém isUpgrading=true para o botão seguir em loading durante o redirect.
       window.location.href = data.init_point;
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Erro ao iniciar checkout Mercado Pago:', err);
-      alert(err?.message || 'Erro ao iniciar pagamento. Tente novamente.');
-      setIsUpgrading(false);
+      const e = err as { name?: string; message?: string };
+      const msg =
+        e?.name === 'AbortError'
+          ? t('checkoutTimeout')
+          : e?.message && String(e.message).trim()
+            ? e.message
+            : t('checkoutRequestFailed');
+      alert(msg);
+      setCheckoutLoadingPlan(null);
+    } finally {
+      window.clearTimeout(timeoutId);
     }
   };
 
@@ -731,7 +1110,7 @@ export default function App() {
 
   // Body Scroll Lock for Modals
   useEffect(() => {
-    if (showChatHistory || showVehicleHistory || showProfileEdit || showTermsModal || showPrivacyModal || showAddVehicle || showAddLog || showAddFinancial || showAddMileage || isSupportModalOpen) {
+    if (showDrGraxaManualModal || showVehicleHistory || showProfileEdit || showTermsModal || showPrivacyModal || showAddVehicle || showAddLog || showAddFinancial || showAddMileage || isSupportModalOpen) {
       document.body.style.overflow = 'hidden';
     } else {
       document.body.style.overflow = 'unset';
@@ -739,7 +1118,99 @@ export default function App() {
     return () => {
       document.body.style.overflow = 'unset';
     };
-  }, [showChatHistory, showVehicleHistory, showProfileEdit, showTermsModal, showPrivacyModal, showAddVehicle, showAddLog, showAddFinancial, showAddMileage, isSupportModalOpen]);
+  }, [showDrGraxaManualModal, showVehicleHistory, showProfileEdit, showTermsModal, showPrivacyModal, showAddVehicle, showAddLog, showAddFinancial, showAddMileage, isSupportModalOpen]);
+
+  // Fecha o tooltip de ajuda do card de abastecimento ao clicar fora ou apertar Esc.
+  useEffect(() => {
+    if (!showMileageHelp) return;
+    const handlePointer = (event: MouseEvent | TouchEvent) => {
+      const node = mileageHelpRef.current;
+      if (node && event.target instanceof Node && !node.contains(event.target)) {
+        setShowMileageHelp(false);
+      }
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowMileageHelp(false);
+    };
+    document.addEventListener('mousedown', handlePointer);
+    document.addEventListener('touchstart', handlePointer);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handlePointer);
+      document.removeEventListener('touchstart', handlePointer);
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [showMileageHelp]);
+
+  // -----------------------------------------------------------------------
+  // Handlers reativos dos filtros de data por card.
+  // - "start" sempre dispara autofill para "end" (+30 dias) quando este último
+  //   está vazio, facilitando a navegação inicial.
+  // - Cada alteração atualiza o filtro ativo e reseta a paginação local para 3.
+  // - "Limpar" zera ambos os campos e desativa o filtro.
+  // -----------------------------------------------------------------------
+  const handleMileageStartChange = (iso: string) => {
+    const next = {
+      start: iso,
+      end: mileageFilterDate.end || (iso ? addDaysISO(iso, 30) : ''),
+    };
+    setMileageFilterDate(next);
+    setActiveMileageFilter(iso || next.end ? next : null);
+    setMileageLimit(3);
+  };
+  const handleMileageEndChange = (iso: string) => {
+    const next = { ...mileageFilterDate, end: iso };
+    setMileageFilterDate(next);
+    setActiveMileageFilter(next.start || next.end ? next : null);
+    setMileageLimit(3);
+  };
+  const handleMileageFilterClear = () => {
+    setMileageFilterDate({ start: '', end: '' });
+    setActiveMileageFilter(null);
+    setMileageLimit(3);
+  };
+
+  const handleServicesStartChange = (iso: string) => {
+    const next = {
+      start: iso,
+      end: servicesFilterDate.end || (iso ? addDaysISO(iso, 30) : ''),
+    };
+    setServicesFilterDate(next);
+    setActiveServicesFilter(iso || next.end ? next : null);
+    setServicesLimit(3);
+  };
+  const handleServicesEndChange = (iso: string) => {
+    const next = { ...servicesFilterDate, end: iso };
+    setServicesFilterDate(next);
+    setActiveServicesFilter(next.start || next.end ? next : null);
+    setServicesLimit(3);
+  };
+  const handleServicesFilterClear = () => {
+    setServicesFilterDate({ start: '', end: '' });
+    setActiveServicesFilter(null);
+    setServicesLimit(3);
+  };
+
+  const handleFinancialStartChange = (iso: string) => {
+    const next = {
+      start: iso,
+      end: financialFilterDate.end || (iso ? addDaysISO(iso, 30) : ''),
+    };
+    setFinancialFilterDate(next);
+    setActiveFinancialFilter(iso || next.end ? next : null);
+    setFinancialLimit(3);
+  };
+  const handleFinancialEndChange = (iso: string) => {
+    const next = { ...financialFilterDate, end: iso };
+    setFinancialFilterDate(next);
+    setActiveFinancialFilter(next.start || next.end ? next : null);
+    setFinancialLimit(3);
+  };
+  const handleFinancialFilterClear = () => {
+    setFinancialFilterDate({ start: '', end: '' });
+    setActiveFinancialFilter(null);
+    setFinancialLimit(3);
+  };
 
   const handleProfileCepBlur = async (e: React.FocusEvent<HTMLInputElement>) => {
     const cleanCep = e.target.value.replace(/\D/g, '');
@@ -855,22 +1326,77 @@ export default function App() {
   };
 
   // ---- Helpers para os modais mistos (Criar/Editar) ----
+
+  // Mapa rápido idioma -> locale (Intl). Usado para detectar separadores
+  // decimal/milhar consistentes com o resto do app (utils/format.ts).
+  const APP_LANGUAGE_TO_LOCALE: Record<string, string> = {
+    'Português (Brasil)': 'pt-BR',
+    'Português (Portugal)': 'pt-PT',
+    English: 'en-US',
+    Español: 'es-ES',
+  };
+  const getLocaleDecimalSeparator = (lang: string): string => {
+    const locale = APP_LANGUAGE_TO_LOCALE[lang] || 'pt-BR';
+    try {
+      const parts = new Intl.NumberFormat(locale).formatToParts(1.1);
+      return parts.find(p => p.type === 'decimal')?.value ?? ',';
+    } catch {
+      return ',';
+    }
+  };
+  // Converte uma string digitada no input (ex.: "1.234,56" ou "1,234.56")
+  // para Number conforme separador do locale atual.
+  const parseLocaleDecimal = (raw: string, lang: string): number | null => {
+    if (!raw || !raw.trim()) return null;
+    const dec = getLocaleDecimalSeparator(lang);
+    const thou = dec === ',' ? '.' : ',';
+    const cleaned = raw
+      .replace(new RegExp(`\\${thou}`, 'g'), '')
+      .replace(dec, '.');
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  };
+  // Formata número decimal para exibição: usa Intl com separadores locais.
+  const formatDecimal = (n: number | null | undefined, lang: string, fractionDigits = 2): string => {
+    if (n === null || n === undefined || !Number.isFinite(Number(n))) return '';
+    const locale = APP_LANGUAGE_TO_LOCALE[lang] || 'pt-BR';
+    try {
+      return new Intl.NumberFormat(locale, {
+        minimumFractionDigits: fractionDigits,
+        maximumFractionDigits: fractionDigits,
+      }).format(Number(n));
+    } catch {
+      return Number(n).toFixed(fractionDigits);
+    }
+  };
+
   const openCreateMileage = () => {
     setEditingMileageLogId(null);
-    setNewMileage({ date: new Date().toISOString().split('T')[0], mileage: '' });
+    setNewMileage({ date: new Date().toISOString().split('T')[0], mileage: '', valor: '', litros: '' });
     setShowAddMileage(true);
   };
   const openEditMileage = (log: MileageLog) => {
     if (!log.id) return; // mileage_logs gerados antes do schema novo podem não ter id
     const formatted = String(log.mileage ?? 0).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    // Para os campos decimais reabrimos o registro mantendo o separador local do usuário.
+    const localeDecimal = getLocaleDecimalSeparator(language);
+    const stringifyDecimal = (n: number | null | undefined): string => {
+      if (n === null || n === undefined || !Number.isFinite(Number(n))) return '';
+      return String(n).replace('.', localeDecimal);
+    };
     setEditingMileageLogId(log.id);
-    setNewMileage({ date: log.date, mileage: formatted });
+    setNewMileage({
+      date: log.date,
+      mileage: formatted,
+      valor: stringifyDecimal(log.valor),
+      litros: stringifyDecimal(log.litros),
+    });
     setShowAddMileage(true);
   };
   const closeMileageModal = () => {
     setShowAddMileage(false);
     setEditingMileageLogId(null);
-    setNewMileage({ date: '', mileage: '' });
+    setNewMileage({ date: '', mileage: '', valor: '', litros: '' });
   };
 
   const openCreateLog = () => {
@@ -1235,6 +1761,8 @@ export default function App() {
       alert(t('errorSavingData'));
       return;
     }
+    const valor = parseLocaleDecimal(newMileage.valor || '', language);
+    const litros = parseLocaleDecimal(newMileage.litros || '', language);
 
     setIsSubmittingMileage(true);
     try {
@@ -1245,7 +1773,7 @@ export default function App() {
 
       const res = await apiFetch(url, {
         method: isEdit ? 'PUT' : 'POST',
-        body: JSON.stringify({ mileage, date: newMileage.date })
+        body: JSON.stringify({ mileage, date: newMileage.date, valor, litros })
       });
       if (!res.ok) {
         console.error('Error saving mileage:', res.status, await res.text().catch(() => ''));
@@ -1261,7 +1789,7 @@ export default function App() {
 
       setShowAddMileage(false);
       setEditingMileageLogId(null);
-      setNewMileage({ date: '', mileage: '' });
+      setNewMileage({ date: '', mileage: '', valor: '', litros: '' });
     } catch (error) {
       console.error('Error saving mileage:', error);
       alert(t('errorSavingData'));
@@ -1288,7 +1816,7 @@ export default function App() {
       await fetchVehicles();
       setShowAddMileage(false);
       setEditingMileageLogId(null);
-      setNewMileage({ date: '', mileage: '' });
+      setNewMileage({ date: '', mileage: '', valor: '', litros: '' });
     } catch (error) {
       console.error('Error deleting mileage:', error);
       alert(t('errorDeletingData'));
@@ -1530,6 +2058,7 @@ export default function App() {
         if (currentSessionId === chatSessionToDelete) {
           setCurrentSessionId(null);
           setChatMessages([]);
+          setDrGraxaUIMode('list');
         }
         setShowDeleteChatModal(false);
         setChatSessionToDelete(null);
@@ -1546,29 +2075,27 @@ export default function App() {
         const raw = await res.json();
         setChatMessages(Array.isArray(raw) ? raw : []);
         setCurrentSessionId(sessionId);
-        setShowChatHistory(false);
+        setDrGraxaUIMode('chat');
       }
     } catch (error) {
       console.error("Error loading chat session:", error);
     }
   };
 
-  const createNewSession = async () => {
-    if (!user) return;
+  /** Produto ai_chats. `title: null` até o PATCH da primeira troca válida com a IA. Pode ser chamado apenas no primeiro envio (sessão lazy). */
+  const createChatSessionRecord = async (title: string | null): Promise<number | null> => {
+    if (!user) return null;
     try {
       const res = await apiFetch(`/api/chat/sessions`, {
         method: 'POST',
         body: JSON.stringify({
-          vehicle_id: selectedVehicle?.id,
-          title: selectedVehicle
-            ? t('chatSessionAbout').replace('{brand}', selectedVehicle.brand).replace('{model}', selectedVehicle.model)
-            : t('newChatSessionTitle')
+          vehicle_id: selectedVehicle?.id ?? null,
+          title,
         })
       });
       if (res.ok) {
         const { id } = await res.json();
         setCurrentSessionId(id);
-        setChatMessages([]);
         fetchChatSessions();
         return id;
       }
@@ -1578,34 +2105,57 @@ export default function App() {
     return null;
   };
 
+  const patchChatSessionTitleAfterFirstQuestion = async (sessionId: number, question: string) => {
+    const safe = chatTitleFromFirstQuestion(question, 200);
+    if (!safe) return;
+    try {
+      const res = await apiFetch(`/api/chat/sessions/${sessionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title: safe }),
+      });
+      if (res.ok) fetchChatSessions();
+    } catch (e) {
+      console.error('Error updating chat title:', e);
+    }
+  };
+
   const askAi = async () => {
-    if (!aiPrompt.trim()) return;
-    
-    const userMessageText = aiPrompt;
-    setAiPrompt(''); // Clear input immediately
+    const userMessageText = aiPrompt.trim();
+    if (!userMessageText || drGraxaSendInFlightRef.current) return;
+
+    const limit = aiMonthlyLimitForPlan(user?.plan);
+    const used = user?.ai_messages_count ?? 0;
+    if (limit > 0 && used >= limit) {
+      return;
+    }
+
+    const hadNoPriorMessages = chatMessages.length === 0;
+
+    drGraxaSendInFlightRef.current = true;
+    setAiPrompt('');
     setIsLoadingAi(true);
 
     let sessionId = currentSessionId;
-    if (!sessionId) {
-      sessionId = await createNewSession();
-    }
-
-    if (!sessionId) {
-      setIsLoadingAi(false);
-      return; // Failed to create session
-    }
-
-    // Add User Message to UI and DB
-    const userMsg: ChatMessage = {
-      id: Date.now(), // Temp ID
-      session_id: sessionId,
-      sender: 'user',
-      content: userMessageText,
-      timestamp: new Date().toISOString()
-    };
-    setChatMessages(prev => [...prev, userMsg]);
-
     try {
+      if (!sessionId) {
+        sessionId = await createChatSessionRecord(null);
+      }
+
+      if (!sessionId) {
+        setAiPrompt(userMessageText);
+        alert(t('aiConnectionError'));
+        return;
+      }
+
+      const userMsg: ChatMessage = {
+        id: Date.now(),
+        session_id: sessionId,
+        sender: 'user',
+        content: userMessageText,
+        timestamp: new Date().toISOString()
+      };
+      setChatMessages(prev => [...prev, userMsg]);
+
       await apiFetch(`/api/chat/messages`, {
         method: 'POST',
         body: JSON.stringify({
@@ -1615,9 +2165,6 @@ export default function App() {
         })
       });
 
-      // SEGURANÇA: Prompt e Contexto movidos para o Backend
-      // O Frontend envia apenas os identificadores e a mensagem do usuário.
-      // O backend identifica o usuário via JWT (Authorization header).
       const response = await apiFetch(`/api/chat`, {
         method: 'POST',
         body: JSON.stringify({
@@ -1625,13 +2172,31 @@ export default function App() {
           vehicleId: selectedVehicle?.id,
         })
       });
-      
-      const data = await response.json();
-      const aiText = data.text || t('aiProcessingError');
 
-      // Add AI Message to UI and DB
+      const data = await response.json().catch(() => ({}) as Record<string, unknown>);
+      if (!response.ok) {
+        const msg =
+          (typeof data.text === 'string' && data.text) ||
+          (typeof data.message === 'string' && data.message) ||
+          t('aiConnectionError');
+        if (response.status === 403 || response.status === 429) setShowUpgradeModal(true);
+        const errMsg: ChatMessage = {
+          id: Date.now() + 2,
+          session_id: sessionId,
+          sender: 'ai',
+          content: msg,
+          timestamp: new Date().toISOString()
+        };
+        setChatMessages(prev => [...prev, errMsg]);
+        void fetchUser();
+        return;
+      }
+
+      const aiText =
+        (typeof data.text === 'string' && data.text) || t('aiProcessingError');
+
       const aiMsg: ChatMessage = {
-        id: Date.now() + 1, // Temp ID
+        id: Date.now() + 1,
         session_id: sessionId,
         sender: 'ai',
         content: aiText,
@@ -1647,24 +2212,44 @@ export default function App() {
           content: aiText
         })
       });
-      
-      // Refresh sessions to update timestamp/order
+
+      if (hadNoPriorMessages) {
+        void patchChatSessionTitleAfterFirstQuestion(sessionId, userMessageText);
+      }
+
+      void fetchUser();
       fetchChatSessions();
 
     } catch (error) {
       console.error(error);
-      const errorMsg: ChatMessage = {
-        id: Date.now() + 2,
-        session_id: sessionId,
-        sender: 'ai',
-        content: t('aiConnectionError'),
-        timestamp: new Date().toISOString()
-      };
-      setChatMessages(prev => [...prev, errorMsg]);
+      if (sessionId != null && sessionId > 0) {
+        const errorMsg: ChatMessage = {
+          id: Date.now() + 2,
+          session_id: sessionId,
+          sender: 'ai',
+          content: t('aiConnectionError'),
+          timestamp: new Date().toISOString()
+        };
+        setChatMessages(prev => [...prev, errorMsg]);
+      } else {
+        setAiPrompt(userMessageText);
+        alert(t('aiConnectionError'));
+      }
     } finally {
       setIsLoadingAi(false);
+      drGraxaSendInFlightRef.current = false;
     }
   };
+
+  useEffect(() => {
+    if (activeTab !== 'advisor') {
+      setDrGraxaUIMode('list');
+      setShowDrGraxaManualModal(false);
+      setCurrentSessionId(null);
+      setChatMessages([]);
+      setAiPrompt('');
+    }
+  }, [activeTab]);
 
   useEffect(() => {
     if (user && activeTab === 'advisor') {
@@ -2413,7 +2998,15 @@ export default function App() {
             {t('goToGarage')}
           </button>
           <button 
-            onClick={() => setActiveTab('advisor')}
+            type="button"
+            onClick={() => {
+              setActiveTab('advisor');
+              setDrGraxaUIMode('list');
+              setShowDrGraxaManualModal(false);
+              setCurrentSessionId(null);
+              setChatMessages([]);
+              setAiPrompt('');
+            }}
             className="bg-revis-dark-gray border border-revis-gray/30 text-white font-bold py-2 px-4 rounded-xl text-sm hover:bg-revis-gray/20 transition-colors"
           >
             {t('talkToDrGraxa')}
@@ -2452,9 +3045,15 @@ export default function App() {
         </button>
 
         <button 
+          type="button"
           onClick={() => { 
-            if (user?.plan === 'premium') {
-              setShowChatHistory(true); 
+            if (isPlusOrPremium(user?.plan)) {
+              setActiveTab('advisor');
+              setDrGraxaUIMode('list');
+              setShowDrGraxaManualModal(false);
+              setCurrentSessionId(null);
+              setChatMessages([]);
+              setAiPrompt('');
             } else {
               setShowUpgradeModal(true);
             }
@@ -2465,19 +3064,17 @@ export default function App() {
             <MessageSquare className="w-5 h-5 text-revis-green" />
             <div className="flex items-center gap-2">
               <span className="font-medium">{t('chatHistory')}</span>
-              <Crown className="w-3 h-3 text-yellow-500 fill-yellow-500" />
+              <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" />
             </div>
           </div>
           <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
         </button>
 
-        <button 
-          onClick={() => { 
-            if (user?.plan === 'premium') {
-              setShowVehicleHistory(true); 
-            } else {
-              setShowUpgradeModal(true);
-            }
+        <button
+          type="button"
+          onClick={() => {
+            if (isPremiumPlan(user?.plan)) setShowVehicleHistory(true);
+            else setShowUpgradeModal(true);
           }}
           className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
         >
@@ -2485,7 +3082,7 @@ export default function App() {
             <History className="w-5 h-5 text-revis-green" />
             <div className="flex items-center gap-2">
               <span className="font-medium">{t('vehicleHistory')}</span>
-              <Crown className="w-3 h-3 text-yellow-500 fill-yellow-500" />
+              <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" />
             </div>
           </div>
           <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
@@ -2496,8 +3093,8 @@ export default function App() {
           className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
         >
           <div className="flex items-center gap-3">
-            <Crown className="w-5 h-5 text-revis-green" />
-            <span className="font-medium">{user?.plan === 'premium' ? 'Gerenciar Plano' : t('plans')}</span>
+            <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="sm" />
+            <span className="font-medium">{isPlusOrPremium(user?.plan) ? t('managePlan') : t('plans')}</span>
           </div>
           <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
         </button>
@@ -2539,6 +3136,7 @@ export default function App() {
 
       <button 
         onClick={() => {
+          resetSensitiveSessionState();
           localStorage.removeItem('revis_user');
           setUser(null);
           setAuthScreen('login');
@@ -2724,13 +3322,8 @@ export default function App() {
           <div className="flex justify-between items-center mb-2">
             <h2 className="text-xl font-bold text-revis-heading flex items-center gap-2">
               {t('garageOf')} {user?.nickname || user?.name?.split(' ')[0]}
-              {user?.plan === 'premium' && (
-                <div className="group relative">
-                  <Crown className="w-5 h-5 text-yellow-500 fill-yellow-500" />
-                  <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 px-2 py-1 bg-black text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-50">
-                    Recurso Premium
-                  </div>
-                </div>
+              {isPlusOrPremium(user?.plan) && (
+                <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="sm" />
               )}
             </h2>
           </div>
@@ -2748,7 +3341,7 @@ export default function App() {
 
           <button 
             onClick={() => {
-              if (user?.plan === 'free' && vehicles.length >= 1) {
+              if (atVehicleLimit) {
                 setShowUpgradeModal(true);
               } else {
                 setNewVehicle({
@@ -2770,19 +3363,14 @@ export default function App() {
               }
             }}
             className={`w-full font-bold py-3 rounded-xl transition-colors flex items-center justify-center gap-2 mb-4 ${
-              user?.plan === 'free' && vehicles.length >= 1 
+              atVehicleLimit 
                 ? 'bg-revis-dark-gray text-revis-gray cursor-not-allowed border border-revis-gray/20' 
                 : 'bg-revis-green text-black hover:bg-opacity-90'
             }`}
           >
-            {user?.plan === 'free' && vehicles.length >= 1 ? (
+            {atVehicleLimit ? (
               <>
-                <div className="group relative">
-                  <Crown className="w-5 h-5 text-yellow-500 fill-yellow-500" />
-                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-black text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-50">
-                    Recurso Premium
-                  </div>
-                </div>
+                <PremiumCrown tooltip={t('vehicleLimitTooltip')} decorative size="sm" />
                 {t('addVehicle')}
               </>
             ) : (
@@ -2807,13 +3395,13 @@ export default function App() {
                 
                 <div className="flex-1 min-w-0">
                   <h3 className="font-bold text-revis-heading text-base truncate">
-                    {user?.plan === 'premium' && vehicle.nickname ? vehicle.nickname : vehicle.model}
+                    {isPlusOrPremium(user?.plan) && vehicle.nickname ? vehicle.nickname : vehicle.model}
                   </h3>
                   <p className="text-xs text-revis-gray truncate">
-                    {user?.plan === 'premium' && vehicle.nickname ? `${vehicle.model} • ` : ''}
+                    {isPlusOrPremium(user?.plan) && vehicle.nickname ? `${vehicle.model} • ` : ''}
                     {vehicle.brand} • {vehicle.year}
-                    {user?.plan === 'premium' && vehicle.color ? ` • ${vehicle.color}` : ''}
-                    {!(user?.plan === 'premium' && (vehicle.nickname || vehicle.color)) ? ` • ${(vehicle.current_mileage || 0).toLocaleString()} km` : ''}
+                    {isPlusOrPremium(user?.plan) && vehicle.color ? ` • ${vehicle.color}` : ''}
+                    {!(isPlusOrPremium(user?.plan) && (vehicle.nickname || vehicle.color)) ? ` • ${(vehicle.current_mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km` : ''}
                   </p>
                 </div>
 
@@ -2855,14 +3443,14 @@ export default function App() {
           </button>
           <div className="flex-1">
             <h2 className="text-xl font-bold text-revis-heading">{selectedVehicle.brand} {selectedVehicle.model}</h2>
-            {user?.plan === 'premium' && (selectedVehicle.nickname || selectedVehicle.color) && (
+            {isPlusOrPremium(user?.plan) && (selectedVehicle.nickname || selectedVehicle.color) && (
               <p className="text-sm text-revis-green mb-1">
                 {selectedVehicle.nickname && <span className="font-medium">{selectedVehicle.nickname}</span>}
                 {selectedVehicle.nickname && selectedVehicle.color && <span className="mx-1">•</span>}
                 {selectedVehicle.color && <span>Cor: {selectedVehicle.color}</span>}
               </p>
             )}
-            <p className="text-sm text-revis-gray">{selectedVehicle.year} • {(selectedVehicle.current_mileage || 0).toLocaleString()} km</p>
+            <p className="text-sm text-revis-gray">{selectedVehicle.year} • {(selectedVehicle.current_mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km</p>
           </div>
           {selectedVehicle.status !== 'archived' && (
             <div className="flex gap-2">
@@ -2892,14 +3480,39 @@ export default function App() {
           )}
         </div>
 
-        {/* Mileage History Card */}
+        {/* Fueling History Card */}
         <div className="bg-revis-dark-gray rounded-2xl p-5 border border-revis-gray/20">
-          <div 
-            className="flex justify-between items-center cursor-pointer" 
+          <div
+            className="flex justify-between items-center cursor-pointer gap-2"
             onClick={() => setExpandedCards(prev => ({ ...prev, mileage: !prev.mileage }))}
           >
-            <h3 className="font-bold text-revis-heading">{t('mileageHistory')}</h3>
-            {expandedCards.mileage ? <ChevronUp className="w-5 h-5 text-revis-gray" /> : <ChevronDown className="w-5 h-5 text-revis-gray" />}
+            <div className="flex items-center gap-2 min-w-0">
+              <h3 className="font-bold text-revis-heading truncate">{t('mileageHistory')}</h3>
+              <div
+                ref={mileageHelpRef}
+                className="relative shrink-0"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <button
+                  type="button"
+                  aria-label={t('mileageHelpTooltip')}
+                  aria-expanded={showMileageHelp}
+                  onClick={() => setShowMileageHelp(prev => !prev)}
+                  className="flex items-center justify-center w-5 h-5 rounded-full bg-revis-gray/20 text-revis-gray text-[11px] font-bold leading-none hover:bg-revis-green/20 hover:text-revis-green transition-colors"
+                >
+                  ?
+                </button>
+                {showMileageHelp && (
+                  <div
+                    role="tooltip"
+                    className="absolute left-0 top-full mt-2 z-30 w-[260px] max-w-[calc(100vw-2.5rem)] bg-revis-black border border-revis-gray/30 rounded-lg p-3 text-xs text-revis-light-gray leading-relaxed shadow-lg"
+                  >
+                    {t('mileageHelpTooltip')}
+                  </div>
+                )}
+              </div>
+            </div>
+            {expandedCards.mileage ? <ChevronUp className="w-5 h-5 text-revis-gray shrink-0" /> : <ChevronDown className="w-5 h-5 text-revis-gray shrink-0" />}
           </div>
           
           {expandedCards.mileage && (
@@ -2914,101 +3527,131 @@ export default function App() {
               )}
 
               <div className="mb-4">
-                <button 
-                  onClick={() => setShowDateFilters(!showDateFilters)}
+                <button
+                  onClick={toggleDateFilters}
                   className="flex items-center gap-2 text-xs text-revis-gray hover:text-revis-green transition-colors mb-2"
                 >
                   <Calendar className="w-4 h-4" />
                   {t('filterByDate')}
                   {showDateFilters ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                 </button>
-                
+
                 {showDateFilters && (
-                  <div className="animate-in fade-in slide-in-from-top-2 duration-200">
-                    <div className="flex flex-col gap-2">
-                      <div className="flex gap-2 items-center">
-                        <input 
-                          type="date" 
-                          className="bg-revis-black/30 text-revis-light-gray text-[10px] rounded-lg px-2 py-1 border border-revis-gray/20 outline-none flex-1"
-                          value={mileageFilterDate.start}
-                          onChange={e => setMileageFilterDate({...mileageFilterDate, start: e.target.value})}
-                        />
-                        <button 
-                          onClick={() => {
-                            setActiveMileageFilter(mileageFilterDate);
-                            setMileageLimit(10);
-                          }}
-                          className="bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray text-[10px] px-3 py-1 rounded-lg hover:bg-revis-gray/20 transition-colors w-20"
-                        >
-                          {t('filter')}
-                        </button>
+                  <div className="animate-in fade-in slide-in-from-top-2 duration-200 relative rounded-lg min-h-[7.5rem]">
+                    <div
+                      className={`flex flex-col gap-2 ${isFreePlan(user?.plan) ? 'opacity-[0.38] pointer-events-none' : ''}`}
+                      aria-hidden={isFreePlan(user?.plan)}
+                    >
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateStartLabel')}</label>
+                          <LocalizedDateInput
+                            dateFormat={dateFormat}
+                            locale={getLocaleFromLanguage(language)}
+                            value={mileageFilterDate.start}
+                            onChange={handleMileageStartChange}
+                            ariaLabel={t('dateStartLabel')}
+                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateEndLabel')}</label>
+                          <LocalizedDateInput
+                            dateFormat={dateFormat}
+                            locale={getLocaleFromLanguage(language)}
+                            value={mileageFilterDate.end}
+                            onChange={handleMileageEndChange}
+                            ariaLabel={t('dateEndLabel')}
+                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                          />
+                        </div>
                       </div>
-                      <div className="text-center text-[10px] text-revis-gray">{t('to')}</div>
-                      <div className="flex gap-2 items-center">
-                        <input 
-                          type="date" 
-                          className="bg-revis-black/30 text-revis-light-gray text-[10px] rounded-lg px-2 py-1 border border-revis-gray/20 outline-none flex-1"
-                          value={mileageFilterDate.end}
-                          onChange={e => setMileageFilterDate({...mileageFilterDate, end: e.target.value})}
-                        />
-                        <button 
-                          onClick={() => {
-                            setMileageFilterDate({ start: '', end: '' });
-                            setActiveMileageFilter(null);
-                            setMileageLimit(10);
-                          }}
-                          className="bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray text-[10px] px-3 py-1 rounded-lg hover:bg-revis-gray/20 transition-colors w-20"
-                        >
-                          {t('clear')}
-                        </button>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={handleMileageFilterClear}
+                        disabled={!mileageFilterDate.start && !mileageFilterDate.end}
+                        className="self-end ml-auto flex items-center gap-1 text-[11px] font-medium text-red-500 hover:text-red-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-red-500"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        {t('clear')}
+                      </button>
                     </div>
+                    {isFreePlan(user?.plan) && (
+                      <div className="absolute inset-0 z-10 rounded-lg bg-revis-black/65 border border-revis-gray/20 flex flex-col items-center justify-center gap-2 p-4 text-center">
+                        <PremiumCrown
+                          tooltip={t('premiumCrownTooltip')}
+                          onOpenPlans={() => setShowUpgradeModal(true)}
+                          size="lg"
+                        />
+                        <p className="text-[11px] text-revis-light-gray leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
+                        <button
+                          type="button"
+                          onClick={() => setShowUpgradeModal(true)}
+                          className="text-xs font-bold text-revis-green underline decoration-revis-green/40 hover:text-revis-green/90"
+                        >
+                          {t('plans')}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
-              {activeMileageFilter && (
-                <div className="mb-4 p-3 bg-revis-black/20 rounded-xl flex justify-between items-center">
-                  <span className="text-sm text-revis-gray">{t('kmDriven')}:</span>
-                  <span className="text-revis-heading font-bold">
-                    {(() => {
-                      const start = new Date(activeMileageFilter.start);
-                      const end = new Date(activeMileageFilter.end);
-                      
-                      let total = 0;
-                      const allLogs = selectedVehicle.mileage_history || [];
-
-                      allLogs.forEach((log, index) => {
-                         const logDate = new Date(log.date);
-                         if (logDate >= start && logDate <= end) {
-                            const prevLog = allLogs[index + 1];
-                            const diff = prevLog ? log.mileage - prevLog.mileage : 0;
-                            total += Math.abs(diff);
-                         }
-                      });
-
-                      return `${total.toLocaleString()} km`;
-                    })()}
-                  </span>
-                </div>
-              )}
-
               <div className="space-y-2">
-                <div className="grid grid-cols-3 text-xs text-revis-gray font-medium pl-2 pr-16 text-center">
+                <div className="grid grid-cols-5 gap-1 text-[10px] sm:text-xs text-revis-gray font-medium pl-1 pr-12 text-center">
                   <span>{t('date')}</span>
+                  <span>{t('value')}</span>
+                  <span>{t('litersLabel')}</span>
                   <span>{t('km')}</span>
-                  <span>{t('balance')}</span>
+                  <span>{t('kmPerLiter')}</span>
                 </div>
-                
-                {(() => {
-                  let displayLogs = selectedVehicle.mileage_history || [];
 
-                  if (activeMileageFilter) {
-                    const start = new Date(activeMileageFilter.start);
-                    const end = new Date(activeMileageFilter.end);
+                {(() => {
+                  const allLogs = selectedVehicle.mileage_history || [];
+
+                  // Ordenamos cronologicamente do mais antigo para o mais novo para
+                  // calcular o KM/L: rendimento depende do log anterior (mais antigo).
+                  // Empates de data são desempatados por id numérico crescente.
+                  const chronological = [...allLogs].sort((a, b) => {
+                    const da = new Date(a.date).getTime();
+                    const db = new Date(b.date).getTime();
+                    if (da !== db) return da - db;
+                    const ia = Number(a.id ?? 0);
+                    const ib = Number(b.id ?? 0);
+                    return ia - ib;
+                  });
+
+                  // id (ou chave estável) -> rendimento e flag de "registro inicial"
+                  const efficiencyByKey = new Map<string, { kmPerLiter: number | null; isInitial: boolean }>();
+                  chronological.forEach((log, idx) => {
+                    const key = log.id ? String(log.id) : `${log.date}-${log.mileage}-${idx}`;
+                    if (idx === 0) {
+                      efficiencyByKey.set(key, { kmPerLiter: null, isInitial: true });
+                      return;
+                    }
+                    const prev = chronological[idx - 1];
+                    const liters = Number(log.litros);
+                    if (!Number.isFinite(liters) || liters <= 0) {
+                      efficiencyByKey.set(key, { kmPerLiter: null, isInitial: false });
+                      return;
+                    }
+                    const deltaKm = Number(log.mileage) - Number(prev.mileage);
+                    if (!Number.isFinite(deltaKm) || deltaKm <= 0) {
+                      efficiencyByKey.set(key, { kmPerLiter: null, isInitial: false });
+                      return;
+                    }
+                    efficiencyByKey.set(key, { kmPerLiter: deltaKm / liters, isInitial: false });
+                  });
+
+                  let displayLogs = allLogs;
+                  if (activeMileageFilter && (activeMileageFilter.start || activeMileageFilter.end)) {
+                    const startIso = activeMileageFilter.start;
+                    const endIso = activeMileageFilter.end;
                     displayLogs = displayLogs.filter(log => {
-                      const d = new Date(log.date);
-                      return d >= start && d <= end;
+                      const d = String(log.date || '');
+                      if (startIso && d < startIso) return false;
+                      if (endIso && d > endIso) return false;
+                      return true;
                     });
                   }
 
@@ -3018,22 +3661,31 @@ export default function App() {
                   return (
                     <>
                       {paginatedLogs.map((log, index) => {
-                        const originalIndex = selectedVehicle.mileage_history?.findIndex(l => l === log) ?? 0;
-                        const prevLog = selectedVehicle.mileage_history?.[originalIndex + 1];
-                        const isLast = originalIndex === (selectedVehicle.mileage_history?.length || 0) - 1;
-                        const rawDiff = prevLog ? log.mileage - prevLog.mileage : 0;
-                        const balance = Math.abs(rawDiff);
-
                         const stableKey = log.id ? String(log.id) : `${log.date}-${log.mileage}-${index}`;
+                        const eff = efficiencyByKey.get(stableKey) ?? { kmPerLiter: null, isInitial: false };
 
                         return (
-                          <div key={stableKey} className="relative grid grid-cols-3 text-sm pl-2 pr-16 py-2 border-b border-revis-gray/10 last:border-0 text-center items-center group">
-                            <span className="text-revis-light-gray">{formatAppDate(log.date, dateFormat)}</span>
-                            <span className="text-revis-light-gray">{(log.mileage || 0).toLocaleString()} km</span>
-                            <span className={isLast ? 'text-revis-gray' : 'text-revis-alert-critical'}>
-                              {isLast ? t('initialRecord') : `${balance.toLocaleString()} km`}
+                          <div key={stableKey} className="relative grid grid-cols-5 gap-1 text-[11px] sm:text-xs pl-1 pr-12 py-2 border-b border-revis-gray/10 last:border-0 text-center items-center group">
+                            <span className="text-revis-light-gray break-words">{formatAppDate(log.date, dateFormat)}</span>
+                            <span className="text-revis-light-gray break-words">
+                              {log.valor !== null && log.valor !== undefined
+                                ? formatAppCurrency(Number(log.valor), currency, language)
+                                : '-'}
                             </span>
-                            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                            <span className="text-revis-light-gray break-words">
+                              {log.litros !== null && log.litros !== undefined
+                                ? `${formatDecimal(Number(log.litros), language, 2)} ${t('litersShort')}`
+                                : '-'}
+                            </span>
+                            <span className="text-revis-light-gray break-words">{(log.mileage || 0).toLocaleString(getLocaleFromLanguage(language))}</span>
+                            <span className="text-revis-light-gray break-words">
+                              {eff.isInitial
+                                ? t('initialRecord')
+                                : eff.kmPerLiter !== null
+                                ? `${formatDecimal(eff.kmPerLiter, language, 1)} km/l`
+                                : '-'}
+                            </span>
+                            <div className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1">
                               <button
                                 type="button"
                                 onClick={() => openViewRecord({ kind: 'mileage', data: log })}
@@ -3046,7 +3698,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => openEditMileage(log)}
-                                  aria-label={t('editMileageTitle')}
+                                  aria-label={t('editFuelingTitle')}
                                   className="p-1 text-gray-400 hover:text-gray-200 transition-colors"
                                 >
                                   <Pencil className="w-4 h-4" />
@@ -3063,8 +3715,8 @@ export default function App() {
 
                       {hasMore && (
                         <button
-                          onClick={() => setMileageLimit(prev => prev + 10)}
-                          className="w-full text-center text-xs text-revis-green font-medium py-2 hover:underline mt-2"
+                          onClick={() => setMileageLimit(prev => prev + 3)}
+                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-revis-green/40 bg-revis-green/10 text-xs text-revis-green font-medium hover:bg-revis-green/20 hover:border-revis-green transition-colors"
                         >
                           {t('seeMore')}
                         </button>
@@ -3073,6 +3725,51 @@ export default function App() {
                   );
                 })()}
               </div>
+
+              {/* Summary Panel - rodapé unificado com Valor total, Litros e Km rodados */}
+              {(() => {
+                const allLogs = selectedVehicle.mileage_history || [];
+                let footerLogs = allLogs;
+                if (activeMileageFilter && (activeMileageFilter.start || activeMileageFilter.end)) {
+                  const startIso = activeMileageFilter.start;
+                  const endIso = activeMileageFilter.end;
+                  footerLogs = footerLogs.filter(log => {
+                    const d = String(log.date || '');
+                    if (startIso && d < startIso) return false;
+                    if (endIso && d > endIso) return false;
+                    return true;
+                  });
+                }
+                if (footerLogs.length === 0) return null;
+                const totalValue = footerLogs.reduce((acc, log) => acc + (Number(log.valor) || 0), 0);
+                const totalLiters = footerLogs.reduce((acc, log) => acc + (Number(log.litros) || 0), 0);
+                const mileages = footerLogs.map(l => Number(l.mileage) || 0);
+                const totalKm = Math.max(...mileages) - Math.min(...mileages);
+                return (
+                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-revis-black/30 border-t border-revis-gray/20 rounded-b-2xl">
+                    <div className="grid grid-cols-3 gap-2 text-center">
+                      <div>
+                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
+                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                          {formatAppCurrency(totalValue, currency, language)}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalLiters')}</div>
+                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                          {`${formatDecimal(totalLiters, language, 2)} ${t('litersShort')}`}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('kmDriven')}</div>
+                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                          {`${totalKm.toLocaleString(getLocaleFromLanguage(language))} km`}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
@@ -3099,78 +3796,75 @@ export default function App() {
               )}
 
               <div className="mb-4">
-                <button 
-                  onClick={() => setShowDateFilters(!showDateFilters)}
+                <button
+                  onClick={toggleDateFilters}
                   className="flex items-center gap-2 text-xs text-revis-gray hover:text-revis-green transition-colors mb-2"
                 >
                   <Calendar className="w-4 h-4" />
                   {t('filterByDate')}
                   {showDateFilters ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                 </button>
-                
+
                 {showDateFilters && (
-                  <div className="animate-in fade-in slide-in-from-top-2 duration-200">
-                    <div className="flex flex-col gap-2">
-                      <div className="flex gap-2 items-center">
-                        <input 
-                          type="date" 
-                          className="bg-revis-black/30 text-revis-light-gray text-[10px] rounded-lg px-2 py-1 border border-revis-gray/20 outline-none flex-1"
-                          value={servicesFilterDate.start}
-                          onChange={e => setServicesFilterDate({...servicesFilterDate, start: e.target.value})}
-                        />
-                        <button 
-                          onClick={() => {
-                            setActiveServicesFilter(servicesFilterDate);
-                            setServicesLimit(10);
-                          }}
-                          className="bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray text-[10px] px-3 py-1 rounded-lg hover:bg-revis-gray/20 transition-colors w-20"
-                        >
-                          {t('filter')}
-                        </button>
+                  <div className="animate-in fade-in slide-in-from-top-2 duration-200 relative rounded-lg min-h-[7.5rem]">
+                    <div
+                      className={`flex flex-col gap-2 ${isFreePlan(user?.plan) ? 'opacity-[0.38] pointer-events-none' : ''}`}
+                      aria-hidden={isFreePlan(user?.plan)}
+                    >
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateStartLabel')}</label>
+                          <LocalizedDateInput
+                            dateFormat={dateFormat}
+                            locale={getLocaleFromLanguage(language)}
+                            value={servicesFilterDate.start}
+                            onChange={handleServicesStartChange}
+                            ariaLabel={t('dateStartLabel')}
+                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateEndLabel')}</label>
+                          <LocalizedDateInput
+                            dateFormat={dateFormat}
+                            locale={getLocaleFromLanguage(language)}
+                            value={servicesFilterDate.end}
+                            onChange={handleServicesEndChange}
+                            ariaLabel={t('dateEndLabel')}
+                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                          />
+                        </div>
                       </div>
-                      <div className="text-center text-[10px] text-revis-gray">{t('to')}</div>
-                      <div className="flex gap-2 items-center">
-                        <input 
-                          type="date" 
-                          className="bg-revis-black/30 text-revis-light-gray text-[10px] rounded-lg px-2 py-1 border border-revis-gray/20 outline-none flex-1"
-                          value={servicesFilterDate.end}
-                          onChange={e => setServicesFilterDate({...servicesFilterDate, end: e.target.value})}
-                        />
-                        <button 
-                          onClick={() => {
-                            setServicesFilterDate({ start: '', end: '' });
-                            setActiveServicesFilter(null);
-                            setServicesLimit(10);
-                          }}
-                          className="bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray text-[10px] px-3 py-1 rounded-lg hover:bg-revis-gray/20 transition-colors w-20"
-                        >
-                          {t('clear')}
-                        </button>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={handleServicesFilterClear}
+                        disabled={!servicesFilterDate.start && !servicesFilterDate.end}
+                        className="self-end ml-auto flex items-center gap-1 text-[11px] font-medium text-red-500 hover:text-red-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-red-500"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        {t('clear')}
+                      </button>
                     </div>
+                    {isFreePlan(user?.plan) && (
+                      <div className="absolute inset-0 z-10 rounded-lg bg-revis-black/65 border border-revis-gray/20 flex flex-col items-center justify-center gap-2 p-4 text-center">
+                        <PremiumCrown
+                          tooltip={t('premiumCrownTooltip')}
+                          onOpenPlans={() => setShowUpgradeModal(true)}
+                          size="lg"
+                        />
+                        <p className="text-[11px] text-revis-light-gray leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
+                        <button
+                          type="button"
+                          onClick={() => setShowUpgradeModal(true)}
+                          className="text-xs font-bold text-revis-green underline decoration-revis-green/40 hover:text-revis-green/90"
+                        >
+                          {t('plans')}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
-
-              {activeServicesFilter && (
-                <div className="mb-4 p-3 bg-revis-black/20 rounded-xl flex justify-between items-center">
-                  <span className="text-sm text-revis-gray">{t('totalSpent')}:</span>
-                  <span className="text-revis-green font-bold">
-                    {formatAppCurrency(
-                      logs
-                        .filter(log => {
-                          const d = new Date(log.date);
-                          const start = new Date(activeServicesFilter.start);
-                          const end = new Date(activeServicesFilter.end);
-                          return d >= start && d <= end;
-                        })
-                        .reduce((acc, log) => acc + log.cost, 0),
-                      currency,
-                      language,
-                    )}
-                  </span>
-                </div>
-              )}
 
               <div className="space-y-2">
                 <div className="grid grid-cols-4 text-xs text-revis-gray font-medium pl-2 pr-16 gap-2 text-center">
@@ -3182,13 +3876,15 @@ export default function App() {
 
                 {(() => {
                   let displayLogs = logs;
-                  
-                  if (activeServicesFilter) {
-                    const start = new Date(activeServicesFilter.start);
-                    const end = new Date(activeServicesFilter.end);
+
+                  if (activeServicesFilter && (activeServicesFilter.start || activeServicesFilter.end)) {
+                    const startIso = activeServicesFilter.start;
+                    const endIso = activeServicesFilter.end;
                     displayLogs = displayLogs.filter(log => {
-                      const d = new Date(log.date);
-                      return d >= start && d <= end;
+                      const d = String(log.date || '');
+                      if (startIso && d < startIso) return false;
+                      if (endIso && d > endIso) return false;
+                      return true;
                     });
                   }
                   
@@ -3230,8 +3926,8 @@ export default function App() {
 
                       {hasMore && (
                         <button 
-                          onClick={() => setServicesLimit(prev => prev + 10)}
-                          className="w-full text-center text-xs text-revis-green font-medium py-2 hover:underline mt-2"
+                          onClick={() => setServicesLimit(prev => prev + 3)}
+                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-revis-green/40 bg-revis-green/10 text-xs text-revis-green font-medium hover:bg-revis-green/20 hover:border-revis-green transition-colors"
                         >
                           {t('seeMore')}
                         </button>
@@ -3240,16 +3936,45 @@ export default function App() {
                   );
                 })()}
               </div>
+
+              {/* Summary Panel - rodapé unificado com Valor total */}
+              {(() => {
+                let footerLogs = logs;
+                if (activeServicesFilter && (activeServicesFilter.start || activeServicesFilter.end)) {
+                  const startIso = activeServicesFilter.start;
+                  const endIso = activeServicesFilter.end;
+                  footerLogs = footerLogs.filter(log => {
+                    const d = String(log.date || '');
+                    if (startIso && d < startIso) return false;
+                    if (endIso && d > endIso) return false;
+                    return true;
+                  });
+                }
+                if (footerLogs.length === 0) return null;
+                const totalValue = footerLogs.reduce((acc, log) => acc + (Number(log.cost) || 0), 0);
+                return (
+                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-revis-black/30 border-t border-revis-gray/20 rounded-b-2xl">
+                    <div className="grid grid-cols-1 gap-2 text-center">
+                      <div>
+                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
+                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                          {formatAppCurrency(totalValue, currency, language)}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
 
         {/* Financial Records Card */}
-        <div className={`bg-revis-dark-gray rounded-2xl p-5 border ${user?.plan === 'free' ? 'border-revis-gray/20 opacity-75' : 'border-revis-gray/20'}`}>
+        <div className={`bg-revis-dark-gray rounded-2xl p-5 border ${isFreePlan(user?.plan) ? 'border-revis-gray/20 opacity-75' : 'border-revis-gray/20'}`}>
           <div 
             className="flex justify-between items-center cursor-pointer" 
             onClick={() => {
-              if (user?.plan === 'free') {
+              if (isFreePlan(user?.plan)) {
                 setShowUpgradeModal(true);
               } else {
                 setExpandedCards(prev => ({ ...prev, financial: !prev.financial }));
@@ -3258,35 +3983,20 @@ export default function App() {
           >
             <div className="flex items-center gap-2">
               <h3 className="font-bold text-revis-heading">{t('financialSectionTitle')}</h3>
-              {user?.plan === 'premium' && (
-                <div className="group relative">
-                  <Crown className="w-4 h-4 text-yellow-500 fill-yellow-500" />
-                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-black text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
-                    Recurso Premium
-                  </div>
-                </div>
-              )}
-              {user?.plan === 'free' && (
-                <div className="group relative">
-                  <Crown className="w-4 h-4 text-yellow-500 fill-yellow-500" />
-                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-black text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-10">
-                    Recurso Premium
-                  </div>
-                </div>
-              )}
+              <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" />
             </div>
-            {user?.plan === 'premium' && (
+            {isPlusOrPremium(user?.plan) && (
               expandedCards.financial ? <ChevronUp className="w-5 h-5 text-revis-gray" /> : <ChevronDown className="w-5 h-5 text-revis-gray" />
             )}
           </div>
 
-          {user?.plan === 'free' && (
+          {isFreePlan(user?.plan) && (
             <div className="mt-2 text-xs text-revis-green font-medium flex items-center gap-1">
-              Conheça nossos planos para liberar esse recurso.
+              {t('plansUnlockFinancial')}
             </div>
           )}
 
-          {expandedCards.financial && user?.plan === 'premium' && (
+          {expandedCards.financial && isPlusOrPremium(user?.plan) && (
             <div className="mt-4 animate-in slide-in-from-top-2 duration-200">
               {selectedVehicle.status !== 'archived' && (
                 <button 
@@ -3298,8 +4008,8 @@ export default function App() {
               )}
 
               <div className="mb-4">
-                <button 
-                  onClick={() => setShowDateFilters(!showDateFilters)}
+                <button
+                  onClick={toggleDateFilters}
                   className="flex items-center gap-2 text-xs text-revis-gray hover:text-revis-green transition-colors mb-2"
                 >
                   <Calendar className="w-4 h-4" />
@@ -3308,68 +4018,65 @@ export default function App() {
                 </button>
 
                 {showDateFilters && (
-                  <div className="animate-in fade-in slide-in-from-top-2 duration-200">
-                    <div className="flex flex-col gap-2">
-                      <div className="flex gap-2 items-center">
-                        <input 
-                          type="date" 
-                          className="bg-revis-black/30 text-revis-light-gray text-[10px] rounded-lg px-2 py-1 border border-revis-gray/20 outline-none flex-1"
-                          value={financialFilterDate.start}
-                          onChange={e => setFinancialFilterDate({...financialFilterDate, start: e.target.value})}
-                        />
-                        <button 
-                          onClick={() => {
-                            setActiveFinancialFilter(financialFilterDate);
-                            setFinancialLimit(10);
-                          }}
-                          className="bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray text-[10px] px-3 py-1 rounded-lg hover:bg-revis-gray/20 transition-colors w-20"
-                        >
-                          {t('filter')}
-                        </button>
+                  <div className="animate-in fade-in slide-in-from-top-2 duration-200 relative rounded-lg min-h-[7.5rem]">
+                    <div
+                      className={`flex flex-col gap-2 ${isFreePlan(user?.plan) ? 'opacity-[0.38] pointer-events-none' : ''}`}
+                      aria-hidden={isFreePlan(user?.plan)}
+                    >
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateStartLabel')}</label>
+                          <LocalizedDateInput
+                            dateFormat={dateFormat}
+                            locale={getLocaleFromLanguage(language)}
+                            value={financialFilterDate.start}
+                            onChange={handleFinancialStartChange}
+                            ariaLabel={t('dateStartLabel')}
+                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateEndLabel')}</label>
+                          <LocalizedDateInput
+                            dateFormat={dateFormat}
+                            locale={getLocaleFromLanguage(language)}
+                            value={financialFilterDate.end}
+                            onChange={handleFinancialEndChange}
+                            ariaLabel={t('dateEndLabel')}
+                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                          />
+                        </div>
                       </div>
-                      <div className="text-center text-[10px] text-revis-gray">{t('to')}</div>
-                      <div className="flex gap-2 items-center">
-                        <input 
-                          type="date" 
-                          className="bg-revis-black/30 text-revis-light-gray text-[10px] rounded-lg px-2 py-1 border border-revis-gray/20 outline-none flex-1"
-                          value={financialFilterDate.end}
-                          onChange={e => setFinancialFilterDate({...financialFilterDate, end: e.target.value})}
-                        />
-                        <button 
-                          onClick={() => {
-                            setFinancialFilterDate({ start: '', end: '' });
-                            setActiveFinancialFilter(null);
-                            setFinancialLimit(10);
-                          }}
-                          className="bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray text-[10px] px-3 py-1 rounded-lg hover:bg-revis-gray/20 transition-colors w-20"
-                        >
-                          {t('clear')}
-                        </button>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={handleFinancialFilterClear}
+                        disabled={!financialFilterDate.start && !financialFilterDate.end}
+                        className="self-end ml-auto flex items-center gap-1 text-[11px] font-medium text-red-500 hover:text-red-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-red-500"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        {t('clear')}
+                      </button>
                     </div>
+                    {isFreePlan(user?.plan) && (
+                      <div className="absolute inset-0 z-10 rounded-lg bg-revis-black/65 border border-revis-gray/20 flex flex-col items-center justify-center gap-2 p-4 text-center">
+                        <PremiumCrown
+                          tooltip={t('premiumCrownTooltip')}
+                          onOpenPlans={() => setShowUpgradeModal(true)}
+                          size="lg"
+                        />
+                        <p className="text-[11px] text-revis-light-gray leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
+                        <button
+                          type="button"
+                          onClick={() => setShowUpgradeModal(true)}
+                          className="text-xs font-bold text-revis-green underline decoration-revis-green/40 hover:text-revis-green/90"
+                        >
+                          {t('plans')}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
-
-              {activeFinancialFilter && (
-                <div className="mb-4 p-3 bg-revis-black/20 rounded-xl flex justify-between items-center">
-                  <span className="text-sm text-revis-gray">{t('totalLabel')}</span>
-                  <span className="text-revis-green font-bold">
-                    {formatAppCurrency(
-                      financialRecords
-                        .filter(rec => {
-                          const d = new Date(rec.due_date);
-                          const start = new Date(activeFinancialFilter.start);
-                          const end = new Date(activeFinancialFilter.end);
-                          return d >= start && d <= end;
-                        })
-                        .reduce((acc, rec) => acc + rec.value, 0),
-                      currency,
-                      language,
-                    )}
-                  </span>
-                </div>
-              )}
 
               <div className="space-y-2">
                 <div className="grid grid-cols-4 text-xs text-revis-gray font-medium pl-2 pr-16 gap-2 text-center">
@@ -3381,13 +4088,15 @@ export default function App() {
 
                 {(() => {
                   let displayRecords = financialRecords;
-                  
-                  if (activeFinancialFilter) {
-                    const start = new Date(activeFinancialFilter.start);
-                    const end = new Date(activeFinancialFilter.end);
+
+                  if (activeFinancialFilter && (activeFinancialFilter.start || activeFinancialFilter.end)) {
+                    const startIso = activeFinancialFilter.start;
+                    const endIso = activeFinancialFilter.end;
                     displayRecords = displayRecords.filter(rec => {
-                      const d = new Date(rec.due_date);
-                      return d >= start && d <= end;
+                      const d = String(rec.due_date || '');
+                      if (startIso && d < startIso) return false;
+                      if (endIso && d > endIso) return false;
+                      return true;
                     });
                   }
                   
@@ -3429,8 +4138,8 @@ export default function App() {
 
                       {hasMore && (
                         <button 
-                          onClick={() => setFinancialLimit(prev => prev + 10)}
-                          className="w-full text-center text-xs text-revis-green font-medium py-2 hover:underline mt-2"
+                          onClick={() => setFinancialLimit(prev => prev + 3)}
+                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-revis-green/40 bg-revis-green/10 text-xs text-revis-green font-medium hover:bg-revis-green/20 hover:border-revis-green transition-colors"
                         >
                           {t('seeMore')}
                         </button>
@@ -3439,6 +4148,35 @@ export default function App() {
                   );
                 })()}
               </div>
+
+              {/* Summary Panel - rodapé unificado com Valor total */}
+              {(() => {
+                let footerRecords = financialRecords;
+                if (activeFinancialFilter && (activeFinancialFilter.start || activeFinancialFilter.end)) {
+                  const startIso = activeFinancialFilter.start;
+                  const endIso = activeFinancialFilter.end;
+                  footerRecords = footerRecords.filter(rec => {
+                    const d = String(rec.due_date || '');
+                    if (startIso && d < startIso) return false;
+                    if (endIso && d > endIso) return false;
+                    return true;
+                  });
+                }
+                if (footerRecords.length === 0) return null;
+                const totalValue = footerRecords.reduce((acc, rec) => acc + (Number(rec.value) || 0), 0);
+                return (
+                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-revis-black/30 border-t border-revis-gray/20 rounded-b-2xl">
+                    <div className="grid grid-cols-1 gap-2 text-center">
+                      <div>
+                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
+                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                          {formatAppCurrency(totalValue, currency, language)}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
@@ -3447,7 +4185,7 @@ export default function App() {
   };
 
   const renderAdvisor = () => {
-    if (user?.plan === 'free') {
+    if (isFreePlan(user?.plan)) {
       return (
         <div className="flex flex-col items-center justify-center h-[calc(100vh-140px)] text-center px-6">
           <div className="w-20 h-20 bg-revis-dark-gray rounded-full flex items-center justify-center mb-6 animate-pulse">
@@ -3465,57 +4203,154 @@ export default function App() {
       );
     }
 
-    return (
-    <div className="flex flex-col h-[calc(100dvh-135px)] md:h-[calc(100vh-4rem)] max-w-4xl mx-auto">
-      <div className="mb-4">
-        <div className="flex justify-between items-center mb-2">
-          <h2 className="text-lg font-bold text-revis-heading flex items-center gap-2">
-            <div className="group relative">
-              <Crown className="w-5 h-5 text-yellow-500 fill-yellow-500" />
-              <div className="absolute top-full left-0 mt-2 px-2 py-1 bg-black text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-50">
-                Recurso Premium
-              </div>
-            </div>
-            Dr. Graxa
-          </h2>
-          <button 
-            onClick={() => setShowChatHistory(true)}
-            className="bg-revis-green text-black text-xs font-bold px-3 py-1.5 rounded-lg hover:bg-opacity-90 transition-colors"
-          >
-            Histórico
-          </button>
-        </div>
-        
-        <div className="mt-2 flex items-center gap-2">
-          <span className="text-xs text-revis-gray whitespace-nowrap">{t('advisorVehiclePrompt')}</span>
-          <select
-            className="flex-1 bg-revis-dark-gray border border-revis-gray/20 rounded-xl px-4 py-2 text-xs text-revis-light-gray outline-none focus:border-revis-green transition-colors appearance-none"
-            value={selectedVehicle?.id || ''}
-            onChange={(e) => {
-              const vehicleId = parseInt(e.target.value);
-              const vehicle = vehicles.find(v => v.id === vehicleId);
-              setSelectedVehicle(vehicle || null);
-              if (vehicle) {
-                setExpandedCards({ mileage: false, services: false, financial: false });
-                fetchLogs(vehicle.id);
-                fetchFinancialRecords(vehicle.id);
-              } else {
-                setLogs([]);
-                setFinancialRecords([]);
-              }
-            }}
-          >
-            <option value="">Nenhum</option>
-            {[...vehicles].sort((a, b) => (a.brand || '').localeCompare(b.brand || '') || (a.model || '').localeCompare(b.model || '')).map(vehicle => (
+    const aiLimit = aiMonthlyLimitForPlan(user?.plan);
+    const aiUsed = user?.ai_messages_count ?? 0;
+    const aiRemaining = Math.max(0, aiLimit - aiUsed);
+    const quotaReached = aiLimit > 0 && aiUsed >= aiLimit;
+
+    const leaveDrGraxaChat = () => {
+      setDrGraxaUIMode('list');
+      setCurrentSessionId(null);
+      setChatMessages([]);
+      setAiPrompt('');
+      void fetchChatSessions();
+    };
+
+    const quotaStrip = (
+      <div
+        className={`rounded-xl px-3 py-2.5 text-center text-xs font-semibold ${
+          quotaReached
+            ? 'bg-red-500/15 text-red-200 border border-red-500/30'
+            : 'bg-revis-green/10 text-revis-heading border border-revis-green/25'
+        }`}
+        role="status"
+      >
+        {quotaReached
+          ? t('drGraxaLimitReachedBanner')
+          : t('drGraxaMonthlyRemaining').replace('{remaining}', String(aiRemaining)).replace('{limit}', String(aiLimit))}
+      </div>
+    );
+
+    const vehicleRow = (
+      <div className="mt-2 flex items-center gap-2">
+        <span className="text-xs text-revis-gray whitespace-nowrap">{t('advisorVehiclePrompt')}</span>
+        <select
+          className="flex-1 bg-revis-dark-gray border border-revis-gray/20 rounded-xl px-4 py-2 text-xs text-revis-light-gray outline-none focus:border-revis-green transition-colors appearance-none"
+          value={selectedVehicle?.id || ''}
+          onChange={(e) => {
+            const vehicleId = parseInt(e.target.value, 10);
+            const vehicle = vehicles.find(v => v.id === vehicleId);
+            setSelectedVehicle(vehicle || null);
+            if (vehicle) {
+              setExpandedCards({ mileage: false, services: false, financial: false });
+              fetchLogs(vehicle.id);
+              fetchFinancialRecords(vehicle.id);
+            } else {
+              setLogs([]);
+              setFinancialRecords([]);
+            }
+          }}
+        >
+          <option value="">Nenhum</option>
+          {[...vehicles]
+            .sort((a, b) =>
+              (a.brand || '').localeCompare(b.brand || '') || (a.model || '').localeCompare(b.model || ''),
+            )
+            .map(vehicle => (
               <option key={vehicle.id} value={vehicle.id}>
                 {vehicle.brand} {vehicle.model} ({vehicle.year})
               </option>
             ))}
-          </select>
+        </select>
+      </div>
+    );
+
+    if (drGraxaUIMode === 'list') {
+      return (
+        <div className="flex flex-col h-[calc(100dvh-135px)] md:h-[calc(100vh-4rem)] max-w-4xl mx-auto">
+          <div className="mb-3 shrink-0">
+            <div className="flex justify-between items-center mb-1">
+              <h2 className="text-lg font-bold text-revis-heading flex items-center gap-2">
+                <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="sm" />
+                Dr. Graxa
+              </h2>
+            </div>
+            <div className="mt-2">{quotaStrip}</div>
+            <p className="text-[10px] text-revis-gray mt-2 px-0.5">
+              {t('aiMessagesUsage').replace('{used}', String(aiUsed)).replace('{limit}', String(aiLimit))}
+            </p>
+            {vehicleRow}
+          </div>
+
+          <button
+            type="button"
+            disabled={quotaReached}
+            onClick={() => setShowDrGraxaManualModal(true)}
+            className="mt-3 w-full py-4 rounded-xl bg-revis-green text-black font-bold text-sm shadow-lg shadow-revis-green/20 hover:bg-opacity-90 transition-colors disabled:opacity-45 disabled:cursor-not-allowed flex items-center justify-center shrink-0"
+          >
+            <span>{t('drGraxaNewChat')}</span>
+          </button>
+
+          <p className="text-xs font-semibold text-revis-heading mt-5 mb-2 shrink-0">{t('drGraxaChatsSubtitle')}</p>
+
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-1 scrollbar-hide pb-4">
+            {chatSessions.map(session => {
+              const displayTitle = session.title?.trim() || t('newChatSessionTitle');
+              return (
+                <div key={session.id} className="relative group">
+                  <button
+                    type="button"
+                    onClick={() => void loadChatSession(session.id)}
+                    className="w-full bg-revis-dark-gray p-4 rounded-xl text-left hover:bg-revis-gray/20 transition-colors pr-12 border border-revis-gray/10 hover:border-revis-green/30"
+                  >
+                    <h4 className="text-revis-heading font-medium text-sm line-clamp-2 mb-2">{displayTitle}</h4>
+                    <span className="text-[10px] text-revis-green font-semibold inline-flex items-center gap-1">
+                      <Calendar className="w-3 h-3" />
+                      {formatAppDate(session.updated_at, dateFormat)}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setChatSessionToDelete(session.id);
+                      setShowDeleteChatModal(true);
+                    }}
+                    className="absolute bottom-3 right-3 p-2 text-revis-alert-critical hover:bg-revis-alert-critical/10 rounded-lg transition-colors z-10"
+                    title={t('deleteChatAria')}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              );
+            })}
+            {chatSessions.length === 0 && (
+              <div className="text-center py-12 px-4 text-revis-gray">
+                <MessageSquare className="w-12 h-12 mx-auto mb-3 opacity-20" />
+                <p className="text-sm">{t('drGraxaNoChatsYet')}</p>
+              </div>
+            )}
+          </div>
         </div>
+      );
+    }
+
+    return (
+    <div className="flex flex-col h-[calc(100dvh-135px)] md:h-[calc(100vh-4rem)] max-w-4xl mx-auto">
+      <div className="mb-3 shrink-0 space-y-2">
+        <button
+          type="button"
+          onClick={leaveDrGraxaChat}
+          className="flex items-center gap-1 text-revis-green text-sm font-bold -ml-1"
+        >
+          <ChevronLeft className="w-5 h-5" />
+          {t('drGraxaBackToList')}
+        </button>
+        {quotaStrip}
+        {vehicleRow}
       </div>
       
-      <div className="flex-1 overflow-y-auto space-y-4 pb-4 pr-1 scrollbar-hide flex flex-col">
+      <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pb-4 pr-1 scrollbar-hide flex flex-col">
         {chatMessages.length === 0 && (
           <div className="text-center text-revis-gray mt-10 px-4">
             <div className="relative w-12 h-12 mx-auto mb-4 opacity-20">
@@ -3537,7 +4372,7 @@ export default function App() {
           >
             <ReactMarkdown>{msg.content}</ReactMarkdown>
             <div className={`text-[9px] mt-1 text-right opacity-60 ${msg.sender === 'user' ? 'text-black' : 'text-gray-500'}`}>
-              {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {new Date(msg.timestamp).toLocaleTimeString(getLocaleFromLanguage(language), { hour: '2-digit', minute: '2-digit' })}
             </div>
           </div>
         ))}
@@ -3552,20 +4387,31 @@ export default function App() {
         )}
       </div>
 
-      <div className="mt-auto pt-2">
+      <div className="mt-auto shrink-0 pt-3 border-t border-revis-gray/10">
+        <div className={`mb-2 rounded-lg px-2 py-1.5 text-center text-[10px] font-medium ${quotaReached ? 'text-red-300' : 'text-revis-gray'}`}>
+          {quotaReached
+            ? t('drGraxaLimitReachedBanner')
+            : t('drGraxaMonthlyRemaining').replace('{remaining}', String(aiRemaining)).replace('{limit}', String(aiLimit))}
+        </div>
         <div className="flex gap-2">
           <input
             type="text"
             value={aiPrompt}
             onChange={(e) => setAiPrompt(e.target.value)}
-            placeholder={t('advisorInputPlaceholder')}
-            className="flex-1 bg-revis-dark-gray border border-revis-gray/20 rounded-xl px-4 py-3 text-xs text-revis-light-gray focus:outline-none focus:border-revis-green transition-colors placeholder:text-revis-gray/50"
-            onKeyDown={(e) => e.key === 'Enter' && askAi()}
+            placeholder={quotaReached ? t('drGraxaLimitReachedBanner') : t('advisorInputPlaceholder')}
+            disabled={quotaReached || isLoadingAi}
+            className="flex-1 bg-revis-dark-gray border border-revis-gray/20 rounded-xl px-4 py-3 text-xs text-revis-light-gray focus:outline-none focus:border-revis-green transition-colors placeholder:text-revis-gray/50 disabled:opacity-50"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                if (!quotaReached && !isLoadingAi && aiPrompt.trim()) void askAi();
+              }
+            }}
           />
           <button 
-            onClick={askAi}
-            disabled={isLoadingAi || !aiPrompt.trim()}
-            className="bg-revis-green disabled:opacity-50 disabled:cursor-not-allowed text-black px-4 rounded-xl transition-colors font-bold flex items-center justify-center"
+            onClick={() => void askAi()}
+            disabled={isLoadingAi || !aiPrompt.trim() || quotaReached}
+            className="bg-revis-green disabled:opacity-50 disabled:cursor-not-allowed text-black px-4 rounded-xl transition-colors font-bold flex items-center justify-center shrink-0"
           >
             {isLoadingAi ? <Activity className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5 fill-black" />}
           </button>
@@ -3858,110 +4704,70 @@ export default function App() {
       {/* Full Screen Modals for Mobile */}
       {/* Profile Menu Modal Removed */}
 
-      {/* Chat History Modal */}
-      {showChatHistory && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
-          <div className="p-4">
-            <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">{t('chatHistory')}</h2>
-              <button onClick={() => setShowChatHistory(false)} className="text-revis-gray p-2">
+      {/* Mini manual antes de iniciar nova conversa (Dr. Graxa) */}
+      {showDrGraxaManualModal && (
+        <div
+          className="fixed inset-0 z-[60] flex items-end md:items-center justify-center md:p-4 bg-black/70 backdrop-blur-sm animate-in fade-in duration-200"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="dr-graxa-manual-title"
+          onClick={() => setShowDrGraxaManualModal(false)}
+        >
+          <div
+            className="w-full md:max-w-lg max-h-[92dvh] overflow-y-auto rounded-t-3xl md:rounded-3xl bg-revis-dark-gray border border-revis-gray/30 shadow-2xl p-5 md:p-6 animate-in slide-in-from-bottom md:slide-in-from-bottom-0 md:zoom-in-95 duration-300"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex justify-between items-start gap-3 mb-3">
+              <h2 id="dr-graxa-manual-title" className="text-base md:text-lg font-bold text-revis-heading leading-snug">
+                {t('drGraxaOnboardingTitle')}
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowDrGraxaManualModal(false)}
+                className="text-revis-gray hover:text-revis-heading p-1 shrink-0 rounded-lg hover:bg-revis-black/40"
+                aria-label={t('closeButton')}
+              >
                 <X className="w-6 h-6" />
               </button>
             </div>
-
-            {/* Filters */}
-            <div className="bg-revis-dark-gray p-4 rounded-xl mb-6 space-y-4">
-              <h3 className="text-revis-heading font-bold flex items-center gap-2">
-                <Search className="w-4 h-4 text-revis-green" />
-                {t('filterByDate').replace(/:\s*$/, '')}
-              </h3>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-[10px] text-revis-gray mb-1 block">{t('dateStartLabel')}</label>
-                  <input 
-                    type="date"
-                    value={chatHistoryStartDate}
-                    onChange={(e) => setChatHistoryStartDate(e.target.value)}
-                    className="w-full bg-revis-black/30 border border-revis-gray/20 rounded-lg p-2 text-xs text-revis-light-gray focus:border-revis-green outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="text-[10px] text-revis-gray mb-1 block">{t('dateEndLabel')}</label>
-                  <input 
-                    type="date"
-                    value={chatHistoryEndDate}
-                    onChange={(e) => setChatHistoryEndDate(e.target.value)}
-                    className="w-full bg-revis-black/30 border border-revis-gray/20 rounded-lg p-2 text-xs text-revis-light-gray focus:border-revis-green outline-none"
-                  />
-                </div>
-              </div>
-              {(chatHistoryStartDate || chatHistoryEndDate) && (
-                <button 
-                  onClick={() => { setChatHistoryStartDate(''); setChatHistoryEndDate(''); }}
-                  className="w-full text-xs text-revis-alert-critical font-bold py-2 border border-revis-alert-critical/30 rounded-lg hover:bg-revis-alert-critical/10 transition-colors"
+            <p className="text-sm text-revis-gray leading-relaxed mb-5">{t('drGraxaOnboardingSubtitle')}</p>
+            <ul className="space-y-3 mb-6">
+              {(
+                [
+                  [Lightbulb, t('drGraxaOnboardingTip1')],
+                  [Zap, t('drGraxaOnboardingTip2')],
+                  [Layers, t('drGraxaOnboardingTip3')],
+                  [Wrench, t('drGraxaOnboardingTip4')],
+                ] as const
+              ).map(([IconC, txt], idx) => (
+                <li
+                  key={idx}
+                  className="flex gap-3 rounded-2xl bg-revis-black/45 border border-revis-gray/15 p-3.5 items-start"
                 >
-                  {t('clearFilters')}
-                </button>
-              )}
-            </div>
-
-            {/* Sessions List */}
-            <div className="space-y-3">
-              {chatSessions
-                .filter(session => {
-                  if (!chatHistoryStartDate && !chatHistoryEndDate) return true;
-                  const sessionDate = new Date(session.updated_at).toISOString().split('T')[0];
-                  if (chatHistoryStartDate && sessionDate < chatHistoryStartDate) return false;
-                  if (chatHistoryEndDate && sessionDate > chatHistoryEndDate) return false;
-                  return true;
-                })
-                .map(session => {
-                  // Find vehicle info
-                  const sessionVehicle = session.vehicle_id ? vehicles.find(v => v.id === session.vehicle_id) || archivedVehicles.find(v => v.id === session.vehicle_id) : null;
-                  
-                  return (
-                    <div key={session.id} className="relative group">
-                      <button
-                        onClick={() => loadChatSession(session.id)}
-                        className="w-full bg-revis-dark-gray p-4 rounded-xl text-left hover:bg-revis-gray/20 transition-colors pr-10"
-                      >
-                        <div className="flex justify-between items-start mb-1">
-                          <span className="text-xs text-revis-green font-bold flex items-center gap-1">
-                            <Calendar className="w-3 h-3" />
-                            {formatAppDate(session.updated_at, dateFormat)}
-                          </span>
-                          <ChevronLeft className="w-4 h-4 rotate-180 text-revis-gray group-hover:text-revis-green transition-colors" />
-                        </div>
-                        <h4 className="text-revis-heading font-medium text-sm line-clamp-2">{session.title}</h4>
-                        {sessionVehicle && (
-                          <p className="text-xs text-revis-gray mt-1 flex items-center gap-1">
-                            <Car className="w-3 h-3" />
-                            {sessionVehicle.brand} {sessionVehicle.model} ({sessionVehicle.year})
-                          </p>
-                        )}
-                      </button>
-                      <button 
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setChatSessionToDelete(session.id);
-                          setShowDeleteChatModal(true);
-                        }}
-                        className="absolute bottom-4 right-4 p-2 text-revis-alert-critical hover:bg-revis-alert-critical/10 rounded-lg transition-colors z-10"
-                        title={t('deleteChatAria')}
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  );
-                })
-              }
-              {chatSessions.length === 0 && (
-                <div className="text-center py-10 text-revis-gray">
-                  <MessageSquare className="w-12 h-12 mx-auto mb-3 opacity-20" />
-                  <p>Nenhuma conversa encontrada.</p>
-                </div>
-              )}
-            </div>
+                  <span className="flex-shrink-0 w-10 h-10 rounded-xl bg-revis-green/15 flex items-center justify-center mt-0.5">
+                    <IconC className="w-[18px] h-[18px] text-revis-green" aria-hidden />
+                  </span>
+                  <p className="text-xs text-revis-light-gray leading-relaxed pt-1">{txt}</p>
+                </li>
+              ))}
+            </ul>
+            <button
+              type="button"
+              disabled={Boolean(user && aiMonthlyLimitForPlan(user.plan) > 0 && (user.ai_messages_count ?? 0) >= aiMonthlyLimitForPlan(user.plan))}
+              onClick={() => {
+                const limit = aiMonthlyLimitForPlan(user?.plan);
+                const used = user?.ai_messages_count ?? 0;
+                if (limit > 0 && used >= limit) return;
+                setShowDrGraxaManualModal(false);
+                setDrGraxaUIMode('chat');
+                setCurrentSessionId(null);
+                setChatMessages([]);
+                setAiPrompt('');
+              }}
+              className="w-full py-4 rounded-2xl bg-revis-green text-black font-bold text-base shadow-lg shadow-revis-green/25 hover:bg-opacity-90 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+            >
+              {t('drGraxaOnboardingAck')}
+            </button>
           </div>
         </div>
       )}
@@ -4581,28 +5387,29 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2 mb-1">
                     <label className="block text-sm text-revis-gray">{t('nickname')}</label>
-                    {user?.plan !== 'premium' && (
-                      <span className="inline-flex items-center gap-1 text-xs font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded-full px-2 py-0.5">
-                        👑 Premium
+                    {!isPlusOrPremium(user?.plan) && (
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/20 px-2 py-0.5 text-xs font-semibold text-amber-300">
+                        <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" className="-my-px" />
+                        Premium
                       </span>
                     )}
                   </div>
                   <div
                     onClick={() => {
-                      if (user?.plan !== 'premium') {
+                      if (!isPlusOrPremium(user?.plan)) {
                         setShowUpgradeModal(true);
                       }
                     }}
                   >
                     <input
                       className={`w-full bg-revis-dark-gray border border-transparent rounded-xl p-4 outline-none transition-colors ${
-                        user?.plan === 'premium'
+                        isPlusOrPremium(user?.plan)
                           ? 'focus:border-revis-green text-revis-light-gray'
                           : 'text-revis-gray cursor-not-allowed opacity-60'
                       }`}
-                      placeholder={user?.plan === 'premium' ? t('vehicleNicknamePremiumExample') : t('vehicleNicknamePremiumOnly')}
+                      placeholder={isPlusOrPremium(user?.plan) ? t('vehicleNicknamePremiumExample') : t('vehicleNicknamePremiumOnly')}
                       maxLength={12}
-                      disabled={user?.plan !== 'premium'}
+                      disabled={!isPlusOrPremium(user?.plan)}
                       value={newVehicle.nickname || ''}
                       onChange={e => {
                         const val = e.target.value.replace(/[^a-zA-Z ]/g, '');
@@ -4615,26 +5422,27 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2 mb-1">
                     <label className="block text-sm text-revis-gray">{t('color')}</label>
-                    {user?.plan !== 'premium' && (
-                      <span className="inline-flex items-center gap-1 text-xs font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded-full px-2 py-0.5">
-                        👑 Premium
+                    {!isPlusOrPremium(user?.plan) && (
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/20 px-2 py-0.5 text-xs font-semibold text-amber-300">
+                        <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" className="-my-px" />
+                        Premium
                       </span>
                     )}
                   </div>
                   <div
                     onClick={() => {
-                      if (user?.plan !== 'premium') {
+                      if (!isPlusOrPremium(user?.plan)) {
                         setShowUpgradeModal(true);
                       }
                     }}
                   >
                     <select
                       className={`w-full bg-revis-dark-gray border border-transparent rounded-xl p-4 outline-none appearance-none transition-colors ${
-                        user?.plan === 'premium'
+                        isPlusOrPremium(user?.plan)
                           ? 'focus:border-revis-green text-revis-light-gray'
                           : 'text-revis-gray cursor-not-allowed opacity-60'
                       }`}
-                      disabled={user?.plan !== 'premium'}
+                      disabled={!isPlusOrPremium(user?.plan)}
                       value={newVehicle.color || ''}
                       onChange={e => {
                         const val = e.target.value;
@@ -4643,11 +5451,11 @@ export default function App() {
                         if (val !== 'Outra') setOtherColor('');
                       }}
                     >
-                      <option value="">{user?.plan === 'premium' ? t('selectPlaceholder') : t('vehicleNicknamePremiumOnly')}</option>
-                      {user?.plan === 'premium' && VEHICLE_COLORS.map(c => <option key={c} value={c}>{c}</option>)}
+                      <option value="">{isPlusOrPremium(user?.plan) ? t('selectPlaceholder') : t('vehicleNicknamePremiumOnly')}</option>
+                      {isPlusOrPremium(user?.plan) && VEHICLE_COLORS.map(c => <option key={c} value={c}>{c}</option>)}
                     </select>
 
-                    {user?.plan === 'premium' && newVehicle.color === 'Customizado' && (
+                    {isPlusOrPremium(user?.plan) && newVehicle.color === 'Customizado' && (
                       <input
                         className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors mt-2"
                         placeholder={t('vehicleCustomColorPlaceholder')}
@@ -4660,7 +5468,7 @@ export default function App() {
                       />
                     )}
 
-                    {user?.plan === 'premium' && newVehicle.color === 'Outra' && (
+                    {isPlusOrPremium(user?.plan) && newVehicle.color === 'Outra' && (
                       <input
                         className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors mt-2"
                         placeholder={t('vehicleColorPlaceholder')}
@@ -4709,12 +5517,13 @@ export default function App() {
 
               <div>
                 <label className="block text-sm text-revis-gray mb-1">{t('lastGeneralRevision')}</label>
-                <input 
-                  type="date"
+                <LocalizedDateInput
                   required
+                  dateFormat={dateFormat}
+                  locale={getLocaleFromLanguage(language)}
                   className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
                   value={newVehicle.last_service_date || ''}
-                  onChange={e => setNewVehicle({...newVehicle, last_service_date: e.target.value})}
+                  onChange={iso => setNewVehicle({ ...newVehicle, last_service_date: iso })}
                 />
               </div>
 
@@ -4789,18 +5598,21 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">Data</label>
-                  <input 
-                    type="date"
+                  <label className="block text-sm text-revis-gray mb-1">{t('date')}</label>
+                  <LocalizedDateInput
                     required
+                    dateFormat={dateFormat}
+                    locale={getLocaleFromLanguage(language)}
                     className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
                     value={newLog.date || ''}
-                    onChange={e => setNewLog({...newLog, date: e.target.value})}
+                    onChange={iso => setNewLog({ ...newLog, date: iso })}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">Custo (R$)</label>
-                  <input 
+                  <label className="block text-sm text-revis-gray mb-1">
+                    {t('value')} ({getCurrencySymbol(currency, getLocaleFromLanguage(language))})
+                  </label>
+                  <input
                     type="number"
                     step="0.01"
                     required
@@ -4889,17 +5701,20 @@ export default function App() {
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm text-revis-gray mb-1">Vencimento</label>
-                  <input 
-                    type="date"
+                  <LocalizedDateInput
                     required
+                    dateFormat={dateFormat}
+                    locale={getLocaleFromLanguage(language)}
                     className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
                     value={newFinancial.due_date || ''}
-                    onChange={e => setNewFinancial({...newFinancial, due_date: e.target.value})}
+                    onChange={iso => setNewFinancial({ ...newFinancial, due_date: iso })}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">Valor (R$)</label>
-                  <input 
+                  <label className="block text-sm text-revis-gray mb-1">
+                    {t('value')} ({getCurrencySymbol(currency, getLocaleFromLanguage(language))})
+                  </label>
+                  <input
                     type="number"
                     step="0.01"
                     required
@@ -4934,12 +5749,13 @@ export default function App() {
               {newFinancial.status === 'Pago' && (
                 <div>
                   <label className="block text-sm text-revis-gray mb-1">Data de Pagamento</label>
-                  <input 
-                    type="date"
+                  <LocalizedDateInput
                     required
+                    dateFormat={dateFormat}
+                    locale={getLocaleFromLanguage(language)}
                     className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
                     value={newFinancial.payment_date || ''}
-                    onChange={e => setNewFinancial({...newFinancial, payment_date: e.target.value})}
+                    onChange={iso => setNewFinancial({ ...newFinancial, payment_date: iso })}
                   />
                 </div>
               )}
@@ -4978,7 +5794,7 @@ export default function App() {
           <div className="p-4">
             <div className="flex justify-between items-center mb-6">
               <h2 className="text-2xl font-bold text-revis-heading">
-                {editingMileageLogId ? t('editMileageTitle') : 'Novo Registro de Km'}
+                {editingMileageLogId ? t('editFuelingTitle') : t('newFuelingTitle')}
               </h2>
               <div className="flex items-center gap-1">
                 {editingMileageLogId && (
@@ -5000,20 +5816,61 @@ export default function App() {
 
             <form onSubmit={handleMileageSubmit} className="space-y-6">
               <div>
-                <label className="block text-sm text-revis-gray mb-1">Data</label>
-                <input 
-                  type="date"
+                <label className="block text-sm text-revis-gray mb-1">{t('date')}</label>
+                <LocalizedDateInput
                   required
+                  dateFormat={dateFormat}
+                  locale={getLocaleFromLanguage(language)}
                   className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
                   value={newMileage.date || ''}
-                  onChange={e => setNewMileage({...newMileage, date: e.target.value})}
+                  onChange={iso => setNewMileage({ ...newMileage, date: iso })}
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm text-revis-gray mb-1">
+                  {t('value')} ({getCurrencySymbol(currency, getLocaleFromLanguage(language))})
+                </label>
+                <input
+                  inputMode="decimal"
+                  placeholder={t('valuePlaceholderDecimal')}
+                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  value={newMileage.valor || ''}
+                  onChange={e => {
+                    const decSep = getLocaleDecimalSeparator(language);
+                    const thouSep = decSep === ',' ? '.' : ',';
+                    // Mantém apenas dígitos e o separador decimal local; aceita também o separador alternativo digitando rápido.
+                    const cleaned = e.target.value
+                      .replace(new RegExp(`[^0-9${decSep === '.' ? '\\.' : decSep}${thouSep === '.' ? '\\.' : thouSep}]`, 'g'), '')
+                      .replace(new RegExp(`\\${thouSep}`, 'g'), '');
+                    setNewMileage({ ...newMileage, valor: cleaned });
+                  }}
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm text-revis-gray mb-1">{t('litersLabel')}</label>
+                <input
+                  inputMode="decimal"
+                  placeholder={t('litersPlaceholderDecimal')}
+                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  value={newMileage.litros || ''}
+                  onChange={e => {
+                    const decSep = getLocaleDecimalSeparator(language);
+                    const thouSep = decSep === ',' ? '.' : ',';
+                    const cleaned = e.target.value
+                      .replace(new RegExp(`[^0-9${decSep === '.' ? '\\.' : decSep}${thouSep === '.' ? '\\.' : thouSep}]`, 'g'), '')
+                      .replace(new RegExp(`\\${thouSep}`, 'g'), '');
+                    setNewMileage({ ...newMileage, litros: cleaned });
+                  }}
                 />
               </div>
 
               <div>
                 <label className="block text-sm text-revis-gray mb-1">{t('currentKmLabel')}</label>
-                <input 
+                <input
                   required
+                  inputMode="numeric"
                   placeholder={t('mileagePlaceholderZero')}
                   className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
                   value={newMileage.mileage || ''}
@@ -5053,7 +5910,7 @@ export default function App() {
           >
             <div className="flex justify-between items-start mb-5">
               <h3 className="text-xl font-bold text-revis-green">
-                {viewingRecord.kind === 'mileage' && t('viewMileageTitle')}
+                {viewingRecord.kind === 'mileage' && t('viewFuelingTitle')}
                 {viewingRecord.kind === 'maintenance' && t('viewMaintenanceTitle')}
                 {viewingRecord.kind === 'financial' && t('viewFinancialTitle')}
               </h3>
@@ -5068,18 +5925,66 @@ export default function App() {
             </div>
 
             <dl className="space-y-4 text-sm max-h-[60vh] overflow-y-auto pr-1">
-              {viewingRecord.kind === 'mileage' && (
-                <>
-                  <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('date')}</dt>
-                    <dd className="text-revis-light-gray">{formatAppDate(viewingRecord.data.date, dateFormat)}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('km')}</dt>
-                    <dd className="text-revis-light-gray font-semibold">{(viewingRecord.data.mileage || 0).toLocaleString()} km</dd>
-                  </div>
-                </>
-              )}
+              {viewingRecord.kind === 'mileage' && (() => {
+                // Recalcula o KM/L do registro selecionado a partir do histórico do veículo,
+                // respeitando a mesma regra cronológica usada na listagem.
+                const all = selectedVehicle?.mileage_history || [];
+                const sorted = [...all].sort((a, b) => {
+                  const da = new Date(a.date).getTime();
+                  const db = new Date(b.date).getTime();
+                  if (da !== db) return da - db;
+                  return Number(a.id ?? 0) - Number(b.id ?? 0);
+                });
+                const idx = sorted.findIndex(l => l.id === viewingRecord.data.id && l.id !== undefined);
+                const isInitial = idx === 0;
+                let kmPerLiter: number | null = null;
+                if (!isInitial && idx > 0) {
+                  const prev = sorted[idx - 1];
+                  const liters = Number(viewingRecord.data.litros);
+                  const deltaKm = Number(viewingRecord.data.mileage) - Number(prev.mileage);
+                  if (Number.isFinite(liters) && liters > 0 && Number.isFinite(deltaKm) && deltaKm > 0) {
+                    kmPerLiter = deltaKm / liters;
+                  }
+                }
+                return (
+                  <>
+                    <div>
+                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('date')}</dt>
+                      <dd className="text-revis-light-gray">{formatAppDate(viewingRecord.data.date, dateFormat)}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('value')}</dt>
+                      <dd className="text-revis-green font-semibold">
+                        {viewingRecord.data.valor !== null && viewingRecord.data.valor !== undefined
+                          ? formatAppCurrency(Number(viewingRecord.data.valor), currency, language)
+                          : '-'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('litersLabel')}</dt>
+                      <dd className="text-revis-light-gray">
+                        {viewingRecord.data.litros !== null && viewingRecord.data.litros !== undefined
+                          ? `${formatDecimal(Number(viewingRecord.data.litros), language, 2)} ${t('litersShort')}`
+                          : '-'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('km')}</dt>
+                      <dd className="text-revis-light-gray font-semibold">{(viewingRecord.data.mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km</dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('fuelEfficiency')}</dt>
+                      <dd className={isInitial ? 'text-revis-gray' : 'text-revis-light-gray font-semibold'}>
+                        {isInitial
+                          ? t('initialRecord')
+                          : kmPerLiter !== null
+                          ? `${formatDecimal(kmPerLiter, language, 1)} km/l`
+                          : '-'}
+                      </dd>
+                    </div>
+                  </>
+                );
+              })()}
 
               {viewingRecord.kind === 'maintenance' && (
                 <>
@@ -5344,80 +6249,289 @@ export default function App() {
           </div>
         </div>
       )}
-      {/* Upgrade Modal */}
+      {/* Planos / Upgrade Modal */}
       {showUpgradeModal && (
-        <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20 shadow-xl relative overflow-hidden">
-            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-revis-green via-revis-green/70 to-revis-green"></div>
+        <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200 overflow-y-auto">
+          <div className="bg-revis-dark-gray rounded-2xl p-5 sm:p-6 max-w-5xl w-full border border-revis-gray/20 shadow-xl relative my-4 max-h-[92vh] overflow-y-auto">
+            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-revis-green via-revis-green/70 to-revis-green rounded-t-2xl" />
+            <button
+              type="button"
+              aria-label={t('cancel')}
+              onClick={() => !checkoutLoadingPlan && setShowUpgradeModal(false)}
+              className="absolute top-3 right-3 p-2 rounded-lg text-revis-gray hover:text-revis-heading hover:bg-revis-black/30 transition-colors disabled:opacity-40"
+              disabled={!!checkoutLoadingPlan}
+            >
+              <X className="w-5 h-5" />
+            </button>
 
-            <div className="flex justify-center mb-4">
-              <div className="bg-revis-green/10 p-4 rounded-full">
-                <Crown className="w-10 h-10 text-revis-green fill-revis-green" />
+            <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 mb-6 pr-8">
+              <div>
+                <h3 className="text-2xl font-bold text-revis-heading">{t('plans')}</h3>
+                <p className="text-revis-gray text-sm mt-1 max-w-xl">{t('pricingPageSubtitle')}</p>
+              </div>
+              <div className="flex items-center gap-3 shrink-0">
+                <span
+                  className={`text-xs font-semibold whitespace-nowrap ${
+                    pricingPeriod === 'monthly' ? 'text-revis-heading' : 'text-revis-gray'
+                  }`}
+                >
+                  {t('billingMonthly')}
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={pricingPeriod === 'annual'}
+                  aria-label={`${t('billingMonthly')} / ${t('billingAnnual')}`}
+                  onClick={() =>
+                    setPricingPeriod((p) => (p === 'monthly' ? 'annual' : 'monthly'))
+                  }
+                  className={`relative inline-flex h-7 w-[3.35rem] shrink-0 rounded-full transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-revis-green/70 ${
+                    pricingPeriod === 'annual'
+                      ? 'bg-revis-green'
+                      : 'bg-revis-black/60 border border-revis-gray/30'
+                  }`}
+                >
+                  <span
+                    className={`pointer-events-none absolute top-0.5 left-0.5 h-[1.375rem] w-[1.375rem] rounded-full bg-white shadow transition-transform duration-200 ${
+                      pricingPeriod === 'annual' ? 'translate-x-[1.375rem]' : 'translate-x-0'
+                    }`}
+                  />
+                </button>
+                <span
+                  className={`text-xs font-semibold whitespace-nowrap ${
+                    pricingPeriod === 'annual' ? 'text-revis-heading' : 'text-revis-gray'
+                  }`}
+                >
+                  {t('billingAnnual')}
+                </span>
               </div>
             </div>
-            
-            <h3 className="text-2xl font-bold text-revis-heading mb-2 text-center">{t('premiumModalTitle')}</h3>
-            <p className="text-revis-gray mb-6 text-sm text-center leading-relaxed">
-              {t('premiumModalSubtitle')}
-            </p>
 
-            <div className="space-y-3 mb-8">
-              <div className="flex items-center gap-3 text-sm text-revis-light-gray">
-                <Check className="w-5 h-5 text-revis-green flex-shrink-0" />
-                <span>{t('premiumFeatureGarage')}</span>
-              </div>
-              <div className="flex items-center gap-3 text-sm text-revis-light-gray">
-                <Check className="w-5 h-5 text-revis-green flex-shrink-0" />
-                <span>{t('premiumFeatureDr')}</span>
-              </div>
-              <div className="flex items-center gap-3 text-sm text-revis-light-gray">
-                <Check className="w-5 h-5 text-revis-green flex-shrink-0" />
-                <span>{t('premiumFeatureFinance')}</span>
-              </div>
-              <div className="flex items-center gap-3 text-sm text-revis-light-gray">
-                <Check className="w-5 h-5 text-revis-green flex-shrink-0" />
-                <span>{t('premiumFeatureHistory')}</span>
-              </div>
-            </div>
+            {(() => {
+              const loc = getLocaleFromLanguage(language);
+              const fmtMoney = (n: number) =>
+                new Intl.NumberFormat(loc, { style: 'currency', currency: 'BRL' }).format(n);
+              const plusVal =
+                pricingPeriod === 'monthly'
+                  ? CHECKOUT_PRICES_BRL.plus.monthly
+                  : CHECKOUT_PRICES_BRL.plus.annual;
+              const premVal =
+                pricingPeriod === 'monthly'
+                  ? CHECKOUT_PRICES_BRL.premium.monthly
+                  : CHECKOUT_PRICES_BRL.premium.annual;
+              const tier = normalizePlan(user?.plan);
 
-            <div className="bg-revis-black/30 rounded-xl p-4 mb-6 text-center border border-revis-gray/10">
-              <span className="text-xs text-revis-gray block mb-1">{t('premiumSubscriptionLabel')}</span>
-              <div className="flex items-end justify-center gap-1">
-                <span className="text-3xl font-bold text-revis-heading">R$ 14,90</span>
-                <span className="text-sm text-revis-gray mb-1">{t('premiumPerMonth')}</span>
-              </div>
-            </div>
+              const checklistForPlan = (plan: PlanTier): { excluded: boolean; label: string }[] => {
+                const fuel = t('planFeatFuelServices');
+                const personalization = t('planFeatPersonalization');
+                const taxes = t('planFeatTaxesFines');
+                const filters = t('planFeatReportFilters');
+                const chats = t('planFeatChatBackup');
+                const vehicleBackup = t('planFeatVehicleBackup');
 
-            <div className="flex flex-col gap-3">
-              <button 
-                onClick={handleNativePurchase}
-                disabled={isUpgrading}
-                className="w-full bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors shadow-lg shadow-revis-green/20 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-              >
-                {isUpgrading ? (
-                  <>
-                    <div className="w-5 h-5 border-2 border-black/30 border-t-black rounded-full animate-spin"></div>
-                    {t('loading')}
-                  </>
-                ) : (
-                  <>
-                    <Crown className="w-5 h-5 fill-black" />
-                    {t('premiumSubscribeNow')}
-                  </>
-                )}
-              </button>
-              <button 
-                onClick={() => setShowUpgradeModal(false)}
-                disabled={isUpgrading}
-                className="w-full bg-transparent text-revis-gray font-medium py-3 rounded-xl hover:text-revis-light-gray transition-colors text-sm"
-              >
-                {t('premiumMaybeLater')}
-              </button>
-            </div>
-            
-            <p className="text-[10px] text-revis-gray text-center mt-4">
-              {t('premiumFooterNote')}
-            </p>
+                let rows: { excluded: boolean; label: string }[];
+                switch (plan) {
+                  case 'free':
+                    rows = [
+                      { excluded: false, label: t('planFeatVehicleFree') },
+                      { excluded: false, label: fuel },
+                      { excluded: true, label: personalization },
+                      { excluded: true, label: taxes },
+                      { excluded: true, label: filters },
+                      { excluded: true, label: t('planFeatDrGraxaConsultant') },
+                      { excluded: true, label: chats },
+                      { excluded: true, label: vehicleBackup },
+                    ];
+                    break;
+                  case 'plus':
+                    rows = [
+                      { excluded: false, label: t('planFeatVehiclePlus') },
+                      { excluded: false, label: fuel },
+                      { excluded: false, label: personalization },
+                      { excluded: false, label: taxes },
+                      { excluded: false, label: filters },
+                      { excluded: false, label: t('planFeatDrGraxaConsultantPlus') },
+                      { excluded: false, label: chats },
+                      { excluded: true, label: vehicleBackup },
+                    ];
+                    break;
+                  default:
+                    rows = [
+                      { excluded: false, label: t('planFeatVehiclePremium') },
+                      { excluded: false, label: fuel },
+                      { excluded: false, label: personalization },
+                      { excluded: false, label: taxes },
+                      { excluded: false, label: filters },
+                      { excluded: false, label: t('planFeatDrGraxaConsultantPremium') },
+                      { excluded: false, label: chats },
+                      { excluded: false, label: vehicleBackup },
+                    ];
+                }
+
+                return [...rows].sort((a, b) =>
+                  a.excluded === b.excluded ? 0 : a.excluded ? 1 : -1,
+                );
+              };
+
+              const planOrder: PlanTier[] = ['free', 'plus', 'premium'];
+
+              const priceForPlan = (
+                plan: PlanTier,
+              ): { headline: string; suffix: string; titleKey: keyof typeof translations['Português (Brasil)'] } => {
+                if (plan === 'free') {
+                  return { headline: fmtMoney(0), suffix: '', titleKey: 'planFree' };
+                }
+                const v = plan === 'plus' ? plusVal : premVal;
+                const suffix =
+                  pricingPeriod === 'monthly' ? t('pricingPerMonth') : t('pricingPerYear');
+                return {
+                  headline: fmtMoney(v),
+                  suffix,
+                  titleKey: plan === 'plus' ? 'planPlus' : 'planPremium',
+                };
+              };
+
+              const renderPlanCardCta = (cardTier: PlanTier) => {
+                const busy = checkoutLoadingPlan !== null;
+                const baseCls =
+                  'w-full font-bold py-2.5 sm:py-3 rounded-xl text-sm min-h-[2.75rem] flex items-center justify-center gap-2 transition-colors disabled:opacity-55 disabled:cursor-not-allowed';
+                const spacerCls = `${baseCls} invisible shrink-0 pointer-events-none select-none`;
+
+                /** Mantém mesma altura do CTA quando o botão fica oculto (layout alinhado). */
+                const ctaGhost = (
+                  <div className={spacerCls} aria-hidden>
+                    {/* Reserva espaço igual ao texto do maior CTA */}
+                    <span className="invisible">{t('pricingSubscribePremium')}</span>
+                  </div>
+                );
+
+                /* Plano atual: qualquer tier */
+                if (tier === cardTier) {
+                  return (
+                    <button
+                      type="button"
+                      disabled
+                      className={`${baseCls} shrink-0 bg-revis-black/35 text-revis-gray border border-revis-gray/35`}
+                    >
+                      {t('planCtaYourCurrentPlan')}
+                    </button>
+                  );
+                }
+
+                /* FREE: apenas “seu plano” quando já é Free; caso contrário, slot invisível */
+                if (cardTier === 'free') {
+                  return ctaGhost;
+                }
+
+                /* PLUS */
+                if (cardTier === 'plus') {
+                  if (tier === 'premium') {
+                    return ctaGhost;
+                  }
+                  return (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleNativePurchase('plus', pricingPeriod)}
+                      className={`${baseCls} shrink-0 bg-revis-green text-black hover:bg-opacity-90 shadow-md shadow-black/25`}
+                    >
+                      {checkoutLoadingPlan === 'plus'
+                        ? t('checkoutGeneratingLink')
+                        : t('pricingSubscribePlus')}
+                    </button>
+                  );
+                }
+
+                /* PREMIUM — upgrade só se ainda não for Premium */
+                if (tier !== 'premium') {
+                  return (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleNativePurchase('premium', pricingPeriod)}
+                      className={`${baseCls} shrink-0 bg-revis-black/55 text-green-400 border-2 border-green-500 hover:bg-green-500/15 shadow-md shadow-black/25`}
+                    >
+                      {checkoutLoadingPlan === 'premium'
+                        ? t('checkoutGeneratingLink')
+                        : t('pricingSubscribePremium')}
+                    </button>
+                  );
+                }
+
+                return ctaGhost;
+              };
+
+              return (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:items-stretch">
+                    {planOrder.map((plan) => {
+                      const { headline, suffix, titleKey } = priceForPlan(plan);
+                      const highlightPlus = plan === 'plus';
+                      const highlightPremium = plan === 'premium';
+                      const rows = checklistForPlan(plan);
+
+                      return (
+                        <article
+                          key={plan}
+                          className={`flex h-full min-h-0 flex-col rounded-xl border p-4 sm:p-5 ${
+                            highlightPlus
+                              ? 'border-revis-green/50 bg-revis-green/[0.08] md:shadow-md md:shadow-revis-green/5'
+                              : highlightPremium
+                                ? 'border-amber-400/35 bg-gradient-to-b from-amber-500/[0.08] to-transparent'
+                                : 'border-revis-gray/25 bg-revis-black/28'
+                          }`}
+                        >
+                          <div className="shrink-0 flex flex-wrap items-start justify-between gap-2 mb-2">
+                            <h4 className="text-lg font-bold text-revis-heading">{t(titleKey)}</h4>
+                            {tier === plan && (
+                              <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-full bg-revis-gray/25 text-revis-gray whitespace-nowrap">
+                                {t('planBadgeCurrent')}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="shrink-0 text-xl font-bold text-revis-green leading-tight">
+                            {headline}
+                            {suffix ? (
+                              <span className="block sm:inline text-sm font-normal text-revis-gray mt-0.5 sm:mt-0 sm:ml-1">
+                                {suffix}
+                              </span>
+                            ) : null}
+                          </div>
+
+                          <ul className="mt-4 flex-1 min-h-0 space-y-2.5 border-t border-revis-gray/15 pt-4 text-sm leading-snug">
+                            {rows.map((row, idx) => (
+                              <li key={`${plan}-${idx}`} className="flex gap-2.5 items-start">
+                                <span className="shrink-0 mt-0.5" aria-hidden>
+                                  {row.excluded ? (
+                                    <X className="w-[1.125rem] h-[1.125rem] text-red-500 stroke-[2.5]" />
+                                  ) : (
+                                    <Check className="w-[1.125rem] h-[1.125rem] text-green-500 stroke-[2.5]" />
+                                  )}
+                                </span>
+                                <p
+                                  className={`text-left font-medium min-w-0 ${
+                                    row.excluded
+                                      ? 'text-revis-gray/55'
+                                      : 'text-revis-heading'
+                                  }`}
+                                >
+                                  {row.label}
+                                </p>
+                              </li>
+                            ))}
+                          </ul>
+
+                          <div className="mt-auto w-full shrink-0 pt-4">{renderPlanCardCta(plan)}</div>
+                        </article>
+                      );
+                    })}
+                  </div>
+
+                  <p className="text-[10px] text-revis-gray text-center mt-5">{t('premiumFooterNote')}</p>
+                </>
+              );
+            })()}
           </div>
         </div>
       )}
