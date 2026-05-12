@@ -24,6 +24,17 @@ import {
   aiMonthlyLimitForPlan,
   type PlanTier,
 } from './plans';
+import { APP_VERSION, isAppVersionBelowMinimum } from './appVersion';
+import {
+  getBiometricUnlockEnabled,
+  isBiometricHardwareAvailable,
+  isNativeCapacitorApp,
+  mercadoPagoSubscriptionsPortalUrl,
+  promptBiometricUnlock,
+  readBiometricEnabledSyncFromStorage,
+  resolveStoreUpdateUrl,
+  setBiometricUnlockEnabled,
+} from './biometric';
 
 // Base URL para chamadas de API. Em produção (Vercel/Render) DEVE ser
 // definida via VITE_API_URL apontando para o backend. Em dev local fica
@@ -55,6 +66,74 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<Response>
     headers.set('Content-Type', 'application/json');
   }
   return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+}
+
+function digitsOnlyToNonNegativeInt(raw: string): number {
+  const d = raw.replace(/\D/g, '');
+  if (!d) return 0;
+  const n = parseInt(d, 10);
+  return Number.isFinite(n) ? Math.max(0, n) : 0;
+}
+
+/** Converte quilometragem exibida (ex.: 35.000) + estado em inteiro não negativo para a API. */
+function sanitizeVehicleKmForApi(currentMileage: unknown, mileageInputDisplay: string): number {
+  if (mileageInputDisplay.trim() !== '') {
+    return digitsOnlyToNonNegativeInt(mileageInputDisplay);
+  }
+  if (typeof currentMileage === 'number' && Number.isFinite(currentMileage)) {
+    return Math.max(0, Math.trunc(currentMileage));
+  }
+  if (currentMileage != null && String(currentMileage).trim() !== '') {
+    return digitsOnlyToNonNegativeInt(String(currentMileage));
+  }
+  return 0;
+}
+
+function formatMileageThousandsDots(km: number): string {
+  const n = Math.max(0, Math.trunc(Number(km) || 0));
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+function parseApiJsonBody(text: string): { json: Record<string, unknown> | null; rawText: string } {
+  const trimmed = text.trim();
+  if (!trimmed) return { json: null, rawText: '' };
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { json: parsed as Record<string, unknown>, rawText: trimmed };
+    }
+  } catch {
+    /* não é JSON */
+  }
+  return { json: null, rawText: trimmed };
+}
+
+function messageFromApiErrorParts(
+  json: Record<string, unknown> | null,
+  rawText: string,
+  status: number,
+): string {
+  if (json) {
+    const msg = json.message;
+    const err = json.error;
+    const details = json.details;
+    if (typeof msg === 'string' && msg.trim()) return msg.trim();
+    if (typeof err === 'string' && err.trim()) return err.trim();
+    if (typeof details === 'string' && details.trim()) return details.trim();
+  }
+  if (rawText.trim()) return rawText.trim();
+  return status ? `HTTP ${status}` : '';
+}
+
+function isVehiclePlanLimitResponse(status: number, json: Record<string, unknown> | null, rawText: string): boolean {
+  if (status !== 403) return false;
+  if (json?.error === 'vehicle_limit_reached') return true;
+  const blob = `${rawText} ${String(json?.message ?? '')} ${String(json?.error ?? '')}`.toLowerCase();
+  if (blob.includes('vehicle_limit_reached')) return true;
+  const hasLimit = blob.includes('limite') || blob.includes('limit');
+  const hasVehicle =
+    blob.includes('veículo') || blob.includes('veiculo') || blob.includes('vehicle');
+  return hasLimit && hasVehicle;
 }
 
 // Quantos dias um mês tem, sem depender de `new Date()` para evitar shift de
@@ -456,6 +535,39 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/app-config`);
+        const data = (await res.json().catch(() => ({}))) as { min_app_version?: string };
+        const min =
+          typeof data.min_app_version === 'string' && data.min_app_version.trim()
+            ? data.min_app_version.trim()
+            : '1.0.0';
+        if (cancelled) return;
+        if (isAppVersionBelowMinimum(APP_VERSION, min)) setForceUpdateStatus('blocked');
+        else setForceUpdateStatus('ok');
+      } catch {
+        if (!cancelled) setForceUpdateStatus('ok');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const ok = await isBiometricHardwareAvailable();
+      if (!cancelled) setLoginBiometricOffered(ok);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const [authForm, setAuthForm] = useState({ 
     name: '', 
     nickname: '',
@@ -592,6 +704,16 @@ export default function App() {
   const [checkoutLoadingPlan, setCheckoutLoadingPlan] = useState<null | 'plus' | 'premium'>(null);
 
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [forceUpdateStatus, setForceUpdateStatus] = useState<'checking' | 'ok' | 'blocked'>('checking');
+  const [biometricUnlockedThisSession, setBiometricUnlockedThisSession] = useState(false);
+  const bioAutoPromptConsumedRef = useRef(false);
+  const [loginBiometricOffered, setLoginBiometricOffered] = useState(false);
+  const [loginBiometricOptIn, setLoginBiometricOptIn] = useState(false);
+  const [prefsBiometricEnabled, setPrefsBiometricEnabled] = useState(false);
+  const [subscriptionManageOpen, setSubscriptionManageOpen] = useState(false);
+  const [subscriptionManageView, setSubscriptionManageView] = useState<'menu' | 'changePlan' | 'cancelInfo'>(
+    'menu',
+  );
   const [pricingPeriod, setPricingPeriod] = useState<'monthly' | 'annual'>('monthly');
   const [showAddLog, setShowAddLog] = useState(false);
   const [showAddFinancial, setShowAddFinancial] = useState(false);
@@ -601,6 +723,7 @@ export default function App() {
   const [showMileageHelp, setShowMileageHelp] = useState(false);
   const mileageHelpRef = useRef<HTMLDivElement | null>(null);
   const [isSubmittingVehicle, setIsSubmittingVehicle] = useState(false);
+  const [appToast, setAppToast] = useState<{ message: string; tone?: 'neutral' | 'warning' } | null>(null);
   const [isSubmittingLog, setIsSubmittingLog] = useState(false);
   const [isSubmittingFinancial, setIsSubmittingFinancial] = useState(false);
   const [isSubmittingMileage, setIsSubmittingMileage] = useState(false);
@@ -669,6 +792,7 @@ export default function App() {
   const handleConfirmCancelAddVehicle = () => {
     setShowCancelAddVehicleConfirmation(false);
     setShowAddVehicle(false);
+    setMileageInput('');
   };
   
   // Preferences State
@@ -790,6 +914,8 @@ export default function App() {
     setChatSessionToDelete(null);
     setShowDeleteChatModal(false);
     setExpandedCards({ mileage: false, services: false, financial: false });
+    bioAutoPromptConsumedRef.current = false;
+    setBiometricUnlockedThisSession(false);
   };
 
   // Apply theme and font size
@@ -830,6 +956,35 @@ export default function App() {
 
   const vehicleLimit = maxVehiclesForPlan(user?.plan);
   const atVehicleLimit = vehicles.length >= vehicleLimit;
+
+  useEffect(() => {
+    if (activeTab !== 'preferences') return;
+    void getBiometricUnlockEnabled().then(setPrefsBiometricEnabled);
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (forceUpdateStatus !== 'ok') return;
+    if (authScreen !== 'app' || !user) {
+      bioAutoPromptConsumedRef.current = false;
+      setBiometricUnlockedThisSession(false);
+      return;
+    }
+    if (!isNativeCapacitorApp() || !readBiometricEnabledSyncFromStorage()) {
+      setBiometricUnlockedThisSession(true);
+      return;
+    }
+    if (biometricUnlockedThisSession) return;
+    if (bioAutoPromptConsumedRef.current) return;
+    bioAutoPromptConsumedRef.current = true;
+    void (async () => {
+      try {
+        await promptBiometricUnlock(t('biometricPromptReason'), 'RevisAuto');
+        setBiometricUnlockedThisSession(true);
+      } catch {
+        bioAutoPromptConsumedRef.current = false;
+      }
+    })();
+  }, [forceUpdateStatus, authScreen, user?.id, biometricUnlockedThisSession, t]);
 
   const toggleDateFilters = () => {
     setShowDateFilters(prev => !prev);
@@ -1119,6 +1274,12 @@ export default function App() {
       document.body.style.overflow = 'unset';
     };
   }, [showDrGraxaManualModal, showVehicleHistory, showProfileEdit, showTermsModal, showPrivacyModal, showAddVehicle, showAddLog, showAddFinancial, showAddMileage, isSupportModalOpen]);
+
+  useEffect(() => {
+    if (!appToast) return;
+    const timer = window.setTimeout(() => setAppToast(null), 4800);
+    return () => window.clearTimeout(timer);
+  }, [appToast]);
 
   // Fecha o tooltip de ajuda do card de abastecimento ao clicar fora ou apertar Esc.
   useEffect(() => {
@@ -1626,6 +1787,11 @@ export default function App() {
       setUser(userToStore);
       localStorage.setItem('revis_user', JSON.stringify(userToStore));
       setAuthScreen('app');
+      if (loginBiometricOptIn && isNativeCapacitorApp()) {
+        const hw = await isBiometricHardwareAvailable();
+        await setBiometricUnlockEnabled(hw);
+      }
+      setLoginBiometricOptIn(false);
       fetchVehicles();
     } catch (err: any) {
       console.error('Erro detalhado no login (rede/JS):', err);
@@ -1827,9 +1993,9 @@ export default function App() {
 
   const handleAddVehicle = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+
     const vehicleToSubmit = { ...newVehicle };
-    
+
     // Handle Custom Brand
     if (vehicleToSubmit.brand === 'Outra') {
       vehicleToSubmit.brand = customBrand;
@@ -1847,32 +2013,54 @@ export default function App() {
       vehicleToSubmit.color = otherColor;
     }
 
+    vehicleToSubmit.current_mileage = sanitizeVehicleKmForApi(vehicleToSubmit.current_mileage, mileageInput);
+
+    const payload: Record<string, unknown> = { ...vehicleToSubmit };
+    const plusOrPremium = isPlusOrPremium(user?.plan);
+    if (!plusOrPremium) {
+      payload.nickname = null;
+      payload.color = null;
+    } else {
+      const nick = typeof payload.nickname === 'string' ? payload.nickname.trim() : '';
+      const col = typeof payload.color === 'string' ? payload.color.trim() : '';
+      payload.nickname = nick === '' ? null : nick;
+      payload.color = col === '' ? null : col;
+    }
+
     setIsSubmittingVehicle(true);
     try {
       let res: Response;
       if (isEditingVehicle && selectedVehicle) {
         res = await apiFetch(`/api/vehicles/${selectedVehicle.id}`, {
           method: 'PUT',
-          body: JSON.stringify({ ...vehicleToSubmit })
+          body: JSON.stringify(payload),
         });
       } else {
         res = await apiFetch(`/api/vehicles`, {
           method: 'POST',
-          body: JSON.stringify({ ...vehicleToSubmit })
+          body: JSON.stringify(payload),
         });
       }
 
       if (!res.ok) {
-        console.error("Failed to add/update vehicle", res.status);
-        alert(t('errorSavingData'));
+        const errorText = await res.text().catch(() => '');
+        const { json } = parseApiJsonBody(errorText);
+        const apiMsg = messageFromApiErrorParts(json, errorText, res.status);
+        console.error('Failed to add/update vehicle', res.status, apiMsg);
+        const limitReached = isVehiclePlanLimitResponse(res.status, json, errorText);
+        if (limitReached) {
+          setAppToast({ message: t('toastVehicleLimitReached'), tone: 'warning' });
+        } else {
+          alert(apiMsg || t('errorSavingData'));
+        }
         return;
       }
 
       const data = await res.json();
 
       if (isEditingVehicle && selectedVehicle) {
-        setVehicles(prev => prev.map(v => v.id === selectedVehicle.id ? { ...v, ...data } : v));
-        setSelectedVehicle(prev => prev ? { ...prev, ...data } : null);
+        setVehicles(prev => prev.map(v => (v.id === selectedVehicle.id ? { ...v, ...data } : v)));
+        setSelectedVehicle(prev => (prev ? { ...prev, ...data } : null));
       } else {
         setVehicles(prev => [...prev, data]);
         setSelectedVehicle(data);
@@ -1890,15 +2078,17 @@ export default function App() {
         current_mileage: 0,
         last_service_date: new Date().toISOString().split('T')[0],
         nickname: '',
-        color: ''
+        color: '',
       });
       setCustomBrand('');
       setCustomModel('');
       setCustomColor('');
       setOtherColor('');
+      setMileageInput('');
     } catch (e) {
-      console.error("Failed to add/update vehicle", e);
-      alert(t('errorSavingData'));
+      console.error('Failed to add/update vehicle', e);
+      const msg = e instanceof Error && e.message.trim() ? e.message.trim() : '';
+      alert(msg || t('errorSavingData'));
     } finally {
       setIsSubmittingVehicle(false);
     }
@@ -2338,6 +2528,18 @@ export default function App() {
           </div>
 
           {authError && <p className="text-revis-alert-critical text-sm text-center mt-4">{authError}</p>}
+
+          {loginBiometricOffered && (
+            <label className="flex items-center gap-3 mt-4 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={loginBiometricOptIn}
+                onChange={(e) => setLoginBiometricOptIn(e.target.checked)}
+                className="accent-revis-green w-4 h-4 rounded"
+              />
+              <span className="text-xs text-revis-gray leading-snug">{t('biometricLoginOptIn')}</span>
+            </label>
+          )}
 
           <button type="submit" className="w-full mt-6 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm">
             {t('loginButton')}
@@ -2965,7 +3167,7 @@ export default function App() {
         {t('journeyBegins')}
       </p>
       <button 
-        onClick={() => { setAuthScreen('app'); setShowAddVehicle(true); }}
+        onClick={() => { setAuthScreen('app'); setMileageInput(''); setShowAddVehicle(true); }}
         className="w-full max-w-sm bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm mb-3"
       >
         {t('addVehicle')}
@@ -3289,6 +3491,28 @@ export default function App() {
           </p>
         </div>
 
+        {loginBiometricOffered && (
+          <div className="bg-revis-dark-gray p-4 rounded-xl space-y-3">
+            <h3 className="font-medium text-revis-heading flex items-center gap-2">
+              <UserIcon className="w-5 h-5 text-revis-green" />
+              {t('biometricSettingsTitle')}
+            </h3>
+            <label className="flex items-center gap-3 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={prefsBiometricEnabled}
+                onChange={async (e) => {
+                  const v = e.target.checked;
+                  await setBiometricUnlockEnabled(v);
+                  setPrefsBiometricEnabled(v);
+                }}
+                className="accent-revis-green w-4 h-4 rounded shrink-0"
+              />
+              <span className="text-sm text-revis-gray leading-snug">{t('biometricEnableLabel')}</span>
+            </label>
+          </div>
+        )}
+
         {/* Action Buttons */}
         <div className="flex gap-4 pt-4">
           <button 
@@ -3359,6 +3583,7 @@ export default function App() {
                 setCustomColor('');
                 setOtherColor('');
                 setIsEditingVehicle(false);
+                setMileageInput('');
                 setShowAddVehicle(true);
               }
             }}
@@ -3462,6 +3687,7 @@ export default function App() {
                   setCustomColor(selectedVehicle.color || '');
                   setOtherColor(selectedVehicle.color || '');
                   setIsEditingVehicle(true);
+                  setMileageInput(formatMileageThousandsDots(selectedVehicle.current_mileage ?? 0));
                   setShowAddVehicle(true);
                 }}
                 className="p-2 text-revis-gray hover:text-revis-green hover:bg-revis-green/10 rounded-lg transition-colors"
@@ -4205,7 +4431,6 @@ export default function App() {
 
     const aiLimit = aiMonthlyLimitForPlan(user?.plan);
     const aiUsed = user?.ai_messages_count ?? 0;
-    const aiRemaining = Math.max(0, aiLimit - aiUsed);
     const quotaReached = aiLimit > 0 && aiUsed >= aiLimit;
 
     const leaveDrGraxaChat = () => {
@@ -4216,19 +4441,15 @@ export default function App() {
       void fetchChatSessions();
     };
 
-    const quotaStrip = (
-      <div
-        className={`rounded-xl px-3 py-2.5 text-center text-xs font-semibold ${
-          quotaReached
-            ? 'bg-red-500/15 text-red-200 border border-red-500/30'
-            : 'bg-revis-green/10 text-revis-heading border border-revis-green/25'
+    const quotaHeaderLine = (
+      <p
+        className={`text-center text-[11px] sm:text-xs font-medium leading-snug px-0.5 ${
+          quotaReached ? 'text-amber-800 dark:text-amber-200' : 'text-revis-gray'
         }`}
         role="status"
       >
-        {quotaReached
-          ? t('drGraxaLimitReachedBanner')
-          : t('drGraxaMonthlyRemaining').replace('{remaining}', String(aiRemaining)).replace('{limit}', String(aiLimit))}
-      </div>
+        {t('drGraxaQuotaUsedThisMonth').replace('{used}', String(aiUsed)).replace('{total}', String(aiLimit))}
+      </p>
     );
 
     const vehicleRow = (
@@ -4269,16 +4490,13 @@ export default function App() {
       return (
         <div className="flex flex-col h-[calc(100dvh-135px)] md:h-[calc(100vh-4rem)] max-w-4xl mx-auto">
           <div className="mb-3 shrink-0">
-            <div className="flex justify-between items-center mb-1">
+            <div className="flex justify-between items-center">
               <h2 className="text-lg font-bold text-revis-heading flex items-center gap-2">
                 <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="sm" />
                 Dr. Graxa
               </h2>
             </div>
-            <div className="mt-2">{quotaStrip}</div>
-            <p className="text-[10px] text-revis-gray mt-2 px-0.5">
-              {t('aiMessagesUsage').replace('{used}', String(aiUsed)).replace('{limit}', String(aiLimit))}
-            </p>
+            <div className="mt-1.5">{quotaHeaderLine}</div>
             {vehicleRow}
           </div>
 
@@ -4346,7 +4564,7 @@ export default function App() {
           <ChevronLeft className="w-5 h-5" />
           {t('drGraxaBackToList')}
         </button>
-        {quotaStrip}
+        {quotaHeaderLine}
         {vehicleRow}
       </div>
       
@@ -4388,11 +4606,6 @@ export default function App() {
       </div>
 
       <div className="mt-auto shrink-0 pt-3 border-t border-revis-gray/10">
-        <div className={`mb-2 rounded-lg px-2 py-1.5 text-center text-[10px] font-medium ${quotaReached ? 'text-red-300' : 'text-revis-gray'}`}>
-          {quotaReached
-            ? t('drGraxaLimitReachedBanner')
-            : t('drGraxaMonthlyRemaining').replace('{remaining}', String(aiRemaining)).replace('{limit}', String(aiLimit))}
-        </div>
         <div className="flex gap-2">
           <input
             type="text"
@@ -4581,6 +4794,32 @@ export default function App() {
     </div>
   );
 
+  if (forceUpdateStatus === 'checking') {
+    return (
+      <div className="min-h-screen bg-revis-black text-revis-light-gray flex items-center justify-center p-6">
+        <p className="text-sm text-revis-gray">{t('loading')}</p>
+      </div>
+    );
+  }
+
+  if (forceUpdateStatus === 'blocked') {
+    return (
+      <div className="min-h-screen bg-revis-black text-revis-light-gray flex flex-col items-center justify-center p-6 text-center">
+        <p className="text-lg font-semibold text-revis-heading max-w-sm mb-8">{t('forceUpdateMessage')}</p>
+        <button
+          type="button"
+          className="w-full max-w-xs bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors"
+          onClick={() => window.open(resolveStoreUpdateUrl(), '_blank', 'noopener,noreferrer')}
+        >
+          {t('forceUpdateButton')}
+        </button>
+        <p className="text-[10px] text-revis-gray mt-6">
+          v{APP_VERSION}
+        </p>
+      </div>
+    );
+  }
+
   if (authScreen === 'login') return renderLogin();
   if (authScreen === 'register') return renderRegister();
   if (authScreen === 'terms') return renderTerms();
@@ -4591,6 +4830,45 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-revis-black text-revis-light-gray font-sans selection:bg-revis-green selection:text-black">
+      {forceUpdateStatus === 'ok' &&
+        authScreen === 'app' &&
+        user &&
+        isNativeCapacitorApp() &&
+        readBiometricEnabledSyncFromStorage() &&
+        !biometricUnlockedThisSession && (
+          <div className="fixed inset-0 z-[200] bg-revis-black flex flex-col items-center justify-center p-6 text-center">
+            <p className="text-lg font-bold text-revis-heading mb-2">{t('biometricGateTitle')}</p>
+            <p className="text-xs text-revis-gray mb-8 max-w-xs">{t('biometricPromptReason')}</p>
+            <button
+              type="button"
+              className="w-full max-w-xs bg-revis-green text-black font-bold py-3 rounded-xl mb-3"
+              onClick={async () => {
+                bioAutoPromptConsumedRef.current = true;
+                try {
+                  await promptBiometricUnlock(t('biometricPromptReason'), 'RevisAuto');
+                  setBiometricUnlockedThisSession(true);
+                } catch {
+                  bioAutoPromptConsumedRef.current = false;
+                }
+              }}
+            >
+              {t('biometricGateRetry')}
+            </button>
+            <button
+              type="button"
+              className="text-revis-alert-critical text-sm font-medium"
+              onClick={() => {
+                resetSensitiveSessionState();
+                localStorage.removeItem('revis_user');
+                setUser(null);
+                setAuthScreen('login');
+                setActiveTab('garage');
+              }}
+            >
+              {t('biometricGateLogout')}
+            </button>
+          </div>
+        )}
       {/* Mobile Header - hidden on desktop */}
       <header className="md:hidden bg-revis-black/90 backdrop-blur-md border-b border-revis-dark-gray p-4 sticky top-0 z-20">
         <div className="flex justify-between items-center">
@@ -4731,7 +5009,7 @@ export default function App() {
               </button>
             </div>
             <p className="text-sm text-revis-gray leading-relaxed mb-5">{t('drGraxaOnboardingSubtitle')}</p>
-            <ul className="space-y-3 mb-6">
+            <ul className="space-y-3 mb-4">
               {(
                 [
                   [Lightbulb, t('drGraxaOnboardingTip1')],
@@ -4751,6 +5029,12 @@ export default function App() {
                 </li>
               ))}
             </ul>
+            <div
+              className="rounded-xl p-3.5 mb-4 text-xs leading-relaxed border bg-amber-500/10 border-amber-500/20 text-amber-900 dark:bg-yellow-500/10 dark:border-yellow-500/20 dark:text-yellow-100"
+              role="note"
+            >
+              {t('drGraxaMiniManualLegalDisclaimer')}
+            </div>
             <button
               type="button"
               disabled={Boolean(user && aiMonthlyLimitForPlan(user.plan) > 0 && (user.ai_messages_count ?? 0) >= aiMonthlyLimitForPlan(user.plan))}
@@ -6268,6 +6552,18 @@ export default function App() {
               <div>
                 <h3 className="text-2xl font-bold text-revis-heading">{t('plans')}</h3>
                 <p className="text-revis-gray text-sm mt-1 max-w-xl">{t('pricingPageSubtitle')}</p>
+                {(normalizePlan(user?.plan) === 'plus' || normalizePlan(user?.plan) === 'premium') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSubscriptionManageView('menu');
+                      setSubscriptionManageOpen(true);
+                    }}
+                    className="mt-3 block text-xs text-revis-green/90 hover:text-revis-green font-medium underline underline-offset-2"
+                  >
+                    {t('manageSubscription')}
+                  </button>
+                )}
               </div>
               <div className="flex items-center gap-3 shrink-0">
                 <span
@@ -6532,6 +6828,118 @@ export default function App() {
                 </>
               );
             })()}
+          </div>
+        </div>
+      )}
+      {subscriptionManageOpen && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 animate-in fade-in duration-200"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="subscription-manage-title"
+        >
+          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-md w-full border border-revis-gray/25 shadow-xl">
+            <h3 id="subscription-manage-title" className="text-lg font-bold text-revis-heading mb-4">
+              {t('subscriptionManageTitle')}
+            </h3>
+
+            {subscriptionManageView === 'menu' && (
+              <div className="space-y-4">
+                <p className="text-sm text-revis-gray">{t('subscriptionManagePickTitle')}</p>
+                <button
+                  type="button"
+                  className="w-full py-3 rounded-xl bg-revis-black/40 border border-revis-gray/25 text-revis-heading font-semibold text-sm hover:bg-revis-black/55"
+                  onClick={() => setSubscriptionManageView('changePlan')}
+                >
+                  {t('subscriptionChangePlan')}
+                </button>
+                <button
+                  type="button"
+                  className="w-full py-3 rounded-xl bg-revis-black/40 border border-revis-gray/25 text-revis-heading font-semibold text-sm hover:bg-revis-black/55"
+                  onClick={() => setSubscriptionManageView('cancelInfo')}
+                >
+                  {t('subscriptionCancelPlan')}
+                </button>
+                <button
+                  type="button"
+                  className="w-full py-3 text-revis-gray text-sm font-medium"
+                  onClick={() => setSubscriptionManageOpen(false)}
+                >
+                  {t('subscriptionManageClose')}
+                </button>
+              </div>
+            )}
+
+            {subscriptionManageView === 'changePlan' && (
+              <div className="space-y-4">
+                <p className="text-sm text-revis-light-gray leading-relaxed">
+                  {user?.subscription_period_end
+                    ? t('subscriptionChangePlanExplain').replace(
+                        '{date}',
+                        formatAppDate(user.subscription_period_end, dateFormat),
+                      )
+                    : t('subscriptionChangePlanExplainNoDate')}
+                </p>
+                <button
+                  type="button"
+                  className="w-full py-3 rounded-xl bg-revis-alert-critical/90 text-white font-bold text-sm"
+                  onClick={() =>
+                    window.open(mercadoPagoSubscriptionsPortalUrl(), '_blank', 'noopener,noreferrer')
+                  }
+                >
+                  {t('subscriptionCancelPlan')}
+                </button>
+                <button
+                  type="button"
+                  className="w-full py-3 rounded-xl bg-revis-green text-black font-bold text-sm"
+                  onClick={() => {
+                    setSubscriptionManageOpen(false);
+                    setShowUpgradeModal(false);
+                    setActiveTab('garage');
+                  }}
+                >
+                  {t('subscriptionBackGarage')}
+                </button>
+              </div>
+            )}
+
+            {subscriptionManageView === 'cancelInfo' && (
+              <div className="space-y-4">
+                <p className="text-sm text-revis-light-gray leading-relaxed">{t('subscriptionCancelExplain')}</p>
+                <button
+                  type="button"
+                  className="w-full py-3 rounded-xl bg-revis-green text-black font-bold text-sm"
+                  onClick={() =>
+                    window.open(mercadoPagoSubscriptionsPortalUrl(), '_blank', 'noopener,noreferrer')
+                  }
+                >
+                  {t('subscriptionOpenMpPortal')}
+                </button>
+                <button
+                  type="button"
+                  className="w-full py-3 text-revis-gray text-sm font-medium"
+                  onClick={() => setSubscriptionManageOpen(false)}
+                >
+                  {t('subscriptionManageClose')}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {appToast && (
+        <div
+          className="fixed left-4 right-4 md:left-auto md:right-6 md:max-w-md z-[100] bottom-[calc(4.5rem+env(safe-area-inset-bottom,0px))] md:bottom-6 animate-in slide-in-from-bottom-2 fade-in duration-200 pointer-events-none"
+          role="status"
+        >
+          <div
+            className={`rounded-xl px-4 py-3 text-sm font-medium shadow-lg border pointer-events-auto ${
+              appToast.tone === 'warning'
+                ? 'bg-amber-500/15 border-amber-400/40 text-amber-100'
+                : 'bg-revis-dark-gray border-revis-gray/30 text-revis-heading'
+            }`}
+          >
+            {appToast.message}
           </div>
         </div>
       )}

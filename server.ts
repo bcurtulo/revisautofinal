@@ -211,6 +211,23 @@ const FINANCIAL_RECORD_FIELDS = [
   "notes",
 ] as const satisfies ReadonlyArray<keyof FinancialRecord>;
 
+function subscriptionEndFromPreapproval(sub: Record<string, unknown> | null | undefined): string | null {
+  if (!sub || typeof sub !== "object") return null;
+  const next = sub["next_payment_date"];
+  if (typeof next === "string" && next.trim()) return next.trim();
+  const ar = sub["auto_recurring"];
+  if (ar && typeof ar === "object") {
+    const end = (ar as Record<string, unknown>)["end_date"];
+    if (typeof end === "string" && end.trim()) return end.trim();
+  }
+  const summarized = sub["summarized"];
+  if (summarized && typeof summarized === "object") {
+    const last = (summarized as Record<string, unknown>)["last_charged_date"];
+    if (typeof last === "string" && last.trim()) return last.trim();
+  }
+  return null;
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -255,6 +272,29 @@ async function startServer() {
       });
     }
     return next(err);
+  });
+
+  // --- Config pública (versão mínima do app) ---
+  app.get("/api/app-config", async (_req, res) => {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from("app_config")
+        .select("min_app_version")
+        .eq("id", 1)
+        .maybeSingle();
+      if (error) {
+        console.error("[app-config]", error.message);
+        return res.json({ min_app_version: "1.0.0" });
+      }
+      const min =
+        typeof data?.min_app_version === "string" && data.min_app_version.trim()
+          ? data.min_app_version.trim()
+          : "1.0.0";
+      return res.json({ min_app_version: min });
+    } catch (e) {
+      console.error("[app-config] exception", e);
+      return res.json({ min_app_version: "1.0.0" });
+    }
   });
 
   // --- MIDDLEWARE DE AUTENTICAÇÃO (Supabase JWT) ---
@@ -1455,6 +1495,8 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
     planStatus?: string;
     /** Só atualiza quando informado — evita sobrescrever mp_preapproval_id nos upgrades via payment-only */
     mpPreapprovalId?: string | null;
+    /** ISO ou timestamptz da próxima cobrança / fim do período, quando o MP informar */
+    subscriptionPeriodEnd?: string | null;
   };
 
   async function upgradeUserPlan(
@@ -1476,6 +1518,10 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
 
     if (meta.mpPreapprovalId != null && meta.mpPreapprovalId !== "") {
       row.mp_preapproval_id = String(meta.mpPreapprovalId);
+    }
+
+    if (meta.subscriptionPeriodEnd != null && meta.subscriptionPeriodEnd !== "") {
+      row.subscription_period_end = meta.subscriptionPeriodEnd;
     }
 
     const { error } = await supabaseAdmin.from("users").update(row).eq("id", String(userId));
@@ -1506,6 +1552,7 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         plan_type: "free",
         plan_status: planStatus,
         mp_preapproval_id: null,
+        subscription_period_end: null,
       })
       .eq("id", String(userId));
 
@@ -1677,9 +1724,11 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
         // authorized/active → ativa Plus ou Premium conforme checkout (idempotente)
         if (mpStatus === "authorized" || mpStatus === "active") {
           console.log("[MP Webhook] plan_action=ensure_plan user=", extUserId, "tier=", planTier);
+          const periodEnd = subscriptionEndFromPreapproval(sub as unknown as Record<string, unknown>);
           await upgradeUserPlan(extUserId, planTier, `preapproval ${sub.id} ${mpStatus}`, {
             mpPreapprovalId: sub.id != null ? String(sub.id) : undefined,
             planStatus: mpStatus,
+            subscriptionPeriodEnd: periodEnd,
           });
           console.log("[MP Webhook] plan_action_done=ensure_plan");
           return;

@@ -13,6 +13,8 @@ export interface User {
   plan?: 'free' | 'plus' | 'premium';
   ai_messages_count?: number;
   last_ai_message_date?: string | null;
+  /** Fim do período vigente da assinatura (Mercado Pago), quando disponível */
+  subscription_period_end?: string | null;
   access_token?: string;
 }
 
