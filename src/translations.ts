@@ -267,6 +267,8 @@ export const translations = {
     connectionError: 'Erro de conexão. Tente novamente.',
     errorSavingData: 'Não foi possível salvar. Verifique a conexão e tente novamente.',
     toastVehicleLimitReached: 'Você atingiu o limite de veículos do seu plano.',
+    toastCheckoutDeepLinkReturn:
+      'Voltamos do Mercado Pago. Atualizamos seus dados — confira seu plano na tela de planos.',
     errorLoadingData: 'Não foi possível carregar os dados. Verifique a conexão e tente novamente.',
     registerServerError: 'Não foi possível criar a conta.',
     recoverEmailError: 'Não foi possível enviar o e-mail de recuperação.',
@@ -634,6 +636,8 @@ export const translations = {
     connectionError: 'Connection error. Please try again.',
     errorSavingData: 'Could not save. Check your connection and try again.',
     toastVehicleLimitReached: "You've reached your plan's vehicle limit.",
+    toastCheckoutDeepLinkReturn:
+      "We're back from Mercado Pago. Your data was refreshed — check your plan on the plans screen.",
     errorLoadingData: 'Could not load data. Check your connection and try again.',
     registerServerError: 'Could not create the account.',
     recoverEmailError: 'Could not send the recovery email.',
@@ -1001,6 +1005,8 @@ export const translations = {
     connectionError: 'Error de conexión. Inténtalo de nuevo.',
     errorSavingData: 'No se pudo guardar. Comprueba la conexión e inténtalo de nuevo.',
     toastVehicleLimitReached: 'Has alcanzado el límite de vehículos de tu plan.',
+    toastCheckoutDeepLinkReturn:
+      'Volvimos de Mercado Pago. Actualizamos tus datos — revisa tu plan en la pantalla de planes.',
     errorLoadingData: 'No se pudieron cargar los datos. Comprueba la conexión e inténtalo de nuevo.',
     registerServerError: 'No se pudo crear la cuenta.',
     recoverEmailError: 'No se pudo enviar el correo de recuperación.',
@@ -1368,6 +1374,8 @@ export const translations = {
     connectionError: 'Erro de ligação. Tenta novamente.',
     errorSavingData: 'Não foi possível guardar. Verifica a ligação e tenta novamente.',
     toastVehicleLimitReached: 'Atingiste o limite de veículos do teu plano.',
+    toastCheckoutDeepLinkReturn:
+      'Voltámos do Mercado Pago. Atualizámos os teus dados — confere o teu plano no ecrã de planos.',
     errorLoadingData: 'Não foi possível carregar os dados. Verifica a ligação e tenta novamente.',
     registerServerError: 'Não foi possível criar a conta.',
     recoverEmailError: 'Não foi possível enviar o e-mail de recuperação.',

@@ -1422,7 +1422,7 @@ Contexto do veículo: ${vehicleContext}. Seja direto, técnico e use jargões de
 
       // Retorno ao app após fluxo Mercado Pago: PreApproval só aceita o campo
       // singular `back_url` (não há `back_urls` como em Preference).
-      // MP_BACK_URL deve ser o deep link revisauto://... ou HTTPS (App Link).
+      // MP_BACK_URL deve ser o deep link revisautoapp://... ou HTTPS (App Link).
       const backUrl = (process.env.MP_BACK_URL || "").trim();
       if (!backUrl) {
         console.error("[MP Checkout] MP_BACK_URL ausente no ambiente.");

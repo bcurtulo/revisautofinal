@@ -3,5 +3,5 @@
     <string name="app_name">RevisAuto</string>
     <string name="title_activity_main">RevisAuto</string>
     <string name="package_name">br.com.revisautoapp</string>
-    <string name="custom_url_scheme">br.com.revisautoapp</string>
+    <string name="custom_url_scheme">revisautoapp</string>
 </resources>

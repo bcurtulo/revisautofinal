@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { App as CapacitorApp } from '@capacitor/app';
 import ReactMarkdown from 'react-markdown';
 import { Car, Bike, Zap, Wrench, Droplets, FileText, Plus, Activity, MessageSquare, MapPin, Calendar, Clock, Gauge, ChevronLeft, ChevronRight, Hop as Home, Menu, Eye, EyeOff, Check, X, Search, Warehouse, ChevronDown, ChevronUp, Shield, Send, Globe, Type, Pencil, Paintbrush, Trash2, Archive, History, Settings, User as UserIcon, DollarSign, CalendarDays, Mail, ArrowLeft, Lightbulb, Layers } from 'lucide-react';
 import { Vehicle, MaintenanceLog, User, MileageLog, FinancialRecord, ChatSession, ChatMessage } from './types';
@@ -462,6 +463,39 @@ function chatTitleFromFirstQuestion(text: string, maxLen = 120): string {
   const c = text.trim().replace(/\s+/g, ' ');
   if (!c) return '';
   return c.length <= maxLen ? c : `${c.slice(0, maxLen - 1).trimEnd()}…`;
+}
+
+/** Paths esperados: revisautoapp://checkout/return, revisautoapp://sucesso, ou query status=approved. */
+function isMercadoPagoCheckoutReturnDeepLink(url: string): boolean {
+  const u = url.trim();
+  if (!/^revisautoapp:\/\//i.test(u)) return false;
+  try {
+    const parsed = new URL(u);
+    if (parsed.protocol.toLowerCase() !== 'revisautoapp:') return false;
+    const host = parsed.hostname.toLowerCase();
+    const segments = parsed.pathname
+      .split('/')
+      .map((s) => s.toLowerCase())
+      .filter(Boolean);
+    if (host === 'sucesso' || host === 'success') return true;
+    if (host === 'checkout') {
+      if (segments.some((s) => ['return', 'sucesso', 'success'].includes(s))) return true;
+    }
+    const st = (
+      parsed.searchParams.get('status') ||
+      parsed.searchParams.get('payment_status') ||
+      ''
+    ).toLowerCase();
+    if (['approved', 'success', 'authorized'].includes(st)) return true;
+  } catch {
+    /* URL() pode falhar em edge cases; usa fallback abaixo */
+  }
+  const base = (u.split(/[?#]/)[0] ?? u).toLowerCase();
+  if (base.includes('revisautoapp://checkout/return')) return true;
+  if (base.includes('revisautoapp://checkout/sucesso')) return true;
+  if (base.includes('revisautoapp://checkout/success')) return true;
+  if (/^revisautoapp:\/\/(sucesso|success)\/?$/i.test(base)) return true;
+  return false;
 }
 
 export default function App() {
@@ -1679,6 +1713,39 @@ export default function App() {
     }
     // Don't auto-select first vehicle on mobile to keep dashboard clean
   };
+
+  const fetchUserRef = useRef(fetchUser);
+  const fetchVehiclesRef = useRef(fetchVehicles);
+  fetchUserRef.current = fetchUser;
+  fetchVehiclesRef.current = fetchVehicles;
+
+  useEffect(() => {
+    if (!isNativeCapacitorApp()) return;
+    let cancelled = false;
+    const sub = CapacitorApp.addListener('appUrlOpen', ({ url }) => {
+      if (cancelled || !url) return;
+      if (!isMercadoPagoCheckoutReturnDeepLink(url)) return;
+      if (!getStoredAccessToken()) return;
+      void fetchUserRef.current();
+      void fetchVehiclesRef.current();
+      setAuthScreen('app');
+      setActiveTab('menu');
+      setSubscriptionManageView('menu');
+      setShowUpgradeModal(true);
+      const langKey = language as keyof typeof translations;
+      const message =
+        translations[langKey]?.toastCheckoutDeepLinkReturn ??
+        translations['Português (Brasil)'].toastCheckoutDeepLinkReturn;
+      setAppToast({
+        message,
+        tone: 'neutral',
+      });
+    });
+    return () => {
+      cancelled = true;
+      void sub.then((handle) => void handle.remove());
+    };
+  }, [language]);
 
   const confirmArchiveVehicle = async () => {
     if (!selectedVehicle) return;
