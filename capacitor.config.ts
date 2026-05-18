@@ -1,13 +1,9 @@
-import { CapacitorConfig } from '@capacitor/cli';
+import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.revisauto.app',
+  appId: 'br.com.revisautoapp',
   appName: 'RevisAuto',
-  webDir: 'dist',
-  server: {
-    androidScheme: 'https',
-    cleartext: true
-  }
+  webDir: 'dist'
 };
 
 export default config;
