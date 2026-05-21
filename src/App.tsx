@@ -3071,61 +3071,61 @@ export default function App() {
         {activeTermsTab === 'privacy' ? (
           <>
             <h3 className="font-bold text-revis-heading mb-2 text-sm">POLÍTICA DE PRIVACIDADE – REVISAUTO</h3>
-            <p className="text-[10px] text-revis-gray mb-4">Última atualização: 17 de fevereiro de 2026.<br/>*novas atualizações serão notificadas por e-mail para novo aceite</p>
+            <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
             
             <p>A plataforma RevisAuto tem o compromisso de proteger a privacidade e os dados pessoais de seus usuários. Esta Política descreve como coletamos, usamos, armazenamos e protegemos suas informações, em total conformidade com a Lei Geral de Proteção de Dados (Lei nº 13.709/2018 - LGPD).</p>
             
             <h4 className="font-bold text-revis-gray mt-4 text-sm">1. DADOS COLETADOS</h4>
-            <p>Para o funcionamento das funcionalidades de consultoria e manutenção, coletamos:</p>
+            <p>Para o funcionamento adequado do aplicativo, coletamos os seguintes dados:</p>
             <ul className="list-disc pl-4 space-y-1">
-              <li>Informações de Cadastro: Nome, e-mail e data de nascimento (para verificação de maioridade).</li>
-              <li>Informações do Veículo: Marca, modelo, ano, quilometragem e histórico de serviços inseridos.</li>
-              <li>Dados de Localização: Coletamos sua localização aproximada (cidade) para fornecer alertas climáticos específicos (ex: maresia e umidade).</li>
-              <li>Dados de Mídia: Fotos de recibos ou fotos do veículo enviadas pelo usuário através da função de câmera.</li>
+              <li>Informações de Cadastro: Nome e e-mail para verificação de conta e suporte.</li>
+              <li>Informações do Veículo: Marca, modelo, ano, quilometragem e histórico de serviços inseridos por você.</li>
+              <li>Interações com a IA: O conteúdo das mensagens, perguntas e fotos enviadas ao assistente virtual (Dr. Graxa).</li>
+              <li>Dados de Autenticação Biométrica: Para maior comodidade, o app utiliza a autenticação local do seu dispositivo (Face ID ou Touch ID). Aviso importante: O RevisAuto NÃO coleta, transfere ou armazena os seus dados biométricos (impressão digital ou mapeamento facial) em nossos servidores. O reconhecimento é feito exclusivamente de forma criptografada pelo hardware do seu próprio celular.</li>
             </ul>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">2. FINALIDADE DO TRATAMENTO DE DADOS</h4>
-            <p>Os dados são utilizados exclusivamente para:</p>
+            <p>Os dados coletados são utilizados exclusivamente para:</p>
             <ul className="list-disc pl-4 space-y-1">
-              <li>Personalizar as recomendações da Inteligência Artificial.</li>
-              <li>Gerar alertas de manutenção preventiva e estética automotiva.</li>
-              <li>Garantir a segurança da conta e prevenir fraudes.</li>
-              <li>Melhorar a experiência na comunidade e rede social do app.</li>
+              <li>Gerenciar sua garagem virtual e histórico automotivo.</li>
+              <li>Personalizar as respostas e diagnósticos da Inteligência Artificial.</li>
+              <li>Processar as validações de pagamento das assinaturas escolhidas pelo usuário.</li>
+              <li>Garantir a segurança da conta e prevenir acessos fraudulentos.</li>
             </ul>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS</h4>
-            <p>3.1. Não Comercialização: O RevisAuto não vende seus dados pessoais a terceiros.</p>
-            <p>3.2. Parceiros Técnicos: Seus dados podem ser processados em servidores de nuvem (Google Cloud) e através da API de Inteligência Artificial do Google, que seguem padrões internacionais de segurança.</p>
-            <p>3.3. Ordens Judiciais: Poderemos compartilhar dados caso sejamos obrigados por lei ou decisão judicial, conforme o Marco Civil da Internet.</p>
+            <h4 className="font-bold text-revis-gray mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS E INFRAESTRUTURA</h4>
+            <p>3.1. Não Comercialização: O RevisAuto não vende seus dados pessoais a terceiros para fins publicitários.</p>
+            <p>3.2. Parceiros Técnicos e Nuvem: Seus dados cadastrais e o histórico de veículos são armazenados de forma criptografada em nosso parceiro de nuvem, o Supabase.</p>
+            <p>3.3. Inteligência Artificial: Para o funcionamento do assistente &quot;Dr. Graxa&quot;, as mensagens enviadas são processadas através da API da OpenAI. O processamento é feito de maneira segura, e os seus dados não são utilizados para treinar modelos públicos de IA.</p>
+            <p>3.4. Processamento de Pagamentos: Transações financeiras (Planos Plus e Premium) são geridas e processadas pelo Mercado Pago. O RevisAuto não armazena os dados completos de seu cartão de crédito em seus servidores.</p>
+            <p>3.5. Ordens Judiciais: Poderemos compartilhar dados caso sejamos obrigados por lei ou decisão judicial, conforme o Marco Civil da Internet.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">4. SEGURANÇA DA INFORMAÇÃO</h4>
-            <p>4.1. Criptografia: Utilizamos criptografia SSL/TLS para o tráfego de dados entre o seu celular e nossos servidores.</p>
-            <p>4.2. Armazenamento Seguro: Os dados são armazenados em bancos de dados protegidos por firewalls e controles de acesso rigorosos.</p>
-            <p>4.3. Responsabilidade do Usuário: A segurança também depende de você. Mantenha sua senha em sigilo e não utilize o app em redes Wi-Fi públicas não seguras.</p>
+            <p>4.1. Criptografia: Utilizamos protocolos de criptografia de ponta a ponta (SSL/TLS) para o tráfego de informações entre o seu dispositivo e nossa nuvem.</p>
+            <p>4.2. Proteção: Nossos bancos de dados contam com rigorosos controles de acesso baseados em políticas de segurança modernas.</p>
+            <p>4.3. Responsabilidade do Usuário: Mantenha suas credenciais seguras e desconfie de abordagens externas solicitando dados em nome do RevisAuto.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">5. SEUS DIREITOS (LGPD)</h4>
             <p>Como titular dos dados, você tem o direito de:</p>
             <ul className="list-disc pl-4 space-y-1">
               <li>Confirmar a existência de tratamento de seus dados.</li>
-              <li>Acessar seus dados a qualquer momento.</li>
-              <li>Corrigir dados incompletos ou desatualizados.</li>
-              <li>Portabilidade: Solicitar a exportação de seus dados para outros serviços.</li>
-              <li>Exclusão (Direito ao Esquecimento): Solicitar a eliminação definitiva de todos os seus dados dos nossos servidores através das configurações do app.</li>
+              <li>Acessar e corrigir dados incompletos ou desatualizados a qualquer momento no perfil do app.</li>
+              <li>Exclusão (Direito ao Esquecimento): Solicitar a eliminação definitiva e irrevogável de todos os seus dados cadastrais, histórico de veículos e conversas dos nossos servidores, utilizando o botão específico de exclusão de conta dentro das configurações do próprio aplicativo.</li>
             </ul>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">6. COOKIES E TECNOLOGIAS DE RASTREIO</h4>
-            <p>Utilizamos identificadores de dispositivos móveis para reconhecer seu aparelho e manter sua sessão ativa, além de ferramentas de análise (como Google Analytics) para entender como os usuários interagem com o app e melhorar as funcionalidades.</p>
+            <h4 className="font-bold text-revis-gray mt-4 text-sm">6. TECNOLOGIAS DE RASTREIO E SESSÃO</h4>
+            <p>Utilizamos identificadores seguros e tokens de sessão (access tokens) do seu dispositivo móvel exclusivamente para manter o aplicativo logado e funcional durante o uso, melhorando a fluidez da sua experiência.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">7. RETENÇÃO DE DADOS</h4>
-            <p>Mantemos seus dados apenas pelo tempo necessário para cumprir as finalidades descritas nesta política ou conforme exigido por obrigações legais de guarda de registros (Marco Civil da Internet).</p>
+            <p>Mantemos seus dados ativos apenas enquanto a sua conta existir para cumprir as finalidades desta política. Caso opte por deletar a conta, os dados serão expurgados dos nossos servidores primários, ressalvada a guarda necessária para o cumprimento de obrigações legais impostas pelo Marco Civil da Internet.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">8. CONTATO E ENCARREGADO DE DADOS (DPO)</h4>
-            <p>Para exercer seus direitos ou tirar dúvidas sobre sua privacidade, entre em contato com nosso Encarregado de Proteção de Dados (DPO) através do e-mail oficial: suporte@revisautoapp.com.br.</p>
+            <p>Para exercer seus direitos, relatar vulnerabilidades ou tirar dúvidas sobre sua privacidade, entre em contato através do e-mail oficial: suporte@revisautoapp.com.br.</p>
           </>
         ) : (
           <>
             <h3 className="font-bold text-revis-gray mb-2 text-sm">TERMOS E CONDIÇÕES DE USO – PLATAFORMA REVISAUTO</h3>
-            <p className="text-[10px] text-revis-gray mb-4">Última atualização: 17 de fevereiro de 2026.<br/>*novas atualizações serão notificadas por e-mail para novo aceite</p>
+            <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
             
             <div className="bg-revis-alert-medium/10 border border-revis-alert-medium p-3 rounded-lg mb-4">
               <p className="text-revis-alert-medium font-bold text-[10px]">AVISO DE MAIORIDADE</p>
@@ -3135,7 +3135,7 @@ export default function App() {
             <h4 className="font-bold text-revis-gray mt-4 text-sm">1. CADASTRO E SEGURANÇA DE DADOS (CONFORMIDADE LGPD)</h4>
             <p>1.1. Elegibilidade: O Usuário declara ser maior de 18 anos e ser o proprietário ou possuidor legítimo do veículo cadastrado.</p>
             <p>1.2. Veracidade das Informações: O Usuário é o único responsável pela precisão e atualização dos dados inseridos (quilometragem, datas de manutenção, histórico de reparos).</p>
-            <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta.</p>
+            <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta. O aplicativo oferece suporte à autenticação biométrica (como Face ID ou Touch ID), cuja segurança é gerida localmente pelo sistema operacional do dispositivo.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">2. COMUNIDADE E REDE SOCIAL (DIRETRIZES DE CONDUTA)</h4>
             <p>2.1. Conteúdo Gerado pelo Usuário (UGC): O Usuário concede ao RevisAuto uma licença gratuita e global para exibir conteúdos postados em áreas comuns do app.</p>
@@ -3143,28 +3143,28 @@ export default function App() {
             <p>2.3. Moderação: O RevisAuto reserva-se o direito de remover conteúdos e banir usuários que violem estas diretrizes.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">3. PROPRIEDADE INTELECTUAL E PROTEÇÃO CONTRA PLÁGIO</h4>
-            <p>3.1. Propriedade e Patenteamento: Todo o código-fonte, interface gráfica, algoritmos de IA e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos por registro de software e patentes conforme aplicável.</p>
+            <p>3.1. Propriedade e Patenteamento: Todo o código-fonte, interface gráfica, algoritmos de IA, identidade visual e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos por registro de software e patentes conforme aplicável.</p>
             <p>3.2. Proibição de Plágio: É terminantemente proibida a reprodução total ou parcial da lógica ou design da plataforma.</p>
             <p>3.3. Procedimentos Judiciais: A prática de plágio sujeitará o infrator a procedimentos judiciais nas esferas cível e criminal, incluindo indenizações por danos materiais e lucros cessantes.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">4. PROTOCOLOS DE SEGURANÇA E PREVENÇÃO A FRAUDES</h4>
             <p>4.1. Cuidado com Credenciais: O RevisAuto jamais solicitará sua senha de acesso por telefone, e-mail, SMS ou redes sociais. O compartilhamento de senhas com terceiros é de inteira responsabilidade do Usuário.</p>
-            <p>4.2. Canais Oficiais de Cobrança: Todas as transações financeiras e cobranças de assinaturas são realizadas exclusivamente através de plataformas verificadas e integradas (App Store, Google Play ou gateways de pagamento seguros dentro do app).</p>
-            <p>4.3. Alertas de Golpes: O RevisAuto não realiza cobranças nem solicita pagamentos via WhatsApp, ligações telefônicas, SMS ou links diretos enviados por e-mail. Caso receba solicitações de transferência (PIX, boletos ou cartões) fora do ambiente seguro do aplicativo, o Usuário deve ignorar e reportar o incidente.</p>
+            <p>4.2. Canais Oficiais de Cobrança: Todas as transações financeiras e cobranças de assinaturas de planos são processadas exclusivamente através de plataformas verificadas, notadamente pelo sistema integrado do Mercado Pago ou pelas lojas oficiais (App Store e Google Play).</p>
+            <p>4.3. Alertas de Golpes: O RevisAuto não realiza cobranças nem solicita pagamentos via WhatsApp, ligações telefônicas, SMS ou links diretos enviados por e-mail.</p>
             <p>4.4. Isenção de Responsabilidade por Engenharia Social: O RevisAuto não se responsabiliza por prejuízos financeiros decorrentes de golpes de terceiros, phishing ou transferências realizadas pelo usuário para contas não oficiais.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">5. ASSINATURAS E PAGAMENTOS</h4>
-            <p>5.1. Serviços Premium: Funcionalidades pagas estarão sujeitas a termos de recorrência apresentados no momento da contratação.</p>
+            <p>5.1. Serviços Premium: O RevisAuto oferece planos de assinatura (como Plus e Premium) para desbloqueio de limites de veículos e maior interação com a inteligência artificial. Estas funcionalidades estão sujeitas a termos de recorrência apresentados no momento da contratação.</p>
             <p>5.2. Reajustes: Alterações de valores serão comunicadas com 30 (trinta) dias de antecedência.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">6. DISPONIBILIDADE E MODIFICAÇÕES</h4>
-            <p>6.1. Interrupções de Serviço: O serviço pode sofrer instabilidades técnicas devido a provedores de nuvem terceiros.</p>
+            <p>6.1. Interrupções de Serviço: O serviço pode sofrer instabilidades técnicas devido a manutenções ou fatores externos em nossos provedores de nuvem.</p>
             <p>6.2. Alteração dos Termos: A continuidade do uso do app após atualizações constitui aceitação dos novos termos.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">7. NATUREZA DO SERVIÇO E ISENÇÃO DE RESPONSABILIDADE</h4>
-            <p>7.1. Consultoria via IA: O Usuário reconhece que o RevisAuto fornece recomendações geradas por algoritmos com caráter meramente informativo e consultivo.</p>
-            <p>7.2. Responsabilidade Técnica: A plataforma não substitui o manual do fabricante ou a avaliação de um profissional. O RevisAuto não se responsabiliza por danos decorrentes da aplicação de sugestões da IA.</p>
-            <p>7.3. Dicas de Produtos: A compatibilidade de produtos químicos ou peças é de inteira responsabilidade do Usuário.</p>
+            <p>7.1. Consultoria via IA (Dr. Graxa): O Usuário reconhece que o assistente virtual &quot;Dr. Graxa&quot; fornece recomendações geradas por Inteligência Artificial com caráter meramente informativo e consultivo.</p>
+            <p>7.2. Responsabilidade Técnica: A plataforma, incluindo sua inteligência artificial, não substitui o manual oficial do fabricante, laudos técnicos ou a avaliação presencial de um profissional mecânico qualificado. O RevisAuto não se responsabiliza por danos físicos ou materiais decorrentes da aplicação de sugestões geradas no aplicativo.</p>
+            <p>7.3. Dicas de Produtos: A compatibilidade de produtos químicos ou peças automotivas é de inteira responsabilidade do Usuário.</p>
 
             <h4 className="font-bold text-revis-gray mt-4 text-sm">8. FORO E LEGISLAÇÃO APLICÁVEL</h4>
             <p>8.1. Regido pelas leis da República Federativa do Brasil (Marco Civil da Internet e LGPD).</p>
@@ -5501,7 +5501,7 @@ export default function App() {
             </div>
             <div className="flex-1 overflow-y-auto bg-revis-dark-gray rounded-xl p-4 text-xs text-revis-light-gray space-y-4">
               <h3 className="font-bold text-revis-heading mb-2 text-sm">TERMOS E CONDIÇÕES DE USO – PLATAFORMA REVISAUTO</h3>
-              <p className="text-[10px] text-revis-gray mb-4">Última atualização: 17 de fevereiro de 2026.<br/>*novas atualizações serão notificadas por e-mail para novo aceite</p>
+              <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
               
               <div className="bg-revis-alert-medium/10 border border-revis-alert-medium p-3 rounded-lg mb-4">
                 <p className="text-revis-alert-medium font-bold text-[10px]">AVISO DE MAIORIDADE</p>
@@ -5511,7 +5511,7 @@ export default function App() {
               <h4 className="font-bold text-revis-heading mt-4 text-sm">1. CADASTRO E SEGURANÇA DE DADOS (CONFORMIDADE LGPD)</h4>
               <p>1.1. Elegibilidade: O Usuário declara ser maior de 18 anos e ser o proprietário ou possuidor legítimo do veículo cadastrado.</p>
               <p>1.2. Veracidade das Informações: O Usuário é o único responsável pela precisão e atualização dos dados inseridos (quilometragem, datas de manutenção, histórico de reparos).</p>
-              <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta.</p>
+              <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta. O aplicativo oferece suporte à autenticação biométrica (como Face ID ou Touch ID), cuja segurança é gerida localmente pelo sistema operacional do dispositivo.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">2. COMUNIDADE E REDE SOCIAL (DIRETRIZES DE CONDUTA)</h4>
               <p>2.1. Conteúdo Gerado pelo Usuário (UGC): O Usuário concede ao RevisAuto uma licença gratuita e global para exibir conteúdos postados em áreas comuns do app.</p>
@@ -5519,28 +5519,28 @@ export default function App() {
               <p>2.3. Moderação: O RevisAuto reserva-se o direito de remover conteúdos e banir usuários que violem estas diretrizes.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">3. PROPRIEDADE INTELECTUAL E PROTEÇÃO CONTRA PLÁGIO</h4>
-              <p>3.1. Propriedade e Patenteamento: Todo o código-fonte, interface gráfica, algoritmos de IA e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos por registro de software e patentes conforme aplicável.</p>
+              <p>3.1. Propriedade e Patenteamento: Todo o código-fonte, interface gráfica, algoritmos de IA, identidade visual e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos por registro de software e patentes conforme aplicável.</p>
               <p>3.2. Proibição de Plágio: É terminantemente proibida a reprodução total ou parcial da lógica ou design da plataforma.</p>
               <p>3.3. Procedimentos Judiciais: A prática de plágio sujeitará o infrator a procedimentos judiciais nas esferas cível e criminal, incluindo indenizações por danos materiais e lucros cessantes.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">4. PROTOCOLOS DE SEGURANÇA E PREVENÇÃO A FRAUDES</h4>
               <p>4.1. Cuidado com Credenciais: O RevisAuto jamais solicitará sua senha de acesso por telefone, e-mail, SMS ou redes sociais. O compartilhamento de senhas com terceiros é de inteira responsabilidade do Usuário.</p>
-              <p>4.2. Canais Oficiais de Cobrança: Todas as transações financeiras e cobranças de assinaturas são realizadas exclusivamente através de plataformas verificadas e integradas (App Store, Google Play ou gateways de pagamento seguros dentro do app).</p>
-              <p>4.3. Alertas de Golpes: O RevisAuto não realiza cobranças nem solicita pagamentos via WhatsApp, ligações telefônicas, SMS ou links diretos enviados por e-mail. Caso receba solicitações de transferência (PIX, boletos ou cartões) fora do ambiente seguro do aplicativo, o Usuário deve ignorar e reportar o incidente.</p>
+              <p>4.2. Canais Oficiais de Cobrança: Todas as transações financeiras e cobranças de assinaturas de planos são processadas exclusivamente através de plataformas verificadas, notadamente pelo sistema integrado do Mercado Pago ou pelas lojas oficiais (App Store e Google Play).</p>
+              <p>4.3. Alertas de Golpes: O RevisAuto não realiza cobranças nem solicita pagamentos via WhatsApp, ligações telefônicas, SMS ou links diretos enviados por e-mail.</p>
               <p>4.4. Isenção de Responsabilidade por Engenharia Social: O RevisAuto não se responsabiliza por prejuízos financeiros decorrentes de golpes de terceiros, phishing ou transferências realizadas pelo usuário para contas não oficiais.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">5. ASSINATURAS E PAGAMENTOS</h4>
-              <p>5.1. Serviços Premium: Funcionalidades pagas estarão sujeitas a termos de recorrência apresentados no momento da contratação.</p>
+              <p>5.1. Serviços Premium: O RevisAuto oferece planos de assinatura (como Plus e Premium) para desbloqueio de limites de veículos e maior interação com a inteligência artificial. Estas funcionalidades estão sujeitas a termos de recorrência apresentados no momento da contratação.</p>
               <p>5.2. Reajustes: Alterações de valores serão comunicadas com 30 (trinta) dias de antecedência.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">6. DISPONIBILIDADE E MODIFICAÇÕES</h4>
-              <p>6.1. Interrupções de Serviço: O serviço pode sofrer instabilidades técnicas devido a provedores de nuvem terceiros.</p>
+              <p>6.1. Interrupções de Serviço: O serviço pode sofrer instabilidades técnicas devido a manutenções ou fatores externos em nossos provedores de nuvem.</p>
               <p>6.2. Alteração dos Termos: A continuidade do uso do app após atualizações constitui aceitação dos novos termos.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">7. NATUREZA DO SERVIÇO E ISENÇÃO DE RESPONSABILIDADE</h4>
-              <p>7.1. Consultoria via IA: O Usuário reconhece que o RevisAuto fornece recomendações geradas por algoritmos com caráter meramente informativo e consultivo.</p>
-              <p>7.2. Responsabilidade Técnica: A plataforma não substitui o manual do fabricante ou a avaliação de um profissional. O RevisAuto não se responsabiliza por danos decorrentes da aplicação de sugestões da IA.</p>
-              <p>7.3. Dicas de Produtos: A compatibilidade de produtos químicos ou peças é de inteira responsabilidade do Usuário.</p>
+              <p>7.1. Consultoria via IA (Dr. Graxa): O Usuário reconhece que o assistente virtual &quot;Dr. Graxa&quot; fornece recomendações geradas por Inteligência Artificial com caráter meramente informativo e consultivo.</p>
+              <p>7.2. Responsabilidade Técnica: A plataforma, incluindo sua inteligência artificial, não substitui o manual oficial do fabricante, laudos técnicos ou a avaliação presencial de um profissional mecânico qualificado. O RevisAuto não se responsabiliza por danos físicos ou materiais decorrentes da aplicação de sugestões geradas no aplicativo.</p>
+              <p>7.3. Dicas de Produtos: A compatibilidade de produtos químicos ou peças automotivas é de inteira responsabilidade do Usuário.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">8. FORO E LEGISLAÇÃO APLICÁVEL</h4>
               <p>8.1. Regido pelas leis da República Federativa do Brasil (Marco Civil da Internet e LGPD).</p>
@@ -5562,56 +5562,56 @@ export default function App() {
             </div>
             <div className="flex-1 overflow-y-auto bg-revis-dark-gray rounded-xl p-4 text-xs text-revis-light-gray space-y-4">
               <h3 className="font-bold text-revis-heading mb-2 text-sm">POLÍTICA DE PRIVACIDADE – REVISAUTO</h3>
-              <p className="text-[10px] text-revis-gray mb-4">Última atualização: 17 de fevereiro de 2026.<br/>*novas atualizações serão notificadas por e-mail para novo aceite</p>
+              <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
               
               <p>A plataforma RevisAuto tem o compromisso de proteger a privacidade e os dados pessoais de seus usuários. Esta Política descreve como coletamos, usamos, armazenamos e protegemos suas informações, em total conformidade com a Lei Geral de Proteção de Dados (Lei nº 13.709/2018 - LGPD).</p>
               
               <h4 className="font-bold text-revis-heading mt-4 text-sm">1. DADOS COLETADOS</h4>
-              <p>Para o funcionamento das funcionalidades de consultoria e manutenção, coletamos:</p>
+              <p>Para o funcionamento adequado do aplicativo, coletamos os seguintes dados:</p>
               <ul className="list-disc pl-4 space-y-1">
-                <li>Informações de Cadastro: Nome, e-mail e data de nascimento (para verificação de maioridade).</li>
-                <li>Informações do Veículo: Marca, modelo, ano, quilometragem e histórico de serviços inseridos.</li>
-                <li>Dados de Localização: Coletamos sua localização aproximada (cidade) para fornecer alertas climáticos específicos (ex: maresia e umidade).</li>
-                <li>Dados de Mídia: Fotos de recibos ou fotos do veículo enviadas pelo usuário através da função de câmera.</li>
+                <li>Informações de Cadastro: Nome e e-mail para verificação de conta e suporte.</li>
+                <li>Informações do Veículo: Marca, modelo, ano, quilometragem e histórico de serviços inseridos por você.</li>
+                <li>Interações com a IA: O conteúdo das mensagens, perguntas e fotos enviadas ao assistente virtual (Dr. Graxa).</li>
+                <li>Dados de Autenticação Biométrica: Para maior comodidade, o app utiliza a autenticação local do seu dispositivo (Face ID ou Touch ID). Aviso importante: O RevisAuto NÃO coleta, transfere ou armazena os seus dados biométricos (impressão digital ou mapeamento facial) em nossos servidores. O reconhecimento é feito exclusivamente de forma criptografada pelo hardware do seu próprio celular.</li>
               </ul>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">2. FINALIDADE DO TRATAMENTO DE DADOS</h4>
-              <p>Os dados são utilizados exclusivamente para:</p>
+              <p>Os dados coletados são utilizados exclusivamente para:</p>
               <ul className="list-disc pl-4 space-y-1">
-                <li>Personalizar as recomendações da Inteligência Artificial.</li>
-                <li>Gerar alertas de manutenção preventiva e estética automotiva.</li>
-                <li>Garantir a segurança da conta e prevenir fraudes.</li>
-                <li>Melhorar a experiência na comunidade e rede social do app.</li>
+                <li>Gerenciar sua garagem virtual e histórico automotivo.</li>
+                <li>Personalizar as respostas e diagnósticos da Inteligência Artificial.</li>
+                <li>Processar as validações de pagamento das assinaturas escolhidas pelo usuário.</li>
+                <li>Garantir a segurança da conta e prevenir acessos fraudulentos.</li>
               </ul>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS</h4>
-              <p>3.1. Não Comercialização: O RevisAuto não vende seus dados pessoais a terceiros.</p>
-              <p>3.2. Parceiros Técnicos: Seus dados podem ser processados em servidores de nuvem (Google Cloud) e através da API de Inteligência Artificial do Google, que seguem padrões internacionais de segurança.</p>
-              <p>3.3. Ordens Judiciais: Poderemos compartilhar dados caso sejamos obrigados por lei ou decisão judicial, conforme o Marco Civil da Internet.</p>
+              <h4 className="font-bold text-revis-heading mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS E INFRAESTRUTURA</h4>
+              <p>3.1. Não Comercialização: O RevisAuto não vende seus dados pessoais a terceiros para fins publicitários.</p>
+              <p>3.2. Parceiros Técnicos e Nuvem: Seus dados cadastrais e o histórico de veículos são armazenados de forma criptografada em nosso parceiro de nuvem, o Supabase.</p>
+              <p>3.3. Inteligência Artificial: Para o funcionamento do assistente &quot;Dr. Graxa&quot;, as mensagens enviadas são processadas através da API da OpenAI. O processamento é feito de maneira segura, e os seus dados não são utilizados para treinar modelos públicos de IA.</p>
+              <p>3.4. Processamento de Pagamentos: Transações financeiras (Planos Plus e Premium) são geridas e processadas pelo Mercado Pago. O RevisAuto não armazena os dados completos de seu cartão de crédito em seus servidores.</p>
+              <p>3.5. Ordens Judiciais: Poderemos compartilhar dados caso sejamos obrigados por lei ou decisão judicial, conforme o Marco Civil da Internet.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">4. SEGURANÇA DA INFORMAÇÃO</h4>
-              <p>4.1. Criptografia: Utilizamos criptografia SSL/TLS para o tráfego de dados entre o seu celular e nossos servidores.</p>
-              <p>4.2. Armazenamento Seguro: Os dados são armazenados em bancos de dados protegidos por firewalls e controles de acesso rigorosos.</p>
-              <p>4.3. Responsabilidade do Usuário: A segurança também depende de você. Mantenha sua senha em sigilo e não utilize o app em redes Wi-Fi públicas não seguras.</p>
+              <p>4.1. Criptografia: Utilizamos protocolos de criptografia de ponta a ponta (SSL/TLS) para o tráfego de informações entre o seu dispositivo e nossa nuvem.</p>
+              <p>4.2. Proteção: Nossos bancos de dados contam com rigorosos controles de acesso baseados em políticas de segurança modernas.</p>
+              <p>4.3. Responsabilidade do Usuário: Mantenha suas credenciais seguras e desconfie de abordagens externas solicitando dados em nome do RevisAuto.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">5. SEUS DIREITOS (LGPD)</h4>
               <p>Como titular dos dados, você tem o direito de:</p>
               <ul className="list-disc pl-4 space-y-1">
                 <li>Confirmar a existência de tratamento de seus dados.</li>
-                <li>Acessar seus dados a qualquer momento.</li>
-                <li>Corrigir dados incompletos ou desatualizados.</li>
-                <li>Portabilidade: Solicitar a exportação de seus dados para outros serviços.</li>
-                <li>Exclusão (Direito ao Esquecimento): Solicitar a eliminação definitiva de todos os seus dados dos nossos servidores através das configurações do app.</li>
+                <li>Acessar e corrigir dados incompletos ou desatualizados a qualquer momento no perfil do app.</li>
+                <li>Exclusão (Direito ao Esquecimento): Solicitar a eliminação definitiva e irrevogável de todos os seus dados cadastrais, histórico de veículos e conversas dos nossos servidores, utilizando o botão específico de exclusão de conta dentro das configurações do próprio aplicativo.</li>
               </ul>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">6. COOKIES E TECNOLOGIAS DE RASTREIO</h4>
-              <p>Utilizamos identificadores de dispositivos móveis para reconhecer seu aparelho e manter sua sessão ativa, além de ferramentas de análise (como Google Analytics) para entender como os usuários interagem com o app e melhorar as funcionalidades.</p>
+              <h4 className="font-bold text-revis-heading mt-4 text-sm">6. TECNOLOGIAS DE RASTREIO E SESSÃO</h4>
+              <p>Utilizamos identificadores seguros e tokens de sessão (access tokens) do seu dispositivo móvel exclusivamente para manter o aplicativo logado e funcional durante o uso, melhorando a fluidez da sua experiência.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">7. RETENÇÃO DE DADOS</h4>
-              <p>Mantemos seus dados apenas pelo tempo necessário para cumprir as finalidades descritas nesta política ou conforme exigido por obrigações legais de guarda de registros (Marco Civil da Internet).</p>
+              <p>Mantemos seus dados ativos apenas enquanto a sua conta existir para cumprir as finalidades desta política. Caso opte por deletar a conta, os dados serão expurgados dos nossos servidores primários, ressalvada a guarda necessária para o cumprimento de obrigações legais impostas pelo Marco Civil da Internet.</p>
 
               <h4 className="font-bold text-revis-heading mt-4 text-sm">8. CONTATO E ENCARREGADO DE DADOS (DPO)</h4>
-              <p>Para exercer seus direitos ou tirar dúvidas sobre sua privacidade, entre em contato com nosso Encarregado de Proteção de Dados (DPO) através do e-mail oficial: suporte@revisautoapp.com.br.</p>
+              <p>Para exercer seus direitos, relatar vulnerabilidades ou tirar dúvidas sobre sua privacidade, entre em contato através do e-mail oficial: suporte@revisautoapp.com.br.</p>
             </div>
           </div>
         </div>
