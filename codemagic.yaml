@@ -3,7 +3,7 @@ workflows:
     name: RevisAuto - iOS App Store
     max_build_duration: 60
     integrations:
-      app_store_connect: revisauto_asc
+      app_store_connect: "Codemagic RevisAuto"
     environment:
       ios_signing:
         distribution_type: app_store
