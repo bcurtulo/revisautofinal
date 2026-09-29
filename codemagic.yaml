@@ -27,6 +27,12 @@ workflows:
         script: npm run build
       - name: Sincronizar o projeto iOS do Capacitor
         script: npx cap sync ios
+      - name: Preparar o chaveiro de assinatura
+        script: keychain initialize
+      - name: Buscar ou criar o certificado e perfil de distribuicao
+        script: app-store-connect fetch-signing-files br.com.revisautoapp --type IOS_APP_STORE --create
+      - name: Adicionar o certificado ao chaveiro
+        script: keychain add-certificates
       - name: Configurar assinatura automática do app
         script: xcode-project use-profiles
       - name: Gerar o arquivo .ipa para a App Store
