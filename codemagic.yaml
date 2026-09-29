@@ -5,9 +5,6 @@ workflows:
     integrations:
       app_store_connect: "Codemagic RevisAuto Admin"
     environment:
-      ios_signing:
-        distribution_type: app_store
-        bundle_identifier: br.com.revisautoapp
       vars:
         VITE_API_URL: "https://app.revisautoapp.com.br"
         XCODE_WORKSPACE: "ios/App/App.xcworkspace"
