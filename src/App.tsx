@@ -1,7 +1,9 @@
+import './index.css';
+import { CustomSelect } from './CustomSelect';
+import { generateVehicleReportPdf, downloadPdf } from './pdfReport';
 import React, { useState, useEffect, useRef } from 'react';
-import { App as CapacitorApp } from '@capacitor/app';
 import ReactMarkdown from 'react-markdown';
-import { Car, Bike, Zap, Wrench, Droplets, FileText, Plus, Activity, MessageSquare, MapPin, Calendar, Clock, Gauge, ChevronLeft, ChevronRight, Hop as Home, Menu, Eye, EyeOff, Check, X, Search, Warehouse, ChevronDown, ChevronUp, Shield, Send, Globe, Type, Pencil, Paintbrush, Trash2, Archive, History, Settings, User as UserIcon, DollarSign, CalendarDays, Mail, ArrowLeft, Lightbulb, Layers } from 'lucide-react';
+import { Car, Bike, Zap, Wrench, Droplets, FileText, Plus, Activity, MessageSquare, MapPin, Calendar, Clock, Gauge, ChevronLeft, ChevronRight, Hop as Home, Menu, Eye, EyeOff, Check, X, Search, Warehouse, ChevronDown, ChevronUp, Shield, Send, Globe, Type, Pencil, Paintbrush, Trash2, Archive, History, Settings, User as UserIcon, DollarSign, CalendarDays, Mail, ArrowLeft, Lightbulb, Layers, Paperclip, Upload, Loader2 } from 'lucide-react';
 import { Vehicle, MaintenanceLog, User, MileageLog, FinancialRecord, ChatSession, ChatMessage } from './types';
 import { PremiumCrown } from './components/PremiumCrown';
 import { CAR_BRANDS, CAR_MODELS, MOTO_BRANDS, MOTO_MODELS, EBIKE_BRANDS, EBIKE_MODELS, OFFENSIVE_WORDS, VEHICLE_COLORS } from './constants';
@@ -26,16 +28,7 @@ import {
   type PlanTier,
 } from './plans';
 import { APP_VERSION, isAppVersionBelowMinimum } from './appVersion';
-import {
-  getBiometricUnlockEnabled,
-  isBiometricHardwareAvailable,
-  isNativeCapacitorApp,
-  mercadoPagoSubscriptionsPortalUrl,
-  promptBiometricUnlock,
-  readBiometricEnabledSyncFromStorage,
-  resolveStoreUpdateUrl,
-  setBiometricUnlockEnabled,
-} from './biometric';
+import { mercadoPagoSubscriptionsPortalUrl } from './billing';
 
 // Base URL para chamadas de API. Em produção (Vercel/Render) DEVE ser
 // definida via VITE_API_URL apontando para o backend. Em dev local fica
@@ -56,17 +49,157 @@ function getStoredAccessToken(): string | undefined {
   }
 }
 
-// Wrapper de fetch que injeta automaticamente o header
-// `Authorization: Bearer <access_token>` quando disponível, e força o
-// Content-Type: application/json em requisições com corpo.
-async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+// Lê o refresh_token do Supabase a partir do user persistido em localStorage.
+function getStoredRefreshToken(): string | undefined {
+  try {
+    const raw = localStorage.getItem('revis_user');
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.refresh_token === 'string' ? parsed.refresh_token : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Chamado quando a sessão não pôde ser renovada (refresh_token também
+ * vencido, ou ausente). Componentes registram um handler aqui no mount
+ * para poder reagir imediatamente na UI, sem esperar um reload de página —
+ * este arquivo é código de módulo, fora do componente React, então não
+ * tem acesso direto a setUser/setAuthScreen.
+ */
+let sessionExpiredHandler: (() => void) | null = null;
+function onSessionExpired(handler: () => void) {
+  sessionExpiredHandler = handler;
+}
+
+// Evita que várias chamadas 401 simultâneas disparem várias renovações ao
+// mesmo tempo — todas esperam a MESMA promise em andamento.
+let refreshInFlight: Promise<string | null> | null = null;
+
+/**
+ * Troca o refresh_token por um access_token novo. Sessões do Supabase
+ * expiram por padrão em 1 hora; sem isto, qualquer uso do app mais longo
+ * que isso passava a devolver "Token inválido ou expirado" em tudo,
+ * exigindo logout manual — o que não é razoável pedir do usuário.
+ */
+async function refreshAccessToken(): Promise<string | null> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    try {
+      const refreshToken = getStoredRefreshToken();
+      if (!refreshToken) return null;
+      const res = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json().catch(() => null) as { access_token?: string; refresh_token?: string } | null;
+      if (!data?.access_token) return null;
+      try {
+        const raw = localStorage.getItem('revis_user');
+        const parsed = raw ? JSON.parse(raw) : {};
+        localStorage.setItem('revis_user', JSON.stringify({
+          ...parsed,
+          access_token: data.access_token,
+          refresh_token: data.refresh_token ?? refreshToken,
+        }));
+      } catch {
+        /* se não conseguir persistir, ainda assim usa o token na chamada atual */
+      }
+      return data.access_token;
+    } catch {
+      return null;
+    }
+  })();
+  const result = await refreshInFlight;
+  refreshInFlight = null;
+  return result;
+}
+
+/**
+ * Núcleo de toda chamada autenticada. Se a resposta vier 401, tenta
+ * renovar a sessão UMA vez e repete a requisição original — nem toda
+ * expiração de token deveria virar erro visível para quem está usando
+ * o app. Se a renovação também falhar, força o logout local.
+ */
+async function authenticatedFetch(path: string, init: RequestInit = {}, isRetry = false): Promise<Response> {
   const headers = new Headers(init.headers || {});
   const token = getStoredAccessToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
+  const res = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+
+  if (res.status === 401 && !isRetry) {
+    const newToken = await refreshAccessToken();
+    if (newToken) {
+      return authenticatedFetch(path, init, true);
+    }
+    try { localStorage.removeItem('revis_user'); } catch { /* ignore */ }
+    sessionExpiredHandler?.();
+  }
+  return res;
+}
+
+// Wrapper de fetch que injeta automaticamente o header
+// `Authorization: Bearer <access_token>` quando disponível, força o
+// Content-Type: application/json em requisições com corpo, e renova a
+// sessão sozinho se o token tiver vencido.
+async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers || {});
   if (init.body != null && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+  return authenticatedFetch(path, { ...init, headers });
+}
+
+/**
+ * Sobe um arquivo (CRLV, comprovante, foto) para o Storage e devolve o
+ * caminho salvo, ou null se falhar. O caminho segue sempre o padrão
+ * `{user_id}/vehicles/...` — é o que autoriza o acesso no backend.
+ */
+async function uploadFileToStorage(file: File, path: string): Promise<{ path: string | null; error: string | null }> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('path', path);
+  try {
+    const res = await authenticatedFetch('/api/storage/upload', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await res.json().catch(() => null) as { path?: string; error?: string; message?: string } | null;
+    if (!res.ok) {
+      const msg = data?.message || data?.error || `Erro ${res.status} ao enviar o arquivo.`;
+      console.error('uploadFileToStorage failed:', res.status, msg);
+      return { path: null, error: msg };
+    }
+    return { path: data?.path ?? null, error: null };
+  } catch (err) {
+    console.error('uploadFileToStorage network error:', err);
+    return { path: null, error: err instanceof Error ? err.message : 'Erro de rede ao enviar o arquivo.' };
+  }
+}
+
+/** Abre um arquivo já salvo no Storage numa nova aba, sem fechar o app. */
+async function openStorageFile(path: string): Promise<void> {
+  try {
+    const res = await apiFetch('/api/storage/signed-view', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) return;
+    const data = await res.json().catch(() => null) as { signedUrl?: string } | null;
+    if (data?.signedUrl) window.open(data.signedUrl, '_blank', 'noopener,noreferrer');
+  } catch (error) {
+    console.error('Error opening storage file:', error);
+  }
+}
+
+/** Caminho único para um novo anexo, sempre prefixado pelo dono do arquivo. */
+function newAttachmentPath(userId: string | number, segments: (string | number)[], filename: string): string {
+  const safeExt = (filename.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const uid = (crypto as any).randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return [String(userId), ...segments.map(String), `${uid}.${safeExt}`].join('/');
 }
 
 function digitsOnlyToNonNegativeInt(raw: string): number {
@@ -204,6 +337,20 @@ function LocalizedDateInput({
   ariaLabel?: string;
   locale?: string;
 }) {
+  // Resolve rótulos de acessibilidade do calendário a partir do `locale` já
+  // recebido (mesmo mecanismo usado para nomes de mês/dia via Intl). Apenas
+  // camada de exibição; não altera parsing nem navegação.
+  const localeToLang: Record<string, keyof typeof translations> = {
+    'pt-BR': 'Português (Brasil)',
+    'pt-PT': 'Português (Portugal)',
+    'en-US': 'English',
+    'es-ES': 'Español',
+  };
+  const ariaT = (key: keyof typeof translations['Português (Brasil)']): string => {
+    const lang = localeToLang[locale] ?? 'Português (Brasil)';
+    return translations[lang][key] || translations['Português (Brasil)'][key];
+  };
+
   const isoToText = (iso: string): string => {
     const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || '');
     if (!match) return '';
@@ -369,9 +516,9 @@ function LocalizedDateInput({
       <button
         type="button"
         onClick={() => setIsCalendarOpen(prev => !prev)}
-        aria-label="Abrir calendário"
+        aria-label={ariaT('calendarOpenAria')}
         aria-expanded={isCalendarOpen}
-        className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-revis-gray hover:text-revis-green transition-colors"
+        className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-[--color-revis-gray] hover:text-[#34a06a] transition-colors"
       >
         <CalendarDays className="w-4 h-4" />
       </button>
@@ -380,32 +527,32 @@ function LocalizedDateInput({
         <div
           role="dialog"
           aria-modal="false"
-          className="absolute left-0 top-full mt-2 z-50 w-[260px] max-w-[calc(100vw-2rem)] bg-revis-dark-gray border border-revis-gray/30 rounded-xl p-3 shadow-xl"
+          className="absolute left-0 top-full mt-2 z-50 w-[260px] max-w-[calc(100vw-2rem)] calendar-panel border border-white/18 rounded-xl p-3 shadow-xl"
           onClick={e => e.stopPropagation()}
         >
           <div className="flex items-center justify-between mb-3">
             <button
               type="button"
               onClick={goPrevMonth}
-              aria-label="Mês anterior"
-              className="p-1 text-revis-gray hover:text-revis-green hover:bg-revis-gray/10 rounded-md transition-colors"
+              aria-label={ariaT('calendarPrevMonthAria')}
+              className="p-1 text-[--color-revis-gray] hover:text-[#34a06a] hover:bg-white/5 rounded-md transition-colors"
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
-            <span className="text-xs font-medium text-revis-heading capitalize">
+            <span className="text-xs font-medium text-[--color-heading] font-display capitalize">
               {headerLabel}
             </span>
             <button
               type="button"
               onClick={goNextMonth}
-              aria-label="Próximo mês"
-              className="p-1 text-revis-gray hover:text-revis-green hover:bg-revis-gray/10 rounded-md transition-colors"
+              aria-label={ariaT('calendarNextMonthAria')}
+              className="p-1 text-[--color-revis-gray] hover:text-[#34a06a] hover:bg-white/5 rounded-md transition-colors"
             >
               <ChevronRight className="w-4 h-4" />
             </button>
           </div>
 
-          <div className="grid grid-cols-7 gap-1 mb-1 text-[10px] text-revis-gray text-center capitalize">
+          <div className="grid grid-cols-7 gap-1 mb-1 text-[10px] text-[--color-revis-gray] text-center capitalize">
             {weekdayLabels.map((w, idx) => (
               <span key={`${w}-${idx}`}>{w}</span>
             ))}
@@ -429,10 +576,10 @@ function LocalizedDateInput({
                   onClick={() => handleDayClick(day)}
                   className={`h-7 text-[11px] rounded-md transition-colors ${
                     isSelected
-                      ? 'bg-revis-green text-black font-bold'
+                      ? 'bg-[#34a06a] text-black font-bold'
                       : isToday
-                      ? 'bg-revis-gray/20 text-revis-heading'
-                      : 'text-revis-light-gray hover:bg-revis-gray/20'
+                      ? 'bg-white/8 text-[--color-heading] font-display'
+                      : 'text-[--color-text] hover:bg-white/8'
                   }`}
                 >
                   {day}
@@ -466,35 +613,37 @@ function chatTitleFromFirstQuestion(text: string, maxLen = 120): string {
 }
 
 /** Paths esperados: revisautoapp://checkout/return, revisautoapp://sucesso, ou query status=approved. */
-function isMercadoPagoCheckoutReturnDeepLink(url: string): boolean {
-  const u = url.trim();
-  if (!/^revisautoapp:\/\//i.test(u)) return false;
+/**
+ * Detecta o retorno do checkout do Mercado Pago na URL atual.
+ * Na versão nativa isto era um deep link `revisautoapp://checkout/return`.
+ * Na web o back_url do MP aponta para https://revisautoapp.com.br/checkout/return
+ * (ou qualquer rota com ?status=approved).
+ */
+function isMercadoPagoCheckoutReturn(url: string): boolean {
   try {
-    const parsed = new URL(u);
-    if (parsed.protocol.toLowerCase() !== 'revisautoapp:') return false;
-    const host = parsed.hostname.toLowerCase();
+    const parsed = new URL(url, window.location.origin);
     const segments = parsed.pathname
       .split('/')
       .map((s) => s.toLowerCase())
       .filter(Boolean);
-    if (host === 'sucesso' || host === 'success') return true;
-    if (host === 'checkout') {
-      if (segments.some((s) => ['return', 'sucesso', 'success'].includes(s))) return true;
+    if (
+      segments[0] === 'checkout' &&
+      segments.some((s) => ['return', 'sucesso', 'success'].includes(s))
+    ) {
+      return true;
     }
+    if (segments[0] === 'sucesso' || segments[0] === 'success') return true;
     const st = (
       parsed.searchParams.get('status') ||
       parsed.searchParams.get('payment_status') ||
+      parsed.searchParams.get('collection_status') ||
       ''
     ).toLowerCase();
     if (['approved', 'success', 'authorized'].includes(st)) return true;
+    if (parsed.searchParams.get('checkout') === 'return') return true;
   } catch {
-    /* URL() pode falhar em edge cases; usa fallback abaixo */
+    /* URL malformada — ignora */
   }
-  const base = (u.split(/[?#]/)[0] ?? u).toLowerCase();
-  if (base.includes('revisautoapp://checkout/return')) return true;
-  if (base.includes('revisautoapp://checkout/sucesso')) return true;
-  if (base.includes('revisautoapp://checkout/success')) return true;
-  if (/^revisautoapp:\/\/(sucesso|success)\/?$/i.test(base)) return true;
   return false;
 }
 
@@ -512,6 +661,9 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [drGraxaUIMode, setDrGraxaUIMode] = useState<'list' | 'chat'>('list');
   const [showDrGraxaManualModal, setShowDrGraxaManualModal] = useState(false);
+  const [showChatTrash, setShowChatTrash] = useState(false);
+  const [chatTrashSessions, setChatTrashSessions] = useState<(ChatSession & { days_until_permanent_deletion?: number })[]>([]);
+  const [chatTrashLoading, setChatTrashLoading] = useState(false);
   const [showVehicleHistory, setShowVehicleHistory] = useState(false);
   const [archivedVehicles, setArchivedVehicles] = useState<Vehicle[]>([]);
   
@@ -569,6 +721,19 @@ export default function App() {
     }
   }, []);
 
+  // Conecta o módulo de rede (fora da árvore React) ao estado do app: quando
+  // uma renovação de sessão falha de verdade (refresh_token também vencido
+  // ou ausente), volta pra tela de login com um aviso claro, em vez de
+  // deixar a pessoa presa vendo erros repetidos sem entender o motivo.
+  useEffect(() => {
+    onSessionExpired(() => {
+      setUser(null);
+      setAuthScreen('login');
+      setAuthError(t('sessionExpiredMessage'));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -591,17 +756,6 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const ok = await isBiometricHardwareAvailable();
-      if (!cancelled) setLoginBiometricOffered(ok);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const [authForm, setAuthForm] = useState({ 
     name: '', 
     nickname: '',
@@ -618,6 +772,8 @@ export default function App() {
     city: ''
   });
   const [authError, setAuthError] = useState('');
+  const [cepError, setCepError] = useState(false);
+  const [showRegisterHelp, setShowRegisterHelp] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [authLangMenuOpen, setAuthLangMenuOpen] = useState(false);
@@ -655,18 +811,29 @@ export default function App() {
   // CEP Lookup
   const handleCepBlur = async (e: React.FocusEvent<HTMLInputElement>) => {
     const cleanCep = e.target.value.replace(/\D/g, '');
-    if (authForm.country === 'Brasil (+55)' && cleanCep.length === 8) {
-      try {
-        const res = await fetch(`https://viacep.com.br/ws/${cleanCep}/json/`);
-        if (res.ok) {
-          const data = await res.json();
-          if (!data.erro) {
-            setAuthForm(prev => ({ ...prev, city: data.localidade, state: data.uf }));
-          }
+    if (authForm.country !== 'Brasil (+55)' || cleanCep.length === 0) return;
+    if (cleanCep.length !== 8) {
+      // CEP incompleto: não sabemos ainda se é inválido, só deixa os campos
+      // de cidade/estado vazios (o botão continua desabilitado por isso).
+      return;
+    }
+    try {
+      const res = await fetch(`https://viacep.com.br/ws/${cleanCep}/json/`);
+      if (res.ok) {
+        const data = await res.json();
+        if (!data.erro) {
+          setCepError(false);
+          setAuthForm(prev => ({ ...prev, city: data.localidade, state: data.uf }));
+          return;
         }
-      } catch (e) {
-        console.error("Erro ao buscar CEP", e);
       }
+      // CEP bem formado mas inexistente (ou resposta inesperada da API).
+      setCepError(true);
+      setAuthForm(prev => ({ ...prev, city: '', state: '' }));
+    } catch (err) {
+      console.error("Erro ao buscar CEP", err);
+      setCepError(true);
+      setAuthForm(prev => ({ ...prev, city: '', state: '' }));
     }
   };
 
@@ -739,11 +906,6 @@ export default function App() {
 
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const [forceUpdateStatus, setForceUpdateStatus] = useState<'checking' | 'ok' | 'blocked'>('checking');
-  const [biometricUnlockedThisSession, setBiometricUnlockedThisSession] = useState(false);
-  const bioAutoPromptConsumedRef = useRef(false);
-  const [loginBiometricOffered, setLoginBiometricOffered] = useState(false);
-  const [loginBiometricOptIn, setLoginBiometricOptIn] = useState(false);
-  const [prefsBiometricEnabled, setPrefsBiometricEnabled] = useState(false);
   const [subscriptionManageOpen, setSubscriptionManageOpen] = useState(false);
   const [subscriptionManageView, setSubscriptionManageView] = useState<'menu' | 'changePlan' | 'cancelInfo'>(
     'menu',
@@ -753,7 +915,7 @@ export default function App() {
   const [showAddFinancial, setShowAddFinancial] = useState(false);
   const [expandedCards, setExpandedCards] = useState({ mileage: false, services: false, financial: false });
   const [showAddMileage, setShowAddMileage] = useState(false);
-  const [newMileage, setNewMileage] = useState({ date: '', mileage: '', valor: '', litros: '' });
+  const [newMileage, setNewMileage] = useState({ date: '', mileage: '', valor: '', litros: '', notes: '', attachment_path: null as string | null });
   const [showMileageHelp, setShowMileageHelp] = useState(false);
   const mileageHelpRef = useRef<HTMLDivElement | null>(null);
   const [isSubmittingVehicle, setIsSubmittingVehicle] = useState(false);
@@ -823,10 +985,119 @@ export default function App() {
     setShowCancelAddVehicleConfirmation(true);
   };
 
+  /** Upload genérico de comprovante/foto usado nos 3 formulários de lançamento. */
+  const handleRecordAttachmentUpload = async (
+    file: File,
+    recordType: 'mileage' | 'maintenance' | 'financial',
+    onDone: (path: string) => void,
+  ) => {
+    if (!user || !selectedVehicle) return;
+    setIsUploadingAttachment(true);
+    try {
+      const path = newAttachmentPath(user.id, ['vehicles', selectedVehicle.id, recordType], file.name);
+      const { path: uploadedPath, error: uploadError } = await uploadFileToStorage(file, path);
+      if (!uploadedPath) {
+        setAppToast({ message: uploadError || t('attachmentUploadError'), tone: 'warning' });
+        return;
+      }
+      onDone(uploadedPath);
+      setAppToast({ message: t('attachmentUploadSuccess'), tone: 'neutral' });
+    } catch (error) {
+      console.error('Error uploading attachment:', error);
+      setAppToast({ message: t('attachmentUploadError'), tone: 'warning' });
+    } finally {
+      setIsUploadingAttachment(false);
+    }
+  };
+
+  const handleVehicleDocUploadFromHeader = async (file: File) => {
+    if (!user || !selectedVehicle) return;
+    setIsUploadingCrlv(true);
+    try {
+      const path = newAttachmentPath(user.id, ['vehicles', selectedVehicle.id], file.name.endsWith('.pdf') ? 'crlv.pdf' : file.name);
+      const { path: uploadedPath, error: uploadError } = await uploadFileToStorage(file, path);
+      if (!uploadedPath) {
+        setAppToast({ message: uploadError || t('crlvUploadError'), tone: 'warning' });
+        return;
+      }
+      const res = await apiFetch(`/api/vehicles/${selectedVehicle.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ document_path: uploadedPath }),
+      });
+      if (!res.ok) {
+        setAppToast({ message: t('crlvUploadError'), tone: 'warning' });
+        return;
+      }
+      setSelectedVehicle(prev => prev ? { ...prev, document_path: uploadedPath } : prev);
+      setVehicles(prev => prev.map(v => v.id === selectedVehicle.id ? { ...v, document_path: uploadedPath } : v));
+      setAppToast({ message: t('crlvExtractSuccess'), tone: 'neutral' });
+    } catch (error) {
+      console.error('Error uploading vehicle document:', error);
+      setAppToast({ message: t('crlvUploadError'), tone: 'warning' });
+    } finally {
+      setIsUploadingCrlv(false);
+    }
+  };
+
+  const handleExportVehicleReport = async () => {
+    if (!selectedVehicle) return;
+    setIsGeneratingReport(true);
+    try {
+      const bytes = await generateVehicleReportPdf({
+        vehicle: selectedVehicle,
+        maintenanceLogs: logs,
+        financialRecords: financialRecords,
+        dateFormat,
+        currency,
+        language,
+        labels: {
+          title: t('reportTitle'),
+          generatedOn: t('reportGeneratedOn'),
+          vehicleData: t('reportVehicleData'),
+          brand: t('brand'),
+          model: t('model'),
+          year: t('year'),
+          plate: t('plateLabel'),
+          color: t('color'),
+          currentMileage: t('reportCurrentMileage'),
+          mileageSummary: t('mileageHistory'),
+          totalRecords: t('reportTotalRecords'),
+          totalSpentFuel: t('reportTotalSpentFuel'),
+          totalLiters: t('reportTotalLiters'),
+          maintenanceSection: t('serviceHistory'),
+          maintenanceEmpty: t('reportMaintenanceEmpty'),
+          colDate: t('date'),
+          colType: t('typeLabel'),
+          colDescription: t('descriptionLabel'),
+          colProvider: t('reportColProvider'),
+          colCost: t('reportColCost'),
+          financialSection: t('financialSectionTitle'),
+          financialEmpty: t('reportFinancialEmpty'),
+          colStatus: t('statusLabel'),
+          colValue: t('reportColValue'),
+          totalSpentMaintenance: t('reportTotalSpentMaintenance'),
+          totalSpentFinancial: t('reportTotalSpentFinancial'),
+          disclaimer: t('reportDisclaimer'),
+          noColor: t('reportNoColor'),
+          noPlate: t('reportNoPlate'),
+        },
+      });
+      const safeName = `${selectedVehicle.brand}-${selectedVehicle.model}`.replace(/[^a-zA-Z0-9-]/g, '_');
+      downloadPdf(bytes, `revisauto-${safeName}.pdf`);
+      setAppToast({ message: t('reportExportSuccess'), tone: 'neutral' });
+    } catch (error) {
+      console.error('Error generating vehicle report:', error);
+      setAppToast({ message: t('reportExportError'), tone: 'warning' });
+    } finally {
+      setIsGeneratingReport(false);
+    }
+  };
+
   const handleConfirmCancelAddVehicle = () => {
     setShowCancelAddVehicleConfirmation(false);
     setShowAddVehicle(false);
     setMileageInput('');
+    setCrlvWarnings([]);
   };
   
   // Preferences State
@@ -948,25 +1219,29 @@ export default function App() {
     setChatSessionToDelete(null);
     setShowDeleteChatModal(false);
     setExpandedCards({ mileage: false, services: false, financial: false });
-    bioAutoPromptConsumedRef.current = false;
-    setBiometricUnlockedThisSession(false);
   };
 
   // Apply theme and font size
   useEffect(() => {
     const root = document.documentElement;
     if (theme === 'dark') {
-      root.classList.add('dark');
-      root.style.setProperty('--color-bg', '#181a1c');
-      root.style.setProperty('--color-text', '#c7c7c7');
-      root.style.setProperty('--color-card', '#4c4c4c');
+      root.classList.remove('theme-light');
+      root.style.setProperty('--color-bg', '#000000');
+      root.style.setProperty('--color-text', '#c9cdd1');
+      root.style.setProperty('--color-card', 'rgba(255,255,255,0.07)');
       root.style.setProperty('--color-heading', '#ffffff');
+      root.style.setProperty('--color-border', 'rgba(255,255,255,0.12)');
+      root.style.setProperty('--color-input', 'rgba(255,255,255,0.06)');
+      root.style.setProperty('--glass-bg', 'rgba(255,255,255,0.08)');
     } else {
-      root.classList.remove('dark');
-      root.style.setProperty('--color-bg', '#f3f4f6'); // gray-100
-      root.style.setProperty('--color-text', '#000000'); // black for better visibility
-      root.style.setProperty('--color-card', '#ffffff');
-      root.style.setProperty('--color-heading', '#000000'); // black
+      root.classList.add('theme-light');
+      root.style.setProperty('--color-bg', '#eef1f0');
+      root.style.setProperty('--color-text', '#374151');
+      root.style.setProperty('--color-card', 'rgba(255,255,255,0.55)');
+      root.style.setProperty('--color-heading', '#0b0c0d');
+      root.style.setProperty('--color-border', 'rgba(0,0,0,0.10)');
+      root.style.setProperty('--color-input', 'rgba(255,255,255,0.72)');
+      root.style.setProperty('--glass-bg', 'rgba(255,255,255,0.52)');
     }
 
     // Font size scaling
@@ -991,35 +1266,6 @@ export default function App() {
   const vehicleLimit = maxVehiclesForPlan(user?.plan);
   const atVehicleLimit = vehicles.length >= vehicleLimit;
 
-  useEffect(() => {
-    if (activeTab !== 'preferences') return;
-    void getBiometricUnlockEnabled().then(setPrefsBiometricEnabled);
-  }, [activeTab]);
-
-  useEffect(() => {
-    if (forceUpdateStatus !== 'ok') return;
-    if (authScreen !== 'app' || !user) {
-      bioAutoPromptConsumedRef.current = false;
-      setBiometricUnlockedThisSession(false);
-      return;
-    }
-    if (!isNativeCapacitorApp() || !readBiometricEnabledSyncFromStorage()) {
-      setBiometricUnlockedThisSession(true);
-      return;
-    }
-    if (biometricUnlockedThisSession) return;
-    if (bioAutoPromptConsumedRef.current) return;
-    bioAutoPromptConsumedRef.current = true;
-    void (async () => {
-      try {
-        await promptBiometricUnlock(t('biometricPromptReason'), 'RevisAuto');
-        setBiometricUnlockedThisSession(true);
-      } catch {
-        bioAutoPromptConsumedRef.current = false;
-      }
-    })();
-  }, [forceUpdateStatus, authScreen, user?.id, biometricUnlockedThisSession, t]);
-
   const toggleDateFilters = () => {
     setShowDateFilters(prev => !prev);
   };
@@ -1042,23 +1288,33 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDown);
   }, [authLangMenuOpen]);
 
-  const renderAuthLanguageSelector = () => (
-    <div className="absolute top-6 left-6 z-20" ref={authLangRef}>
+  const renderAuthLanguageSelector = (align: 'left' | 'right' = 'right') => (
+    <div className="relative" ref={authLangRef}>
       <div className="relative">
         <button
           type="button"
           onClick={() => setAuthLangMenuOpen((o) => !o)}
-          className="px-4 py-2 rounded-full bg-revis-dark-gray text-revis-green hover:bg-revis-gray/20 transition-colors flex items-center gap-2 text-xs font-bold"
+          className="px-3 py-1.5 rounded-full transition-colors flex items-center gap-1.5 text-xs"
+          style={
+            theme === 'light'
+              ? { background: 'rgba(255,255,255,0.85)', border: '1px solid rgba(255,255,255,0.6)', color: '#1f7a4d' }
+              : { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.13)', color: '#34a06a' }
+          }
           aria-expanded={authLangMenuOpen}
           aria-label={t('language')}
           aria-haspopup="listbox"
         >
-          <Globe className="w-4 h-4 shrink-0" />
-          <span>{t('languageLabel')}</span>
+          <Globe className="w-3.5 h-3.5 shrink-0" />
+          <span>{authLangOptions.find(o => o.value === language)?.code ?? t('languageLabel')}</span>
         </button>
         {authLangMenuOpen && (
           <div
-            className="absolute left-0 mt-2 min-w-[7.5rem] rounded-xl border border-revis-dark-gray/80 bg-revis-black py-1 shadow-lg"
+            className={`absolute ${align === 'left' ? 'left-0' : 'right-0'} mt-2 min-w-[7.5rem] rounded-xl py-1 shadow-lg z-30`}
+            style={
+              theme === 'light'
+                ? { background: 'rgba(255,255,255,0.94)', border: '1px solid rgba(0,0,0,0.10)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)' }
+                : { background: 'rgba(10,12,14,0.92)', border: '1px solid rgba(255,255,255,0.13)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)' }
+            }
             role="listbox"
           >
             {authLangOptions.map((opt) => (
@@ -1071,8 +1327,8 @@ export default function App() {
                   setLanguage(opt.value);
                   setAuthLangMenuOpen(false);
                 }}
-                className={`flex w-full items-center px-4 py-2 text-left text-xs font-semibold tracking-wide transition-colors hover:bg-revis-dark-gray ${
-                  language === opt.value ? 'text-revis-green' : 'text-revis-light-gray'
+                className={`flex w-full items-center px-4 py-2 text-left text-xs font-semibold tracking-wide transition-colors hover:glass ${
+                  language === opt.value ? 'text-[#34a06a]' : 'text-[--color-text]'
                 }`}
               >
                 {opt.code}
@@ -1085,6 +1341,135 @@ export default function App() {
   );
 
   type TransKey = keyof typeof translations['Português (Brasil)'];
+
+  // Helpers de exibição: traduzem apenas o LABEL mostrado ao usuário.
+  // Os valores internos (value dos selects, estado e payloads de API) continuam
+  // sendo os originais em português ("Carro", "Imposto", "Pago", "Amarelo"...).
+  const labelFromMap = (map: Record<string, TransKey>, value: string | null | undefined): string => {
+    if (value == null || value === '') return '';
+    const key = map[value];
+    return key ? t(key) : value;
+  };
+
+  const SPECIAL_OPTION_LABEL_KEYS: Record<string, TransKey> = {
+    Nenhum: 'optionNone',
+    Outro: 'optionOther',
+    Outra: 'optionOtherFem',
+    Customizado: 'optionCustom',
+  };
+  const VEHICLE_TYPE_LABEL_KEYS: Record<string, TransKey> = {
+    Carro: 'vehicleTypeCar',
+    Moto: 'vehicleTypeMoto',
+    Bike: 'eBikeTypeLabel',
+  };
+  const FINANCIAL_TYPE_LABEL_KEYS: Record<string, TransKey> = {
+    Imposto: 'financialTypeImposto',
+    Multa: 'financialTypeMulta',
+    Taxa: 'financialTypeTaxa',
+  };
+  const MAINTENANCE_TYPE_LABEL_KEYS: Record<string, TransKey> = {
+    Limpeza: 'maintenanceTypeLimpeza',
+    'Mecânica': 'maintenanceTypeMecanica',
+    'Documentação': 'maintenanceTypeDocumentacao',
+  };
+  const FINANCIAL_STATUS_LABEL_KEYS: Record<string, TransKey> = {
+    Pago: 'financialStatusPago',
+    'Em aberto': 'financialStatusEmAberto',
+    Atrasado: 'financialStatusAtrasado',
+  };
+  const COLOR_LABEL_KEYS: Record<string, TransKey> = {
+    Amarelo: 'colorAmarelo',
+    Azul: 'colorAzul',
+    'Azul Marinho': 'colorAzulMarinho',
+    Bege: 'colorBege',
+    'Bordô': 'colorBordo',
+    Branco: 'colorBranco',
+    Bronze: 'colorBronze',
+    Cinza: 'colorCinza',
+    Cobre: 'colorCobre',
+    Dourado: 'colorDourado',
+    Laranja: 'colorLaranja',
+    Marrom: 'colorMarrom',
+    Prata: 'colorPrata',
+    Preto: 'colorPreto',
+    Rosa: 'colorRosa',
+    Roxo: 'colorRoxo',
+    Verde: 'colorVerde',
+    'Verde Escuro': 'colorVerdeEscuro',
+    'Verde Lima': 'colorVerdeLima',
+    Vermelho: 'colorVermelho',
+    Vinho: 'colorVinho',
+    Violeta: 'colorVioleta',
+    Customizado: 'optionCustom',
+    Outra: 'optionOtherFem',
+  };
+  const COUNTRY_LABEL_KEYS: Record<string, TransKey> = {
+    'Brasil (+55)': 'countryBrasil',
+    'Estados Unidos (+1)': 'countryEstadosUnidos',
+    'Portugal (+351)': 'countryPortugal',
+    'Argentina (+54)': 'countryArgentina',
+    'Uruguai (+598)': 'countryUruguai',
+    'Paraguai (+595)': 'countryParaguai',
+    'Chile (+56)': 'countryChile',
+    'Reino Unido (+44)': 'countryReinoUnido',
+    'França (+33)': 'countryFranca',
+    'Alemanha (+49)': 'countryAlemanha',
+    'Itália (+39)': 'countryItalia',
+    'Espanha (+34)': 'countryEspanha',
+    'Japão (+81)': 'countryJapao',
+    'China (+86)': 'countryChina',
+    'Canadá (+1)': 'countryCanada',
+    'Austrália (+61)': 'countryAustralia',
+  };
+  const CURRENCY_LABEL_KEYS: Record<string, TransKey> = {
+    BRL: 'currencyBRL',
+    USD: 'currencyUSD',
+    EUR: 'currencyEUR',
+    GBP: 'currencyGBP',
+    CAD: 'currencyCAD',
+    AUD: 'currencyAUD',
+    CHF: 'currencyCHF',
+    JPY: 'currencyJPY',
+    CNY: 'currencyCNY',
+    KRW: 'currencyKRW',
+    INR: 'currencyINR',
+    ARS: 'currencyARS',
+    CLP: 'currencyCLP',
+    COP: 'currencyCOP',
+    MXN: 'currencyMXN',
+    UYU: 'currencyUYU',
+    PEN: 'currencyPEN',
+    PYG: 'currencyPYG',
+    BOB: 'currencyBOB',
+    VES: 'currencyVES',
+    ZAR: 'currencyZAR',
+    TRY: 'currencyTRY',
+    RUB: 'currencyRUB',
+    PLN: 'currencyPLN',
+    SEK: 'currencySEK',
+    NOK: 'currencyNOK',
+    DKK: 'currencyDKK',
+    AED: 'currencyAED',
+    ILS: 'currencyILS',
+    SGD: 'currencySGD',
+  };
+  const FONT_SIZE_LABEL_KEYS: TransKey[] = [
+    'fontSizeVerySmall',
+    'fontSizeSmall',
+    'fontSizeNormal',
+    'fontSizeLarge',
+    'fontSizeVeryLarge',
+  ];
+
+  const optionLabel = (value: string) => labelFromMap(SPECIAL_OPTION_LABEL_KEYS, value);
+  const vehicleTypeLabel = (value: string) => labelFromMap(VEHICLE_TYPE_LABEL_KEYS, value);
+  const financialTypeLabel = (value: string) => labelFromMap(FINANCIAL_TYPE_LABEL_KEYS, value);
+  const maintenanceTypeLabel = (value: string) => labelFromMap(MAINTENANCE_TYPE_LABEL_KEYS, value);
+  const financialStatusLabel = (value: string) => labelFromMap(FINANCIAL_STATUS_LABEL_KEYS, value);
+  const colorLabel = (value: string) => labelFromMap(COLOR_LABEL_KEYS, value);
+  const countryLabel = (value: string) => labelFromMap(COUNTRY_LABEL_KEYS, value);
+  const currencyLabel = (value: string) => labelFromMap(CURRENCY_LABEL_KEYS, value);
+  const mileageNotesLabel = (notes: string) => (notes === 'Registro inicial' ? t('initialMileageRecord') : notes);
 
   const mapAuthErrorMessage = (raw: string | undefined): string => {
     if (raw == null || !String(raw).trim()) return t('serverError');
@@ -1128,9 +1513,15 @@ export default function App() {
     return t('serverError');
   };
 
-  // Mapeador inteligente: lê details (Supabase/Postgres) e message (app),
+  // Mapeador inteligente: lê details (Supabase/Postgres), message e error code,
   // traduz para uma mensagem amigável e localizada.
-  const mapAuthError = (errorData: { details?: unknown; message?: unknown } | null | undefined): string => {
+  // Para códigos com details específico do Supabase (REGISTER_AUTH_FAILED,
+  // REGISTER_PROFILE_SAVE_FAILED, LOGIN_PROFILE_LOAD_FAILED, RESET_UPDATE_FAILED),
+  // mapApiErrorCode retorna '' e o fluxo continua no substring matching abaixo.
+  const mapAuthError = (errorData: { details?: unknown; message?: unknown; error?: unknown } | null | undefined): string => {
+    const fromCode = mapApiErrorCode(errorData?.error);
+    if (fromCode) return fromCode;
+
     const details = typeof errorData?.details === 'string' ? errorData.details : '';
     const message = typeof errorData?.message === 'string' ? errorData.message : '';
     const haystack = `${details}\n${message}`.toLowerCase();
@@ -1171,6 +1562,55 @@ export default function App() {
     return message || details || t('serverError');
   };
 
+  // Mapeia códigos UPPER_SNAKE_CASE do backend para mensagens traduzidas.
+  // Retorna string vazia se o código não for reconhecido, preservando o fallback
+  // original (data.text / data.message) na cadeia de chamada.
+  const mapApiErrorCode = (code: unknown): string => {
+    const API_ERROR_MAP: Partial<Record<string, TransKey>> = {
+      // Chat IA / Checkout (etapa anterior)
+      ADVISOR_FEATURE_REQUIRES_PLUS: 'errorAdvisorRequiresPlus',
+      AI_LIMIT_REACHED:              'errorAiLimitReached',
+      AI_SERVICE_UNAVAILABLE:        'errorAiServiceUnavailable',
+      AI_SERVICE_ERROR:              'errorAiServiceError',
+      AI_EMPTY_RESPONSE:             'errorAiEmptyResponse',
+      AI_EMPTY_MESSAGE:              'errorAiEmptyMessage',
+      CHECKOUT_MP_NOT_CONFIGURED:    'errorCheckoutNotConfigured',
+      CHECKOUT_EMAIL_REQUIRED:       'errorCheckoutEmailRequired',
+      CHECKOUT_BACKURL_MISSING:      'errorCheckoutBackurlMissing',
+      CHECKOUT_NO_INIT_POINT:        'errorCheckoutNoInitPoint',
+      CHECKOUT_FAILED:               'errorCheckoutFailed',
+      // Middleware de autenticação
+      AUTH_TOKEN_MISSING:            'errorAuthTokenMissing',
+      AUTH_TOKEN_INVALID:            'errorAuthTokenInvalid',
+      AUTH_TOKEN_VALIDATION_FAILED:  'errorAuthTokenValidationFailed',
+      // Registro
+      REGISTER_MISSING_FIELDS:       'errorRegisterMissingFields',
+      REGISTER_NO_ID:                'errorRegisterNoId',
+      REGISTER_FAILED:               'errorRegisterFailed',
+      // REGISTER_AUTH_FAILED e REGISTER_PROFILE_SAVE_FAILED: omitidos
+      // intencionalmente — details do Supabase tratado por substring matching.
+      // Login
+      LOGIN_MISSING_CREDENTIALS:     'errorLoginMissingCredentials',
+      LOGIN_EMAIL_NOT_CONFIRMED:     'emailNotConfirmed',
+      LOGIN_INVALID_CREDENTIALS:     'invalidCredentials',
+      LOGIN_SESSION_MISSING:         'errorLoginSessionMissing',
+      LOGIN_PROFILE_NOT_FOUND:       'profileNotFound',
+      LOGIN_FAILED:                  'errorLoginFailed',
+      // Rate limiting (login, recuperação de senha, chat)
+      RATE_LIMITED:                  'errorRateLimited',
+      // LOGIN_PROFILE_LOAD_FAILED: omitido — details do Supabase tem prioridade.
+      // Recuperação / reset
+      RECOVER_EMAIL_REQUIRED:        'errorRecoverEmailRequired',
+      RESET_INVALID_DATA:            'errorResetInvalidData',
+      RESET_TOKEN_INVALID:           'errorResetTokenInvalid',
+      RESET_FAILED:                  'errorResetFailed',
+      // RESET_UPDATE_FAILED: omitido — message é updErr.message variável do Supabase.
+    };
+    if (typeof code !== 'string' || !code) return '';
+    const key = API_ERROR_MAP[code];
+    return key ? t(key) : '';
+  };
+
   const MONTHS = React.useMemo(() => {
     const keys: TransKey[] = [
       'monthJan', 'monthFeb', 'monthMar', 'monthApr', 'monthMay', 'monthJun',
@@ -1207,6 +1647,7 @@ export default function App() {
 
       if (!res.ok || !data?.init_point) {
         const message =
+          mapApiErrorCode(data?.error) ||
           (data && typeof data.message === 'string' && data.message) ||
           t('checkoutRequestFailed');
         throw new Error(message);
@@ -1223,7 +1664,7 @@ export default function App() {
           : e?.message && String(e.message).trim()
             ? e.message
             : t('checkoutRequestFailed');
-      alert(msg);
+      setAppToast({ message: msg, tone: 'warning' });
       setCheckoutLoadingPlan(null);
     } finally {
       window.clearTimeout(timeoutId);
@@ -1237,11 +1678,17 @@ export default function App() {
     model: '',
     year: new Date().getFullYear(),
     current_mileage: 0,
-    last_service_date: new Date().toISOString().split('T')[0]
+    last_service_date: new Date().toISOString().split('T')[0],
+    plate: '',
+    document_path: null,
   }));
   const [customBrand, setCustomBrand] = useState('');
   const [customModel, setCustomModel] = useState('');
   const [mileageInput, setMileageInput] = useState('');
+  const [isUploadingCrlv, setIsUploadingCrlv] = useState(false);
+  const [crlvWarnings, setCrlvWarnings] = useState<string[]>([]);
+  const [isUploadingAttachment, setIsUploadingAttachment] = useState(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
   // New Log State
   const [newLog, setNewLog] = useState<Partial<MaintenanceLog>>(() => ({
@@ -1249,7 +1696,8 @@ export default function App() {
     description: '',
     date: new Date().toISOString().split('T')[0],
     cost: 0,
-    provider: ''
+    provider: '',
+    notes: ''
   }));
 
   // New Financial Record State
@@ -1585,13 +2033,15 @@ export default function App() {
       mileage: formatted,
       valor: stringifyDecimal(log.valor),
       litros: stringifyDecimal(log.litros),
+      notes: log.notes && log.notes !== 'Registro inicial' ? log.notes : '',
+      attachment_path: log.attachment_path ?? null,
     });
     setShowAddMileage(true);
   };
   const closeMileageModal = () => {
     setShowAddMileage(false);
     setEditingMileageLogId(null);
-    setNewMileage({ date: '', mileage: '', valor: '', litros: '' });
+    setNewMileage({ date: '', mileage: '', valor: '', litros: '', notes: '', attachment_path: null });
   };
 
   const openCreateLog = () => {
@@ -1614,6 +2064,7 @@ export default function App() {
       cost: log.cost,
       provider: log.provider ?? '',
       photo_path: log.photo_path,
+      notes: log.notes ?? '',
     });
     setShowAddLog(true);
   };
@@ -1682,9 +2133,13 @@ export default function App() {
       const res = await apiFetch(`/api/user`);
       if (res.ok) {
         const data = await res.json();
-        // Preserva o access_token (a rota /api/user não retorna token).
+        // Preserva access_token e refresh_token lendo do localStorage (não do
+        // estado React, que pode estar desatualizado se uma renovação
+        // silenciosa aconteceu entre o disparo desta chamada e sua resposta).
         setUser(prev => {
-          const merged = { ...data, access_token: prev?.access_token };
+          const freshAccessToken = getStoredAccessToken() ?? prev?.access_token;
+          const freshRefreshToken = getStoredRefreshToken() ?? prev?.refresh_token;
+          const merged = { ...data, access_token: freshAccessToken, refresh_token: freshRefreshToken };
           localStorage.setItem('revis_user', JSON.stringify(merged));
           return merged;
         });
@@ -1700,7 +2155,7 @@ export default function App() {
       const res = await apiFetch(`/api/vehicles`);
       if (!res.ok) {
         console.error("Failed to fetch vehicles", res.status);
-        alert(t('errorLoadingData'));
+        setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
         return;
       }
       const raw = await res.json();
@@ -1709,7 +2164,7 @@ export default function App() {
       setArchivedVehicles(data.filter(v => v.status === 'archived'));
     } catch (e) {
       console.error("Failed to fetch vehicles", e);
-      alert(t('errorLoadingData'));
+      setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
     }
     // Don't auto-select first vehicle on mobile to keep dashboard clean
   };
@@ -1719,33 +2174,29 @@ export default function App() {
   fetchUserRef.current = fetchUser;
   fetchVehiclesRef.current = fetchVehicles;
 
+  // Retorno do checkout do Mercado Pago: na web chega como navegação normal
+  // para o back_url configurado (ex.: /checkout/return), e não como deep link.
   useEffect(() => {
-    if (!isNativeCapacitorApp()) return;
-    let cancelled = false;
-    const sub = CapacitorApp.addListener('appUrlOpen', ({ url }) => {
-      if (cancelled || !url) return;
-      if (!isMercadoPagoCheckoutReturnDeepLink(url)) return;
-      if (!getStoredAccessToken()) return;
-      void fetchUserRef.current();
-      void fetchVehiclesRef.current();
-      setAuthScreen('app');
-      setActiveTab('menu');
-      setSubscriptionManageView('menu');
-      setShowUpgradeModal(true);
-      const langKey = language as keyof typeof translations;
-      const message =
-        translations[langKey]?.toastCheckoutDeepLinkReturn ??
-        translations['Português (Brasil)'].toastCheckoutDeepLinkReturn;
-      setAppToast({
-        message,
-        tone: 'neutral',
-      });
-    });
-    return () => {
-      cancelled = true;
-      void sub.then((handle) => void handle.remove());
-    };
-  }, [language]);
+    if (!isMercadoPagoCheckoutReturn(window.location.href)) return;
+    if (!getStoredAccessToken()) return;
+
+    void fetchUserRef.current();
+    void fetchVehiclesRef.current();
+    setAuthScreen('app');
+    setActiveTab('menu');
+    setSubscriptionManageView('menu');
+    setShowUpgradeModal(true);
+
+    const langKey = language as keyof typeof translations;
+    const message =
+      translations[langKey]?.toastCheckoutDeepLinkReturn ??
+      translations['Português (Brasil)'].toastCheckoutDeepLinkReturn;
+    setAppToast({ message, tone: 'neutral' });
+
+    // Limpa a URL para que um refresh não repita o fluxo.
+    window.history.replaceState({}, '', '/');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const confirmArchiveVehicle = async () => {
     if (!selectedVehicle) return;
@@ -1757,7 +2208,7 @@ export default function App() {
       
       if (!res.ok) {
         console.error("Failed to archive vehicle", res.status);
-        alert(t('errorSavingData'));
+        setAppToast({ message: t('errorSavingData'), tone: 'warning' });
         return;
       }
       const updatedVehicle = await res.json();
@@ -1768,7 +2219,7 @@ export default function App() {
       setShowDeleteVehicleModal(false);
     } catch (e) {
       console.error("Failed to archive vehicle", e);
-      alert(t('errorSavingData'));
+      setAppToast({ message: t('errorSavingData'), tone: 'warning' });
     }
   };
 
@@ -1777,14 +2228,14 @@ export default function App() {
       const res = await apiFetch(`/api/vehicles/${vehicleId}/logs`);
       if (!res.ok) {
         console.error("Failed to fetch logs", res.status);
-        alert(t('errorLoadingData'));
+        setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
         return;
       }
       const raw = await res.json();
       setLogs(Array.isArray(raw) ? raw : []);
     } catch (e) {
       console.error("Failed to fetch logs", e);
-      alert(t('errorLoadingData'));
+      setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
     }
   };
 
@@ -1793,7 +2244,7 @@ export default function App() {
       const res = await apiFetch(`/api/vehicles/${vehicleId}/mileage`);
       if (!res.ok) {
         console.error("Failed to fetch mileage logs", res.status);
-        alert(t('errorLoadingData'));
+        setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
         return;
       }
       const raw = await res.json();
@@ -1802,7 +2253,7 @@ export default function App() {
       setVehicles(prev => prev.map(v => v.id === vehicleId ? { ...v, mileage_history: history } : v));
     } catch (e) {
       console.error("Failed to fetch mileage logs", e);
-      alert(t('errorLoadingData'));
+      setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
     }
   };
 
@@ -1811,14 +2262,14 @@ export default function App() {
       const res = await apiFetch(`/api/vehicles/${vehicleId}/financial`);
       if (!res.ok) {
         console.error("Failed to fetch financial records", res.status);
-        alert(t('errorLoadingData'));
+        setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
         return;
       }
       const raw = await res.json();
       setFinancialRecords(Array.isArray(raw) ? raw : []);
     } catch (e) {
       console.error("Failed to fetch financial records", e);
-      alert(t('errorLoadingData'));
+      setAppToast({ message: t('errorLoadingData'), tone: 'warning' });
     }
   };
 
@@ -1843,6 +2294,7 @@ export default function App() {
       // (shape antigo) ou de session.access_token (shape novo do backend).
       const accessToken: string | undefined =
         data.user?.access_token ?? data.session?.access_token;
+      const refreshToken: string | undefined = data.session?.refresh_token;
 
       if (!accessToken) {
         console.error('🚨 Login retornou sem access_token:', data);
@@ -1850,15 +2302,10 @@ export default function App() {
         return;
       }
 
-      const userToStore = { ...data.user, access_token: accessToken };
+      const userToStore = { ...data.user, access_token: accessToken, refresh_token: refreshToken };
       setUser(userToStore);
       localStorage.setItem('revis_user', JSON.stringify(userToStore));
       setAuthScreen('app');
-      if (loginBiometricOptIn && isNativeCapacitorApp()) {
-        const hw = await isBiometricHardwareAvailable();
-        await setBiometricUnlockEnabled(hw);
-      }
-      setLoginBiometricOptIn(false);
       fetchVehicles();
     } catch (err: any) {
       console.error('Erro detalhado no login (rede/JS):', err);
@@ -1991,7 +2438,7 @@ export default function App() {
     if (!selectedVehicle) return;
     const mileage = parseInt(String(newMileage.mileage).replace(/\D/g, ''));
     if (Number.isNaN(mileage)) {
-      alert(t('errorSavingData'));
+      setAppToast({ message: t('errorSavingData'), tone: 'warning' });
       return;
     }
     const valor = parseLocaleDecimal(newMileage.valor || '', language);
@@ -2006,11 +2453,18 @@ export default function App() {
 
       const res = await apiFetch(url, {
         method: isEdit ? 'PUT' : 'POST',
-        body: JSON.stringify({ mileage, date: newMileage.date, valor, litros })
+        body: JSON.stringify({
+          mileage,
+          date: newMileage.date,
+          valor,
+          litros,
+          notes: newMileage.notes || null,
+          attachment_path: newMileage.attachment_path,
+        })
       });
       if (!res.ok) {
         console.error('Error saving mileage:', res.status, await res.text().catch(() => ''));
-        alert(t('errorSavingData'));
+        setAppToast({ message: t('errorSavingData'), tone: 'warning' });
         return;
       }
 
@@ -2022,10 +2476,10 @@ export default function App() {
 
       setShowAddMileage(false);
       setEditingMileageLogId(null);
-      setNewMileage({ date: '', mileage: '', valor: '', litros: '' });
+      setNewMileage({ date: '', mileage: '', valor: '', litros: '', notes: '', attachment_path: null });
     } catch (error) {
       console.error('Error saving mileage:', error);
-      alert(t('errorSavingData'));
+      setAppToast({ message: t('errorSavingData'), tone: 'warning' });
     } finally {
       setIsSubmittingMileage(false);
     }
@@ -2041,7 +2495,7 @@ export default function App() {
       });
       if (!res.ok) {
         console.error('Error deleting mileage:', res.status, await res.text().catch(() => ''));
-        alert(t('errorDeletingData'));
+        setAppToast({ message: t('errorDeletingData'), tone: 'warning' });
         return;
       }
       await fetchMileageLogs(selectedVehicle.id);
@@ -2049,10 +2503,10 @@ export default function App() {
       await fetchVehicles();
       setShowAddMileage(false);
       setEditingMileageLogId(null);
-      setNewMileage({ date: '', mileage: '', valor: '', litros: '' });
+      setNewMileage({ date: '', mileage: '', valor: '', litros: '', notes: '', attachment_path: null });
     } catch (error) {
       console.error('Error deleting mileage:', error);
-      alert(t('errorDeletingData'));
+      setAppToast({ message: t('errorDeletingData'), tone: 'warning' });
     } finally {
       setIsDeletingRecord(false);
     }
@@ -2118,7 +2572,7 @@ export default function App() {
         if (limitReached) {
           setAppToast({ message: t('toastVehicleLimitReached'), tone: 'warning' });
         } else {
-          alert(apiMsg || t('errorSavingData'));
+          setAppToast({ message: apiMsg || t('errorSavingData'), tone: 'warning' });
         }
         return;
       }
@@ -2155,7 +2609,7 @@ export default function App() {
     } catch (e) {
       console.error('Failed to add/update vehicle', e);
       const msg = e instanceof Error && e.message.trim() ? e.message.trim() : '';
-      alert(msg || t('errorSavingData'));
+      setAppToast({ message: msg || t('errorSavingData'), tone: 'warning' });
     } finally {
       setIsSubmittingVehicle(false);
     }
@@ -2171,10 +2625,127 @@ export default function App() {
   const getModelList = () => {
     if (newVehicle.brand === 'Outra') return [];
     let models: string[] = [];
-    if (newVehicle.type === 'Carro') models = CAR_MODELS[newVehicle.brand] || [];
-    if (newVehicle.type === 'Moto') models = MOTO_MODELS[newVehicle.brand] || [];
-    if (newVehicle.type === 'Bike') models = EBIKE_MODELS[newVehicle.brand] || [];
+    const brand = newVehicle.brand ?? '';
+    if (newVehicle.type === 'Carro') models = CAR_MODELS[brand] || [];
+    if (newVehicle.type === 'Moto') models = MOTO_MODELS[brand] || [];
+    if (newVehicle.type === 'Bike') models = EBIKE_MODELS[brand] || [];
     return models.sort();
+  };
+
+  /** Compara ignorando maiúsculas/acentos — o Gemini às vezes devolve "Chevrolet" e nossa lista tem "CHEVROLET". */
+  const looseMatch = (value: string, options: readonly string[]): string | null => {
+    const norm = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    const target = norm(value);
+    return options.find(opt => norm(opt) === target) ?? null;
+  };
+
+  const handleCrlvUpload = async (file: File) => {
+    if (!user) return;
+    setIsUploadingCrlv(true);
+    setCrlvWarnings([]);
+    try {
+      const scope = isEditingVehicle && selectedVehicle ? String(selectedVehicle.id) : 'pending';
+      const path = newAttachmentPath(user.id, ['vehicles', scope], file.name.endsWith('.pdf') ? 'crlv.pdf' : file.name);
+
+      const { path: uploadedPath, error: uploadError } = await uploadFileToStorage(file, path);
+      if (!uploadedPath) {
+        setAppToast({ message: uploadError || t('crlvUploadError'), tone: 'warning' });
+        return;
+      }
+      setNewVehicle(prev => ({ ...prev, document_path: uploadedPath }));
+
+      const res = await apiFetch('/api/vehicles/crlv/extract', {
+        method: 'POST',
+        body: JSON.stringify({ path: uploadedPath }),
+      });
+      if (!res.ok) {
+        setAppToast({ message: t('crlvExtractError'), tone: 'warning' });
+        return;
+      }
+      const extracted = await res.json().catch(() => ({})) as {
+        plate?: string | null;
+        brand?: string | null;
+        model?: string | null;
+        year?: number | null;
+        color?: string | null;
+        not_found?: string[];
+      };
+
+      const warnings: string[] = [];
+      const patch: Partial<Vehicle> = {};
+
+      if (extracted.plate) {
+        patch.plate = extracted.plate.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      } else {
+        warnings.push(t('crlvFieldPlate'));
+      }
+
+      if (extracted.year && extracted.year >= 1950 && extracted.year <= new Date().getFullYear() + 1) {
+        patch.year = extracted.year;
+      } else {
+        warnings.push(t('crlvFieldYear'));
+      }
+
+      if (extracted.brand) {
+        const brandList = getBrandList();
+        const matchedBrand = looseMatch(extracted.brand, brandList);
+        if (matchedBrand) {
+          patch.brand = matchedBrand;
+          setCustomBrand('');
+        } else {
+          patch.brand = 'Outra';
+          setCustomBrand(extracted.brand.replace(/[^a-zA-Z ]/g, ''));
+          warnings.push(t('crlvFieldBrandNotListed'));
+        }
+      } else {
+        warnings.push(t('crlvFieldBrand'));
+      }
+
+      if (extracted.model) {
+        // Marca precisa estar resolvida para checar a lista de modelos certa.
+        const modelsForBrand = patch.brand && patch.brand !== 'Outra'
+          ? (newVehicle.type === 'Carro' ? CAR_MODELS[patch.brand] : newVehicle.type === 'Moto' ? MOTO_MODELS[patch.brand] : EBIKE_MODELS[patch.brand]) || []
+          : [];
+        const matchedModel = looseMatch(extracted.model, modelsForBrand);
+        if (matchedModel) {
+          patch.model = matchedModel;
+          setCustomModel('');
+        } else {
+          patch.model = patch.brand === 'Outra' ? undefined : 'Outro';
+          setCustomModel(extracted.model.replace(/[^a-zA-Z0-9 ]/g, ''));
+          if (patch.brand === 'Outra') patch.model = 'Outro';
+          warnings.push(t('crlvFieldModelNotListed'));
+        }
+      } else {
+        warnings.push(t('crlvFieldModel'));
+      }
+
+      if (extracted.color && isPlusOrPremium(user?.plan)) {
+        const matchedColor = looseMatch(extracted.color, VEHICLE_COLORS || []);
+        if (matchedColor) {
+          setNewVehicle(prev => ({ ...prev, ...patch, color: matchedColor }));
+        } else {
+          setCustomColor(extracted.color.replace(/[^a-zA-Z ]/g, ''));
+          setNewVehicle(prev => ({ ...prev, ...patch, color: 'Customizado' }));
+        }
+      } else {
+        setNewVehicle(prev => ({ ...prev, ...patch }));
+      }
+
+      if (extracted.not_found?.length) {
+        warnings.push(...extracted.not_found);
+      }
+      setCrlvWarnings(warnings);
+      setAppToast({
+        message: warnings.length ? t('crlvExtractPartial') : t('crlvExtractSuccess'),
+        tone: warnings.length ? 'warning' : 'neutral',
+      });
+    } catch (error) {
+      console.error('Error processing CRLV:', error);
+      setAppToast({ message: t('crlvExtractError'), tone: 'warning' });
+    } finally {
+      setIsUploadingCrlv(false);
+    }
   };
 
   const handleAddLog = async (e: React.FormEvent) => {
@@ -2194,7 +2765,7 @@ export default function App() {
       );
       if (!res.ok) {
         console.error('Failed to save log', res.status, await res.text().catch(() => ''));
-        alert(t('errorSavingData'));
+        setAppToast({ message: t('errorSavingData'), tone: 'warning' });
         return;
       }
       setShowAddLog(false);
@@ -2202,7 +2773,7 @@ export default function App() {
       fetchLogs(selectedVehicle.id);
     } catch (err) {
       console.error('Failed to save log', err);
-      alert(t('errorSavingData'));
+      setAppToast({ message: t('errorSavingData'), tone: 'warning' });
     } finally {
       setIsSubmittingLog(false);
     }
@@ -2218,7 +2789,7 @@ export default function App() {
       });
       if (!res.ok) {
         console.error('Failed to delete log', res.status, await res.text().catch(() => ''));
-        alert(t('errorDeletingData'));
+        setAppToast({ message: t('errorDeletingData'), tone: 'warning' });
         return;
       }
       await fetchLogs(selectedVehicle.id);
@@ -2226,7 +2797,7 @@ export default function App() {
       setEditingMaintenanceLogId(null);
     } catch (err) {
       console.error('Failed to delete log', err);
-      alert(t('errorDeletingData'));
+      setAppToast({ message: t('errorDeletingData'), tone: 'warning' });
     } finally {
       setIsDeletingRecord(false);
     }
@@ -2249,7 +2820,7 @@ export default function App() {
       );
       if (!res.ok) {
         console.error('Failed to save financial record', res.status, await res.text().catch(() => ''));
-        alert(t('errorSavingData'));
+        setAppToast({ message: t('errorSavingData'), tone: 'warning' });
         return;
       }
       setShowAddFinancial(false);
@@ -2257,7 +2828,7 @@ export default function App() {
       fetchFinancialRecords(selectedVehicle.id);
     } catch (err) {
       console.error('Failed to save financial record', err);
-      alert(t('errorSavingData'));
+      setAppToast({ message: t('errorSavingData'), tone: 'warning' });
     } finally {
       setIsSubmittingFinancial(false);
     }
@@ -2273,7 +2844,7 @@ export default function App() {
       });
       if (!res.ok) {
         console.error('Failed to delete financial record', res.status, await res.text().catch(() => ''));
-        alert(t('errorDeletingData'));
+        setAppToast({ message: t('errorDeletingData'), tone: 'warning' });
         return;
       }
       await fetchFinancialRecords(selectedVehicle.id);
@@ -2281,7 +2852,7 @@ export default function App() {
       setEditingFinancialRecordId(null);
     } catch (err) {
       console.error('Failed to delete financial record', err);
-      alert(t('errorDeletingData'));
+      setAppToast({ message: t('errorDeletingData'), tone: 'warning' });
     } finally {
       setIsDeletingRecord(false);
     }
@@ -2322,6 +2893,46 @@ export default function App() {
       }
     } catch (error) {
       console.error("Error deleting chat session:", error);
+    }
+  };
+
+  const fetchChatTrash = async () => {
+    if (!user) return;
+    setChatTrashLoading(true);
+    try {
+      const res = await apiFetch(`/api/chat/sessions/trash`);
+      if (res.ok) {
+        const raw = await res.json();
+        setChatTrashSessions(Array.isArray(raw) ? raw : []);
+      }
+    } catch (error) {
+      console.error("Error fetching chat trash:", error);
+    } finally {
+      setChatTrashLoading(false);
+    }
+  };
+
+  const restoreChatSession = async (sessionId: number) => {
+    try {
+      const res = await apiFetch(`/api/chat/sessions/${sessionId}/restore`, { method: 'POST' });
+      if (res.ok) {
+        setChatTrashSessions(prev => prev.filter(s => s.id !== sessionId));
+        void fetchChatSessions();
+        setAppToast({ message: t('chatTrashRestored'), tone: 'neutral' });
+      }
+    } catch (error) {
+      console.error("Error restoring chat session:", error);
+    }
+  };
+
+  const permanentlyDeleteChatSession = async (sessionId: number) => {
+    try {
+      const res = await apiFetch(`/api/chat/sessions/${sessionId}/permanent`, { method: 'DELETE' });
+      if (res.ok) {
+        setChatTrashSessions(prev => prev.filter(s => s.id !== sessionId));
+      }
+    } catch (error) {
+      console.error("Error permanently deleting chat session:", error);
     }
   };
 
@@ -2400,7 +3011,7 @@ export default function App() {
 
       if (!sessionId) {
         setAiPrompt(userMessageText);
-        alert(t('aiConnectionError'));
+        setAppToast({ message: t('aiConnectionError'), tone: 'warning' });
         return;
       }
 
@@ -2427,12 +3038,14 @@ export default function App() {
         body: JSON.stringify({
           message: userMessageText,
           vehicleId: selectedVehicle?.id,
+          session_id: sessionId,
         })
       });
 
       const data = await response.json().catch(() => ({}) as Record<string, unknown>);
       if (!response.ok) {
         const msg =
+          mapApiErrorCode(data.error) ||
           (typeof data.text === 'string' && data.text) ||
           (typeof data.message === 'string' && data.message) ||
           t('aiConnectionError');
@@ -2490,7 +3103,7 @@ export default function App() {
         setChatMessages(prev => [...prev, errorMsg]);
       } else {
         setAiPrompt(userMessageText);
-        alert(t('aiConnectionError'));
+        setAppToast({ message: t('aiConnectionError'), tone: 'warning' });
       }
     } finally {
       setIsLoadingAi(false);
@@ -2515,133 +3128,258 @@ export default function App() {
   }, [user, activeTab]);
 
   const getHealthStatus = (vehicle: Vehicle) => {
-    if (vehicle.current_mileage > 100000) return 'text-revis-alert-critical';
-    if (vehicle.current_mileage > 50000) return 'text-revis-alert-medium';
-    return 'text-revis-green';
+    if (vehicle.current_mileage > 100000) return 'text-[#e0473f]';
+    if (vehicle.current_mileage > 50000) return 'text-[#ffcc00]';
+    return 'text-[#34a06a]';
   };
 
   // Footer Component
-  const Footer = () => (
+  // showHelp: exibe o link "Precisa de ajuda?" — usado só nas telas de criação
+  // de conta (cadastro, termos, preferências de onboarding), onde o usuário
+  // ainda não tem acesso ao menu Suporte do app autenticado.
+  const Footer = ({ showHelp = false }: { showHelp?: boolean } = {}) => (
     <div className="mt-8 py-6 text-center border-t border-revis-dark-gray/50">
-      <p className="text-xs text-revis-gray font-medium">{t('footerCopyright')}</p>
-      <p className="text-xs text-revis-green mt-1">suporte@revisautoapp.com.br</p>
+      {showHelp && (
+        <div className="mb-4">
+          <button
+            type="button"
+            onClick={() => setShowRegisterHelp(v => !v)}
+            className="text-xs text-[--color-revis-gray] underline decoration-dotted underline-offset-2 hover:text-[#34a06a] transition-colors"
+          >
+            {t('needHelp')}
+          </button>
+          {showRegisterHelp && (
+            <div className="mt-3 max-w-xs mx-auto glass rounded-xl border border-[--color-border] p-2 flex flex-col gap-1">
+              <a
+                href="mailto:dev@revisautoapp.com.br"
+                className="flex items-center justify-center gap-2 text-sm font-medium text-[--color-text] py-2 rounded-lg hover:bg-white/5 hover:text-[#34a06a] transition-colors"
+              >
+                <Mail className="w-4 h-4" />
+                {t('supportEmail')}
+              </a>
+              <a
+                href="https://wa.me/5511918540985"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-center gap-2 text-sm font-medium text-[--color-text] py-2 rounded-lg hover:bg-white/5 hover:text-[#25D366] transition-colors"
+              >
+                <WhatsAppIcon className="w-4 h-4 text-[#25D366]" />
+                {t('supportWhatsapp')}
+              </a>
+            </div>
+          )}
+        </div>
+      )}
+      <p className="text-xs text-[--color-revis-gray] font-medium">{t('footerCopyright')}</p>
+      <p className="text-xs text-[#34a06a] mt-1">dev@revisautoapp.com.br</p>
     </div>
-  ); 
+  );
 
   // Mobile View Renderers
   const renderLogin = () => (
-    <div className="flex flex-col min-h-screen p-6 bg-revis-black relative">
-      {renderAuthLanguageSelector()}
-      <button
-        onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-        className="absolute top-6 right-6 px-4 py-2 rounded-full bg-revis-dark-gray text-revis-green hover:bg-revis-gray/20 transition-colors flex items-center gap-2 text-xs font-bold"
-      >
-        <span>{t('authTheme')}</span>
-        <Paintbrush className="w-4 h-4" />
-      </button>
-      <div className="w-full max-w-md mx-auto my-auto flex flex-col">
-        <div className="mb-8 text-center">
-          <div className="bg-revis-green p-3 rounded-2xl inline-block mb-4">
-            <Wrench className="w-8 h-8 text-black" />
-          </div>
-          <h1 className="text-2xl font-bold tracking-tight mb-2">
-            <span className="text-revis-gray">Revis</span>
-            <span className="text-revis-green">Auto</span>
-          </h1>
-        </div>
+    <div className="relative min-h-screen w-full overflow-hidden bg-black">
 
-        <form onSubmit={handleLogin} className="space-y-4" autoComplete="off">
-          <div>
-            <label className="block text-xs text-revis-gray mb-1">{t('email')}</label>
-            <input
-              type="email"
-              required
-              autoComplete="email"
-              className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
-              value={authForm.email}
-              onChange={e => setAuthForm({...authForm, email: e.target.value})}
-            />
-          </div>
-          <div>
-            <label className="block text-xs text-revis-gray mb-1">{t('password')}</label>
-            <div className="relative">
-              <input
-                type={showPassword ? "text" : "password"}
-                required
-                autoComplete="current-password"
-                className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors pr-12"
-                value={authForm.password}
-                onChange={e => setAuthForm({...authForm, password: e.target.value})}
-              />
-              <button 
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-4 top-1/2 -translate-y-1/2 text-revis-gray"
-              >
-                {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-              </button>
-            </div>
-          </div>
+      {/* Imagem de fundo full-bleed */}
+      <div
+        className="absolute inset-0 bg-cover bg-center bg-no-repeat"
+        style={{ backgroundImage: "url('/login-bg.jpg')" }}
+        aria-hidden="true"
+      />
 
-          {/* O botão 'Esqueci minha senha' agora está livre e visível */}
-          <div className="flex justify-end mt-1">
+      {/* Overlay escuro gradiente: mais denso nos cantos, transparente no centro */}
+      <div
+        className="absolute inset-0"
+        style={{
+          background: 'linear-gradient(to right, rgba(0,0,0,0.72) 0%, rgba(0,0,0,0.38) 48%, rgba(0,0,0,0.68) 100%)',
+        }}
+        aria-hidden="true"
+      />
+
+      {/* Conteúdo sobre o overlay */}
+      <div className="relative z-10 min-h-screen flex flex-col">
+
+        {/* Header: logo + seletores */}
+        <div className="flex items-center justify-between px-8 pt-7 pb-4">
+          <span className="font-display font-semibold text-xl tracking-tight select-none">
+            <span className="text-white">Revis</span>
+            <span className="text-[#34a06a]">Auto</span>
+          </span>
+          <div className="flex items-center gap-3">
+            {renderAuthLanguageSelector('right')}
             <button
-              type="button"
-              onClick={() => { setAuthError(''); setRecoverEmail(authForm.email); setRecoverError(''); setRecoverMessage(''); setAuthScreen('recover'); }}
-              className="text-revis-green text-sm font-bold hover:underline"
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              className="px-3 py-1.5 rounded-full transition-colors flex items-center gap-1.5 text-xs"
+              style={
+                theme === 'light'
+                  ? { background: 'rgba(255,255,255,0.85)', border: '1px solid rgba(255,255,255,0.6)', color: '#1f7a4d' }
+                  : { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.13)', color: '#34a06a' }
+              }
             >
-              {t('forgotPassword')}
+              <Paintbrush className="w-3.5 h-3.5" />
+              <span>{t('authTheme')}</span>
             </button>
           </div>
-
-          {authError && <p className="text-revis-alert-critical text-sm text-center mt-4">{authError}</p>}
-
-          {loginBiometricOffered && (
-            <label className="flex items-center gap-3 mt-4 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={loginBiometricOptIn}
-                onChange={(e) => setLoginBiometricOptIn(e.target.checked)}
-                className="accent-revis-green w-4 h-4 rounded"
-              />
-              <span className="text-xs text-revis-gray leading-snug">{t('biometricLoginOptIn')}</span>
-            </label>
-          )}
-
-          <button type="submit" className="w-full mt-6 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm">
-            {t('loginButton')}
-          </button>
-        </form>
-
-        <div className="mt-8 text-center">
-          <p className="text-revis-gray text-sm">{t('noAccount')}</p>
-          <button onClick={() => { setAuthError(''); setAuthScreen('register'); }} className="text-revis-green font-bold mt-1">
-            {t('registerTitle')}
-          </button>
         </div>
+
+        {/* Layout principal: headline esquerda + formulário direita */}
+        <div className="flex-1 flex items-center justify-between px-8 md:px-14 pb-10 gap-8">
+
+          {/* Headline — visível apenas em desktop */}
+          <div className="hidden md:flex flex-col justify-end pb-4 flex-1 max-w-md">
+            <h1 className="font-display text-4xl font-semibold text-white leading-tight tracking-tight mb-3"
+              style={{ textShadow: '0 2px 24px rgba(0,0,0,0.6)' }}
+            >
+              {t('loginHeroTitle')}
+            </h1>
+            <p className="text-[#c9cdd1] text-base leading-relaxed"
+              style={{ textShadow: '0 1px 12px rgba(0,0,0,0.7)' }}
+            >
+              {t('loginHeroSubtitle')}
+            </p>
+          </div>
+
+          {/* Formulário glass — cores mudam de verdade com o tema (a foto de fundo continua escura) */}
+          <div className="w-full max-w-sm md:max-w-[380px] flex-shrink-0">
+            <div
+              className="rounded-2xl p-8"
+              style={
+                theme === 'light'
+                  ? {
+                      background: 'rgba(255,255,255,0.92)',
+                      backdropFilter: 'blur(40px) saturate(180%)',
+                      WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+                      border: '1px solid rgba(255,255,255,0.6)',
+                      boxShadow: '0 24px 64px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.9)',
+                    }
+                  : {
+                      background: 'rgba(18,20,22,0.82)',
+                      backdropFilter: 'blur(40px) saturate(180%)',
+                      WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+                      border: '1px solid rgba(255,255,255,0.10)',
+                      boxShadow: '0 24px 64px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.08)',
+                    }
+              }
+            >
+              <h2 className={`font-display text-2xl font-semibold tracking-tight mb-7 ${theme === 'light' ? 'text-[#0b0c0d]' : 'text-white'}`}>
+                {t('welcomeBack')}
+              </h2>
+
+              <form onSubmit={handleLogin} className="space-y-4" autoComplete="off">
+                <div>
+                  <label className={`block mb-1.5 text-[11px] font-medium tracking-[0.07em] uppercase ${theme === 'light' ? 'text-[#6b7280]' : 'text-[--color-revis-gray]'}`}>{t('email')}</label>
+                  <input
+                    type="email"
+                    required
+                    autoComplete="email"
+                    placeholder="voce@email.com"
+                    className="w-full px-4 py-3 text-sm rounded-[10px] outline-none transition-colors"
+                    style={
+                      theme === 'light'
+                        ? { background: 'rgba(0,0,0,0.04)', border: '1px solid rgba(0,0,0,0.10)', color: '#0b0c0d' }
+                        : { background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)', color: '#ffffff' }
+                    }
+                    value={authForm.email}
+                    onChange={e => setAuthForm({...authForm, email: e.target.value})}
+                  />
+                </div>
+
+                <div>
+                  <label className={`block mb-1.5 text-[11px] font-medium tracking-[0.07em] uppercase ${theme === 'light' ? 'text-[#6b7280]' : 'text-[--color-revis-gray]'}`}>{t('password')}</label>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      required
+                      autoComplete="current-password"
+                      placeholder="••••••••"
+                      className="w-full px-4 py-3 text-sm pr-12 rounded-[10px] outline-none transition-colors"
+                      style={
+                        theme === 'light'
+                          ? { background: 'rgba(0,0,0,0.04)', border: '1px solid rgba(0,0,0,0.10)', color: '#0b0c0d' }
+                          : { background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)', color: '#ffffff' }
+                      }
+                      value={authForm.password}
+                      onChange={e => setAuthForm({...authForm, password: e.target.value})}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className={`absolute right-3.5 top-1/2 -translate-y-1/2 transition-colors ${theme === 'light' ? 'text-[#6b7280] hover:text-[#0b0c0d]' : 'text-[#9aa0a8] hover:text-white'}`}
+                      aria-label={showPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                    >
+                      {showPassword ? <EyeOff className="w-4.5 h-4.5" /> : <Eye className="w-4.5 h-4.5" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => { setAuthError(''); setRecoverEmail(authForm.email); setRecoverError(''); setRecoverMessage(''); setAuthScreen('recover'); }}
+                    className="text-[#34a06a] text-sm hover:text-[#2d8f5d] transition-colors"
+                  >
+                    {t('forgotPassword')}
+                  </button>
+                </div>
+
+                {authError && (
+                  <p className="text-[#e0473f] text-sm text-center py-2 px-3 rounded-lg bg-[#e0473f]/10 border border-[#e0473f]/20">
+                    {authError}
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  className="btn-primary w-full mt-2 py-3"
+                >
+                  {t('loginButton')}
+                </button>
+              </form>
+
+              <p className={`mt-6 text-center text-sm ${theme === 'light' ? 'text-[#6b7280]' : 'text-[#9aa0a8]'}`}>
+                {t('noAccount')}{' '}
+                <button
+                  onClick={() => { setAuthError(''); setAuthScreen('register'); }}
+                  className="text-[#34a06a] font-medium hover:text-[#2d8f5d] transition-colors"
+                >
+                  {t('registerTitle')}
+                </button>
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Mobile: headline abaixo do formulário */}
+        <div className="md:hidden px-8 pb-10">
+          <h1 className="font-display text-2xl font-semibold text-white leading-tight tracking-tight mb-2">
+            {t('loginHeroTitle')}
+          </h1>
+          <p className="text-[#c9cdd1] text-sm leading-relaxed">
+            {t('loginHeroSubtitle')}
+          </p>
+        </div>
+
       </div>
-      <Footer />
     </div>
   );
 
   const renderRecover = () => (
-    <div className="flex flex-col min-h-screen p-6 bg-revis-black">
+    <div className="flex flex-col min-h-screen p-6 bg-black">
       <div className="w-full max-w-md mx-auto my-auto flex flex-col">
         <div className="mb-8 text-center">
-          <div className="bg-revis-dark-gray p-3 rounded-2xl inline-block mb-4">
-            <Wrench className="w-8 h-8 text-revis-green" />
+          <div className="glass p-3 rounded-2xl inline-block mb-4">
+            <Wrench className="w-8 h-8 text-[#34a06a]" />
           </div>
-          <h1 className="text-xl font-bold text-revis-heading mb-1">{t('forgotPassword')}</h1>
-          <p className="text-sm text-revis-gray">{t('recoverInstructions')}</p>
+          <h1 className="text-xl font-bold text-[--color-heading] font-display mb-1">{t('forgotPassword')}</h1>
+          <p className="text-sm text-[--color-revis-gray]">{t('recoverInstructions')}</p>
         </div>
 
         {recoverMessage ? (
-          <div className="bg-revis-green/10 border border-revis-green rounded-xl p-4 text-center">
-            <Check className="w-8 h-8 text-revis-green mx-auto mb-2" />
-            <p className="text-revis-green text-sm font-medium">{recoverMessage}</p>
+          <div className="bg-[#34a06a]/10 border border-[#34a06a] rounded-xl p-4 text-center">
+            <Check className="w-8 h-8 text-[#34a06a] mx-auto mb-2" />
+            <p className="text-[#34a06a] text-sm font-medium">{recoverMessage}</p>
             <button
               onClick={() => { setAuthScreen('login'); setRecoverMessage(''); }}
-              className="mt-4 text-xs text-revis-gray hover:text-revis-green transition-colors"
+              className="mt-4 text-xs text-[--color-revis-gray] hover:text-[#34a06a] transition-colors"
             >
               {t('backToLogin')}
             </button>
@@ -2649,24 +3387,24 @@ export default function App() {
         ) : (
           <form onSubmit={handleRecoverPassword} className="space-y-4">
             <div>
-              <label className="block text-xs text-revis-gray mb-1">{t('email')}</label>
+              <label className="block text-xs text-[--color-revis-gray] mb-1">{t('email')}</label>
               <input
                 type="email"
                 required
                 autoComplete="email"
-                className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                 value={recoverEmail}
                 onChange={e => setRecoverEmail(e.target.value)}
                 placeholder={t('placeholderEmailExample')}
               />
             </div>
 
-            {recoverError && <p className="text-revis-alert-critical text-sm text-center">{recoverError}</p>}
+            {recoverError && <p className="text-[#e0473f] text-sm text-center">{recoverError}</p>}
 
             <button
               type="submit"
               disabled={recoverLoading}
-              className="w-full bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm disabled:opacity-60"
+              className="w-full bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm disabled:opacity-60"
             >
               {recoverLoading ? t('sending') : t('sendRecoveryLink')}
             </button>
@@ -2676,7 +3414,7 @@ export default function App() {
         <div className="mt-6 text-center">
           <button
             onClick={() => { setAuthScreen('login'); setRecoverError(''); setRecoverMessage(''); }}
-            className="text-revis-gray text-sm hover:text-revis-green transition-colors flex items-center gap-1 mx-auto"
+            className="text-[--color-revis-gray] text-sm hover:text-[#34a06a] transition-colors flex items-center gap-1 mx-auto"
           >
             <ChevronLeft className="w-4 h-4" />
             {t('back')}
@@ -2688,52 +3426,52 @@ export default function App() {
   );
 
   const renderResetPassword = () => (
-    <div className="flex flex-col min-h-screen p-6 bg-revis-black">
+    <div className="flex flex-col min-h-screen p-6 bg-black">
       <div className="w-full max-w-md mx-auto my-auto flex flex-col">
         <div className="mb-8 text-center">
-          <div className="bg-revis-dark-gray p-3 rounded-2xl inline-block mb-4">
-            <Shield className="w-8 h-8 text-revis-green" />
+          <div className="glass p-3 rounded-2xl inline-block mb-4">
+            <Shield className="w-8 h-8 text-[#34a06a]" />
           </div>
-          <h1 className="text-xl font-bold text-revis-heading mb-1">{t('newPassword')}</h1>
-          <p className="text-sm text-revis-gray">{t('resetPasswordIntro')}</p>
+          <h1 className="text-xl font-bold text-[--color-heading] font-display mb-1">{t('newPassword')}</h1>
+          <p className="text-sm text-[--color-revis-gray]">{t('resetPasswordIntro')}</p>
         </div>
 
         {resetMessage ? (
-          <div className="bg-revis-green/10 border border-revis-green rounded-xl p-4 text-center">
-            <Check className="w-8 h-8 text-revis-green mx-auto mb-2" />
-            <p className="text-revis-green text-sm font-medium">{resetMessage}</p>
+          <div className="bg-[#34a06a]/10 border border-[#34a06a] rounded-xl p-4 text-center">
+            <Check className="w-8 h-8 text-[#34a06a] mx-auto mb-2" />
+            <p className="text-[#34a06a] text-sm font-medium">{resetMessage}</p>
           </div>
         ) : (
           <form onSubmit={handleResetPassword} className="space-y-4">
             <div>
-              <label className="block text-xs text-revis-gray mb-1">{t('newPasswordLabel')}</label>
+              <label className="block text-xs text-[--color-revis-gray] mb-1">{t('newPasswordLabel')}</label>
               <input
                 type="password"
                 required
-                className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                 value={resetPassword}
                 onChange={e => setResetPassword(e.target.value)}
                 placeholder={t('placeholderPasswordMask')}
               />
             </div>
             <div>
-              <label className="block text-xs text-revis-gray mb-1">{t('confirmPassword')}</label>
+              <label className="block text-xs text-[--color-revis-gray] mb-1">{t('confirmPassword')}</label>
               <input
                 type="password"
                 required
-                className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                 value={resetConfirmPassword}
                 onChange={e => setResetConfirmPassword(e.target.value)}
                 placeholder={t('placeholderPasswordMask')}
               />
             </div>
 
-            {resetError && <p className="text-revis-alert-critical text-sm text-center">{resetError}</p>}
+            {resetError && <p className="text-[#e0473f] text-sm text-center">{resetError}</p>}
 
             <button
               type="submit"
               disabled={resetLoading}
-              className="w-full bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm disabled:opacity-60"
+              className="w-full bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm disabled:opacity-60"
             >
               {resetLoading ? t('saving') : t('saveNewPassword')}
             </button>
@@ -2745,19 +3483,34 @@ export default function App() {
   );
 
   const renderRegister = () => (
-    <div className="flex flex-col min-h-screen p-6 bg-revis-black relative">
-      {renderAuthLanguageSelector()}
+    <div className="flex flex-col min-h-screen p-6 bg-black relative">
+      <div className="absolute top-6 left-6 z-20 flex items-center gap-3">
+        {renderAuthLanguageSelector('left')}
+        <button
+          type="button"
+          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          className="px-3 py-1.5 rounded-full transition-colors flex items-center gap-1.5 text-xs"
+          style={
+            theme === 'light'
+              ? { background: 'rgba(255,255,255,0.85)', border: '1px solid rgba(255,255,255,0.6)', color: '#1f7a4d' }
+              : { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.13)', color: '#34a06a' }
+          }
+        >
+          <Paintbrush className="w-3.5 h-3.5" />
+          <span>{t('authTheme')}</span>
+        </button>
+      </div>
       <div className="w-full max-w-md mx-auto my-auto flex flex-col">
-      <h1 className="text-xl font-bold text-revis-heading mb-6 mt-2">{t('registerTitle')}</h1>
+      <h1 className="text-xl font-bold text-[--color-heading] font-display mb-6 mt-2">{t('registerTitle')}</h1>
 
       <form onSubmit={handleRegister} className="space-y-5 flex-1" autoComplete="off">
         {/* 1. Nome Completo */}
         <div>
-          <label className="block text-xs text-revis-gray mb-1">{t('name')}*</label>
+          <label className="block text-xs text-[--color-revis-gray] mb-1">{t('name')}*</label>
           <input 
             required
             autoComplete="name"
-            className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+            className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
             value={authForm.name}
             onChange={e => setAuthForm({...authForm, name: e.target.value})}
           />
@@ -2765,80 +3518,49 @@ export default function App() {
 
         {/* 2. Como quer ser chamado */}
         <div>
-          <label className="block text-xs text-revis-gray mb-1">{t('nickname')}</label>
+          <label className="block text-xs text-[--color-revis-gray] mb-1">{t('nickname')}</label>
           <input 
             autoComplete="username"
-            className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+            className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
             value={authForm.nickname}
             onChange={e => setAuthForm({...authForm, nickname: e.target.value})}
           />
           {!validateNickname(authForm.nickname) && authForm.nickname.length > 0 && (
-             <p className="text-xs text-revis-alert-critical mt-1 ml-1">{t('nicknameNotAllowed')}</p>
+             <p className="text-xs text-[#e0473f] mt-1 ml-1">{t('nicknameNotAllowed')}</p>
           )}
         </div>
 
         {/* 3. E-mail */}
         <div>
-          <label className="block text-xs text-revis-gray mb-1">{t('email')}*</label>
+          <label className="block text-xs text-[--color-revis-gray] mb-1">{t('email')}*</label>
           <input 
             type="email"
             required
             autoComplete="email"
-            className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+            className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
             value={authForm.email}
             onChange={e => setAuthForm({...authForm, email: e.target.value})}
           />
-          <p className="text-[10px] text-revis-gray mt-1 ml-1">{t('registerEmailHint')}</p>
+          <p className="text-[10px] text-[--color-revis-gray] mt-1 ml-1">{t('registerEmailHint')}</p>
         </div>
 
         {/* 4. Data de Nascimento */}
         <div>
-          <label className="block text-xs text-revis-gray mb-1">{t('birthDate')}*</label>
+          <label className="block text-xs text-[--color-revis-gray] mb-1">{t('birthDate')}*</label>
           <div className="grid grid-cols-3 gap-2">
-            <select 
-              required
-              className="bg-revis-dark-gray rounded-xl p-3 text-sm text-revis-light-gray outline-none appearance-none"
-              value={authForm.birthDay}
-              onChange={e => setAuthForm({...authForm, birthDay: e.target.value})}
-            >
-              <option value="">{t('labelDay')}</option>
-              {DAYS.map(d => <option key={d} value={d}>{d}</option>)}
-            </select>
-            <select 
-              required
-              className="bg-revis-dark-gray rounded-xl p-3 text-sm text-revis-light-gray outline-none appearance-none"
-              value={authForm.birthMonth}
-              onChange={e => setAuthForm({...authForm, birthMonth: e.target.value})}
-            >
-              <option value="">{t('labelMonth')}</option>
-              {MONTHS.map(m => <option key={m.val} value={m.val}>{m.label}</option>)}
-            </select>
-            <select 
-              required
-              className="bg-revis-dark-gray rounded-xl p-3 text-sm text-revis-light-gray outline-none appearance-none"
-              value={authForm.birthYear}
-              onChange={e => setAuthForm({...authForm, birthYear: e.target.value})}
-            >
-              <option value="">{t('labelYear')}</option>
-              {YEARS.map(y => <option key={y} value={y}>{y}</option>)}
-            </select>
+            <CustomSelect required value={authForm.birthDay} onChange={v=>setAuthForm({...authForm,birthDay:v})} options={[{value:'',label:t('labelDay')},...DAYS.map(d=>({value:d,label:d}))]} placeholder={t('labelDay')} />
+            <CustomSelect required value={authForm.birthMonth} onChange={v=>setAuthForm({...authForm,birthMonth:v})} options={[{value:'',label:t('labelMonth')},...MONTHS.map(m=>({value:m.val,label:m.label}))]} placeholder={t('labelMonth')} />
+            <CustomSelect required value={authForm.birthYear} onChange={v=>setAuthForm({...authForm,birthYear:v})} options={[{value:'',label:t('labelYear')},...YEARS.map(y=>({value:y,label:y}))]} placeholder={t('labelYear')} />
           </div>
           {!isAgeValid() && authForm.birthYear && (
-             <p className="text-xs text-revis-alert-critical mt-1 ml-1">{t('ageRequirement18')}</p>
+             <p className="text-xs text-[#e0473f] mt-1 ml-1">{t('ageRequirement18')}</p>
           )}
         </div>
 
         {/* 5. País */}
         <div>
-          <label className="block text-xs text-revis-gray mb-1">{t('country')}*</label>
-          <select 
-            required
-            className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none appearance-none"
-            value={authForm.country}
-            onChange={e => setAuthForm({...authForm, country: e.target.value})}
-          >
-            {COUNTRIES.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
+          <label className="block text-xs text-[--color-revis-gray] mb-1">{t('country')}*</label>
+          <CustomSelect required value={authForm.country} onChange={v=>setAuthForm({...authForm,country:v})} options={COUNTRIES.map(c=>({value:c,label:countryLabel(c)}))} />
         </div>
 
         {/* 5.1 / 5.2 Condicionais */}
@@ -2846,27 +3568,31 @@ export default function App() {
           <>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-revis-gray mb-1">{t('zipCode')}*</label>
+                <label className="block text-xs text-[--color-revis-gray] mb-1">{t('zipCode')}*</label>
                 <input 
                   required
                   placeholder={t('placeholderCepMask')}
                   maxLength={9}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                   value={authForm.zip_code}
                   onChange={e => {
                     const val = e.target.value.replace(/\D/g, '').replace(/^(\d{5})(\d)/, '$1-$2');
+                    setCepError(false);
                     setAuthForm({...authForm, zip_code: val});
                   }}
                   onBlur={handleCepBlur}
                 />
+                {cepError && (
+                  <p className="text-xs text-[#e0473f] mt-1 ml-1">{t('cepNotFound')}</p>
+                )}
               </div>
               <div>
-                <label className="block text-xs text-revis-gray mb-1">{t('phone')}*</label>
-                <input 
+                <label className="block text-xs text-[--color-revis-gray] mb-1">{t('phone')}*</label>
+                <input
                   required
                   placeholder={t('placeholderPhoneBrMask')}
                   maxLength={15}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                   value={authForm.phone}
                   onChange={e => {
                     let val = e.target.value.replace(/\D/g, '');
@@ -2876,22 +3602,25 @@ export default function App() {
                     setAuthForm({...authForm, phone: val});
                   }}
                 />
+                {authForm.phone.replace(/\D/g, '').length >= 10 && !validatePhone(authForm.phone) && (
+                  <p className="text-xs text-[#e0473f] mt-1 ml-1">{t('invalidMobileBr')}</p>
+                )}
               </div>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-revis-gray mb-1">{t('city')}</label>
+                <label className="block text-xs text-[--color-revis-gray] mb-1">{t('city')}</label>
                 <input 
                   readOnly
-                  className="w-full bg-revis-dark-gray/50 border border-transparent rounded-xl p-3 text-sm text-revis-gray outline-none cursor-not-allowed"
+                  className="w-full glass opacity-70 border border-transparent rounded-xl p-3 text-sm text-[--color-revis-gray] outline-none cursor-not-allowed"
                   value={authForm.city}
                 />
               </div>
               <div>
-                <label className="block text-xs text-revis-gray mb-1">{t('state')}</label>
+                <label className="block text-xs text-[--color-revis-gray] mb-1">{t('state')}</label>
                 <input 
                   readOnly
-                  className="w-full bg-revis-dark-gray/50 border border-transparent rounded-xl p-3 text-sm text-revis-gray outline-none cursor-not-allowed"
+                  className="w-full glass opacity-70 border border-transparent rounded-xl p-3 text-sm text-[--color-revis-gray] outline-none cursor-not-allowed"
                   value={authForm.state}
                 />
               </div>
@@ -2900,9 +3629,9 @@ export default function App() {
         ) : (
           <>
             <div>
-              <label className="block text-xs text-revis-gray mb-1">{t('phone')}</label>
+              <label className="block text-xs text-[--color-revis-gray] mb-1">{t('phone')}</label>
               <input 
-                className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                 value={authForm.phone}
                 onChange={e => {
                   const val = e.target.value.replace(/[^0-9()]/g, '');
@@ -2910,15 +3639,15 @@ export default function App() {
                 }}
               />
               {authForm.country === 'Brasil (+55)' && authForm.phone.length >= 10 && !validatePhone(authForm.phone) && (
-                 <p className="text-xs text-revis-alert-critical mt-1 ml-1">{t('invalidMobileBr')}</p>
+                 <p className="text-xs text-[#e0473f] mt-1 ml-1">{t('invalidMobileBr')}</p>
               )}
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-revis-gray mb-1">{t('city')}</label>
+                <label className="block text-xs text-[--color-revis-gray] mb-1">{t('city')}</label>
                 <input 
                   maxLength={25}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                   value={authForm.city}
                   onChange={e => {
                     const val = e.target.value.replace(/[^a-zA-Z\u00C0-\u00FF ]/g, '');
@@ -2927,10 +3656,10 @@ export default function App() {
                 />
               </div>
               <div>
-                <label className="block text-xs text-revis-gray mb-1">{t('state')}</label>
+                <label className="block text-xs text-[--color-revis-gray] mb-1">{t('state')}</label>
                 <input 
                   maxLength={25}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors"
                   value={authForm.state}
                   onChange={e => {
                     const val = e.target.value.replace(/[^a-zA-Z\u00C0-\u00FF ]/g, '');
@@ -2944,21 +3673,21 @@ export default function App() {
 
         {/* 6. Senha */}
         <div>
-          <label className="block text-xs text-revis-gray mb-1">{t('password')}*</label>
+          <label className="block text-xs text-[--color-revis-gray] mb-1">{t('password')}*</label>
           <div className="relative">
             <input 
               type={showPassword ? "text" : "password"}
               required
               autoComplete="new-password"
               maxLength={20}
-              className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors pr-12"
+              className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors pr-12"
               value={authForm.password}
               onChange={e => setAuthForm({...authForm, password: e.target.value})}
             />
             <button 
               type="button"
               onClick={() => setShowPassword(!showPassword)}
-              className="absolute right-4 top-1/2 -translate-y-1/2 text-revis-gray"
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-[--color-revis-gray]"
             >
               {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
             </button>
@@ -2974,11 +3703,11 @@ export default function App() {
             ].map((req, i) => (
               <div key={i} className="flex items-center gap-1.5">
                 {req.valid ? (
-                  <Check className="w-3 h-3 text-revis-green" />
+                  <Check className="w-3 h-3 text-[#34a06a]" />
                 ) : (
                   <div className="w-3 h-3 rounded-full border border-revis-gray" />
                 )}
-                <span className={`text-[10px] ${req.valid ? 'text-revis-green' : 'text-revis-gray'}`}>
+                <span className={`text-[10px] ${req.valid ? 'text-[#34a06a]' : 'text-[--color-revis-gray]'}`}>
                   {req.label}
                 </span>
               </div>
@@ -2988,16 +3717,16 @@ export default function App() {
 
         {/* 7. Repetir Senha */}
         <div>
-          <label className="block text-xs text-revis-gray mb-1">{t('confirmPassword')}*</label>
+          <label className="block text-xs text-[--color-revis-gray] mb-1">{t('confirmPassword')}*</label>
           <div className="relative">
             <input 
               type={showConfirmPassword ? "text" : "password"}
               required
               autoComplete="new-password"
-              className={`w-full bg-revis-dark-gray border rounded-xl p-3 text-sm text-revis-light-gray outline-none transition-colors pr-12 ${
+              className={`w-full glass border rounded-xl p-3 text-sm text-[--color-text] outline-none transition-colors pr-12 ${
                 authForm.confirmPassword && authForm.password !== authForm.confirmPassword 
                   ? 'border-revis-alert-critical focus:border-revis-alert-critical' 
-                  : 'border-transparent focus:border-revis-green'
+                  : 'border-transparent focus:border-[#34a06a]'
               }`}
               value={authForm.confirmPassword}
               onChange={e => setAuthForm({...authForm, confirmPassword: e.target.value})}
@@ -3005,42 +3734,42 @@ export default function App() {
             <button 
               type="button"
               onClick={() => setShowConfirmPassword(!showConfirmPassword)}
-              className="absolute right-4 top-1/2 -translate-y-1/2 text-revis-gray"
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-[--color-revis-gray]"
             >
               {showConfirmPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
             </button>
           </div>
           {authForm.confirmPassword && authForm.password !== authForm.confirmPassword && (
-            <p className="text-xs text-revis-alert-critical mt-1 ml-1">{t('passwordsDoNotMatch')}</p>
+            <p className="text-xs text-[#e0473f] mt-1 ml-1">{t('passwordsDoNotMatch')}</p>
           )}
         </div>
 
-        {authError && <p className="text-revis-alert-critical text-sm text-center">{authError}</p>}
+        {authError && <p className="text-[#e0473f] text-sm text-center">{authError}</p>}
 
         <div className="flex gap-4 pt-4 mt-auto">
           <button 
             type="button" 
             onClick={() => { setAuthError(''); setAuthScreen('login'); }}
-            className="flex-1 bg-revis-dark-gray text-gray-500 font-bold py-3 rounded-xl hover:bg-revis-gray/20 transition-colors text-sm"
+            className="flex-1 glass text-gray-500 font-bold py-3 rounded-xl hover:bg-white/8 transition-colors text-sm"
           >
             &lt; {t('back')}
           </button>
           <button 
             type="submit" 
             disabled={!isFormValid()}
-            className="flex-1 bg-revis-green disabled:opacity-50 disabled:cursor-not-allowed text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm"
+            className="flex-1 bg-[#34a06a] disabled:opacity-50 disabled:cursor-not-allowed text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm"
           >
             {t('next')}
           </button>
         </div>
       </form>
-      <Footer />
+      <Footer showHelp />
       </div>
     </div>
   );
 
   const renderTerms = () => (
-    <div className="flex flex-col h-[100dvh] p-6 bg-revis-black">
+    <div className="flex flex-col h-[100dvh] p-6 bg-black">
       
       <div className="flex gap-4 mb-6 border-b border-revis-dark-gray">
         <button 
@@ -3048,7 +3777,7 @@ export default function App() {
             setActiveTermsTab('terms');
             if (termsContentRef.current) termsContentRef.current.scrollTop = 0;
           }}
-          className={`pb-2 px-2 font-medium transition-colors flex-1 text-sm ${activeTermsTab === 'terms' ? 'text-revis-green border-b-2 border-revis-green' : 'text-revis-gray'}`}
+          className={`pb-2 px-2 font-medium transition-colors flex-1 text-sm ${activeTermsTab === 'terms' ? 'text-[#34a06a] border-b-2 border-[#34a06a]' : 'text-[--color-revis-gray]'}`}
         >
           {t('terms')}
         </button>
@@ -3057,7 +3786,7 @@ export default function App() {
             setActiveTermsTab('privacy');
             if (termsContentRef.current) termsContentRef.current.scrollTop = 0;
           }}
-          className={`pb-2 px-2 font-medium transition-colors flex-1 text-sm ${activeTermsTab === 'privacy' ? 'text-revis-green border-b-2 border-revis-green' : 'text-revis-gray'}`}
+          className={`pb-2 px-2 font-medium transition-colors flex-1 text-sm ${activeTermsTab === 'privacy' ? 'text-[#34a06a] border-b-2 border-[#34a06a]' : 'text-[--color-revis-gray]'}`}
         >
           {t('privacy')}
         </button>
@@ -3066,107 +3795,112 @@ export default function App() {
       <div 
         ref={termsContentRef}
         onScroll={handleTermsScroll}
-        className="flex-1 bg-revis-dark-gray rounded-xl p-4 overflow-y-auto mb-6 text-xs text-revis-light-gray space-y-4"
+        className="flex-1 glass rounded-xl p-4 overflow-y-auto mb-6 text-xs text-[--color-text] space-y-4"
       >
         {activeTermsTab === 'privacy' ? (
           <>
-            <h3 className="font-bold text-revis-heading mb-2 text-sm">POLÍTICA DE PRIVACIDADE – REVISAUTO</h3>
-            <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
+            <h3 className="font-bold text-[--color-heading] font-display mb-2 text-sm">POLÍTICA DE PRIVACIDADE – REVISAUTO</h3>
+            <p className="text-[10px] text-[--color-revis-gray] mb-4">{t('legalLastUpdated')}<br/>{t('legalUpdatesNotice')}</p>
             
             <p>A plataforma RevisAuto tem o compromisso de proteger a privacidade e os dados pessoais de seus usuários. Esta Política descreve como coletamos, usamos, armazenamos e protegemos suas informações, em total conformidade com a Lei Geral de Proteção de Dados (Lei nº 13.709/2018 - LGPD).</p>
             
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">1. DADOS COLETADOS</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">1. DADOS COLETADOS</h4>
             <p>Para o funcionamento adequado do aplicativo, coletamos os seguintes dados:</p>
             <ul className="list-disc pl-4 space-y-1">
-              <li>Informações de Cadastro: Nome e e-mail para verificação de conta e suporte.</li>
-              <li>Informações do Veículo: Marca, modelo, ano, quilometragem e histórico de serviços inseridos por você.</li>
-              <li>Interações com a IA: O conteúdo das mensagens, perguntas e fotos enviadas ao assistente virtual (Dr. Graxa).</li>
-              <li>Dados de Autenticação Biométrica: Para maior comodidade, o app utiliza a autenticação local do seu dispositivo (Face ID ou Touch ID). Aviso importante: O RevisAuto NÃO coleta, transfere ou armazena os seus dados biométricos (impressão digital ou mapeamento facial) em nossos servidores. O reconhecimento é feito exclusivamente de forma criptografada pelo hardware do seu próprio celular.</li>
+              <li>Informações de Cadastro: Nome completo, e-mail, apelido, data de nascimento, país, celular, CEP, cidade e estado.</li>
+              <li>Informações do Veículo: Placa, marca, modelo, ano, cor, quilometragem, RENAVAM e chassi (quando informados ou extraídos automaticamente do CRLV), além do histórico de abastecimentos, manutenções e impostos, taxas e multas registrados por você.</li>
+              <li>Documentos e Comprovantes: Fotos e arquivos anexados aos lançamentos de abastecimento, manutenção e impostos/multas, além do documento do veículo (CRLV) enviado para preenchimento automático do cadastro.</li>
+              <li>Interações com a IA: O conteúdo das mensagens e fotos enviadas ao assistente virtual (Dr. Graxa).</li>
             </ul>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">2. FINALIDADE DO TRATAMENTO DE DADOS</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">2. FINALIDADE DO TRATAMENTO DE DADOS</h4>
             <p>Os dados coletados são utilizados exclusivamente para:</p>
             <ul className="list-disc pl-4 space-y-1">
               <li>Gerenciar sua garagem virtual e histórico automotivo.</li>
-              <li>Personalizar as respostas e diagnósticos da Inteligência Artificial.</li>
+              <li>Personalizar as respostas e diagnósticos da Inteligência Artificial, inclusive a leitura automática do CRLV.</li>
               <li>Processar as validações de pagamento das assinaturas escolhidas pelo usuário.</li>
               <li>Garantir a segurança da conta e prevenir acessos fraudulentos.</li>
             </ul>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS E INFRAESTRUTURA</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS E INFRAESTRUTURA</h4>
             <p>3.1. Não Comercialização: O RevisAuto não vende seus dados pessoais a terceiros para fins publicitários.</p>
-            <p>3.2. Parceiros Técnicos e Nuvem: Seus dados cadastrais e o histórico de veículos são armazenados de forma criptografada em nosso parceiro de nuvem, o Supabase.</p>
-            <p>3.3. Inteligência Artificial: Para o funcionamento do assistente &quot;Dr. Graxa&quot;, as mensagens enviadas são processadas através da API da OpenAI. O processamento é feito de maneira segura, e os seus dados não são utilizados para treinar modelos públicos de IA.</p>
+            <p>3.2. Parceiros Técnicos e Nuvem: Seus dados cadastrais e o histórico de veículos são armazenados de forma criptografada em nosso parceiro de nuvem, o Supabase. O aplicativo é hospedado na infraestrutura da Cloudflare, que processa as requisições e o envio de arquivos antes de chegarem ao armazenamento.</p>
+            <p>3.3. Inteligência Artificial: Para o funcionamento do assistente &quot;Dr. Graxa&quot; e para a leitura automática do CRLV, as mensagens e documentos enviados são processados através da API do Gemini (Google). O processamento é feito de maneira segura, e os seus dados não são utilizados para treinar modelos públicos de IA.</p>
             <p>3.4. Processamento de Pagamentos: Transações financeiras (Planos Plus e Premium) são geridas e processadas pelo Mercado Pago. O RevisAuto não armazena os dados completos de seu cartão de crédito em seus servidores.</p>
             <p>3.5. Ordens Judiciais: Poderemos compartilhar dados caso sejamos obrigados por lei ou decisão judicial, conforme o Marco Civil da Internet.</p>
+            <p>3.6. Transferência Internacional de Dados: Nossos parceiros de nuvem e de inteligência artificial (Supabase, Cloudflare e Google) podem processar ou armazenar dados em servidores localizados fora do Brasil. Esse tratamento segue o disposto no art. 33 da LGPD, com garantias contratuais de proteção equivalente à legislação brasileira.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">4. SEGURANÇA DA INFORMAÇÃO</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">4. SEGURANÇA DA INFORMAÇÃO</h4>
             <p>4.1. Criptografia: Utilizamos protocolos de criptografia de ponta a ponta (SSL/TLS) para o tráfego de informações entre o seu dispositivo e nossa nuvem.</p>
             <p>4.2. Proteção: Nossos bancos de dados contam com rigorosos controles de acesso baseados em políticas de segurança modernas.</p>
             <p>4.3. Responsabilidade do Usuário: Mantenha suas credenciais seguras e desconfie de abordagens externas solicitando dados em nome do RevisAuto.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">5. SEUS DIREITOS (LGPD)</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">5. SEUS DIREITOS (LGPD)</h4>
             <p>Como titular dos dados, você tem o direito de:</p>
             <ul className="list-disc pl-4 space-y-1">
               <li>Confirmar a existência de tratamento de seus dados.</li>
               <li>Acessar e corrigir dados incompletos ou desatualizados a qualquer momento no perfil do app.</li>
+              <li>Solicitar a portabilidade dos seus dados a outro fornecedor de serviço.</li>
+              <li>Solicitar a anonimização, o bloqueio ou a eliminação de dados desnecessários, excessivos ou tratados em desconformidade com a LGPD.</li>
+              <li>Obter informação sobre as entidades com as quais o RevisAuto compartilha seus dados (ver seção 3).</li>
+              <li>Revogar seu consentimento a qualquer momento e se opor a um tratamento realizado sem consentimento, quando exigido por lei.</li>
               <li>Exclusão (Direito ao Esquecimento): Solicitar a eliminação definitiva e irrevogável de todos os seus dados cadastrais, histórico de veículos e conversas dos nossos servidores, utilizando o botão específico de exclusão de conta dentro das configurações do próprio aplicativo.</li>
             </ul>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">6. TECNOLOGIAS DE RASTREIO E SESSÃO</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">6. TECNOLOGIAS DE RASTREIO E SESSÃO</h4>
             <p>Utilizamos identificadores seguros e tokens de sessão (access tokens) do seu dispositivo móvel exclusivamente para manter o aplicativo logado e funcional durante o uso, melhorando a fluidez da sua experiência.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">7. RETENÇÃO DE DADOS</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">7. RETENÇÃO DE DADOS</h4>
             <p>Mantemos seus dados ativos apenas enquanto a sua conta existir para cumprir as finalidades desta política. Caso opte por deletar a conta, os dados serão expurgados dos nossos servidores primários, ressalvada a guarda necessária para o cumprimento de obrigações legais impostas pelo Marco Civil da Internet.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">8. CONTATO E ENCARREGADO DE DADOS (DPO)</h4>
-            <p>Para exercer seus direitos, relatar vulnerabilidades ou tirar dúvidas sobre sua privacidade, entre em contato através do e-mail oficial: suporte@revisautoapp.com.br.</p>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">8. CONTATO E ENCARREGADO DE DADOS (DPO)</h4>
+            <p>Para exercer seus direitos, relatar vulnerabilidades ou tirar dúvidas sobre sua privacidade, entre em contato através do e-mail oficial: dev@revisautoapp.com.br.</p>
           </>
         ) : (
           <>
-            <h3 className="font-bold text-revis-gray mb-2 text-sm">TERMOS E CONDIÇÕES DE USO – PLATAFORMA REVISAUTO</h3>
-            <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
+            <h3 className="font-bold text-[--color-revis-gray] mb-2 text-sm">TERMOS E CONDIÇÕES DE USO – PLATAFORMA REVISAUTO</h3>
+            <p className="text-[10px] text-[--color-revis-gray] mb-4">{t('legalLastUpdated')}<br/>{t('legalUpdatesNotice')}</p>
             
             <div className="bg-revis-alert-medium/10 border border-revis-alert-medium p-3 rounded-lg mb-4">
-              <p className="text-revis-alert-medium font-bold text-[10px]">AVISO DE MAIORIDADE</p>
+              <p className="text-[#ffcc00] font-bold text-[10px]">{t('majorityWarningTitle')}</p>
               <p className="text-[10px] mt-1">O RevisAuto é uma plataforma destinada exclusivamente a usuários maiores de 18 (dezoito) anos. Ao acessar ou utilizar este aplicativo, você declara possuir a idade mínima exigida e plena capacidade civil, compreendendo que a gestão e condução de veículos automotores e elétricos no Brasil requerem maioridade e habilitação legal específica.</p>
             </div>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">1. CADASTRO E SEGURANÇA DE DADOS (CONFORMIDADE LGPD)</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">1. CADASTRO E SEGURANÇA DE DADOS (CONFORMIDADE LGPD)</h4>
             <p>1.1. Elegibilidade: O Usuário declara ser maior de 18 anos e ser o proprietário ou possuidor legítimo do veículo cadastrado.</p>
             <p>1.2. Veracidade das Informações: O Usuário é o único responsável pela precisão e atualização dos dados inseridos (quilometragem, datas de manutenção, histórico de reparos).</p>
-            <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta. O aplicativo oferece suporte à autenticação biométrica (como Face ID ou Touch ID), cuja segurança é gerida localmente pelo sistema operacional do dispositivo.</p>
+            <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">2. COMUNIDADE E REDE SOCIAL (DIRETRIZES DE CONDUTA)</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">2. COMUNIDADE E REDE SOCIAL (DIRETRIZES DE CONDUTA)</h4>
             <p>2.1. Conteúdo Gerado pelo Usuário (UGC): O Usuário concede ao RevisAuto uma licença gratuita e global para exibir conteúdos postados em áreas comuns do app.</p>
             <p>2.2. Proibições: É proibida a publicação de conteúdo difamatório, obsceno, abusivo, ilegal ou propaganda não autorizada (SPAM).</p>
             <p>2.3. Moderação: O RevisAuto reserva-se o direito de remover conteúdos e banir usuários que violem estas diretrizes.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">3. PROPRIEDADE INTELECTUAL E PROTEÇÃO CONTRA PLÁGIO</h4>
-            <p>3.1. Propriedade e Patenteamento: Todo o código-fonte, interface gráfica, algoritmos de IA, identidade visual e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos por registro de software e patentes conforme aplicável.</p>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">3. PROPRIEDADE INTELECTUAL E PROTEÇÃO CONTRA PLÁGIO</h4>
+            <p>3.1. Propriedade Intelectual: Todo o código-fonte, interface gráfica, prompts e integrações de Inteligência Artificial, identidade visual e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos pela legislação de direitos autorais e de propriedade intelectual aplicável, incluindo o registro da marca RevisAuto junto ao INPI.</p>
             <p>3.2. Proibição de Plágio: É terminantemente proibida a reprodução total ou parcial da lógica ou design da plataforma.</p>
             <p>3.3. Procedimentos Judiciais: A prática de plágio sujeitará o infrator a procedimentos judiciais nas esferas cível e criminal, incluindo indenizações por danos materiais e lucros cessantes.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">4. PROTOCOLOS DE SEGURANÇA E PREVENÇÃO A FRAUDES</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">4. PROTOCOLOS DE SEGURANÇA E PREVENÇÃO A FRAUDES</h4>
             <p>4.1. Cuidado com Credenciais: O RevisAuto jamais solicitará sua senha de acesso por telefone, e-mail, SMS ou redes sociais. O compartilhamento de senhas com terceiros é de inteira responsabilidade do Usuário.</p>
             <p>4.2. Canais Oficiais de Cobrança: Todas as transações financeiras e cobranças de assinaturas de planos são processadas exclusivamente através de plataformas verificadas, notadamente pelo sistema integrado do Mercado Pago ou pelas lojas oficiais (App Store e Google Play).</p>
             <p>4.3. Alertas de Golpes: O RevisAuto não realiza cobranças nem solicita pagamentos via WhatsApp, ligações telefônicas, SMS ou links diretos enviados por e-mail.</p>
             <p>4.4. Isenção de Responsabilidade por Engenharia Social: O RevisAuto não se responsabiliza por prejuízos financeiros decorrentes de golpes de terceiros, phishing ou transferências realizadas pelo usuário para contas não oficiais.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">5. ASSINATURAS E PAGAMENTOS</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">5. ASSINATURAS E PAGAMENTOS</h4>
             <p>5.1. Serviços Premium: O RevisAuto oferece planos de assinatura (como Plus e Premium) para desbloqueio de limites de veículos e maior interação com a inteligência artificial. Estas funcionalidades estão sujeitas a termos de recorrência apresentados no momento da contratação.</p>
             <p>5.2. Reajustes: Alterações de valores serão comunicadas com 30 (trinta) dias de antecedência.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">6. DISPONIBILIDADE E MODIFICAÇÕES</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">6. DISPONIBILIDADE E MODIFICAÇÕES</h4>
             <p>6.1. Interrupções de Serviço: O serviço pode sofrer instabilidades técnicas devido a manutenções ou fatores externos em nossos provedores de nuvem.</p>
             <p>6.2. Alteração dos Termos: A continuidade do uso do app após atualizações constitui aceitação dos novos termos.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">7. NATUREZA DO SERVIÇO E ISENÇÃO DE RESPONSABILIDADE</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">7. NATUREZA DO SERVIÇO E ISENÇÃO DE RESPONSABILIDADE</h4>
             <p>7.1. Consultoria via IA (Dr. Graxa): O Usuário reconhece que o assistente virtual &quot;Dr. Graxa&quot; fornece recomendações geradas por Inteligência Artificial com caráter meramente informativo e consultivo.</p>
             <p>7.2. Responsabilidade Técnica: A plataforma, incluindo sua inteligência artificial, não substitui o manual oficial do fabricante, laudos técnicos ou a avaliação presencial de um profissional mecânico qualificado. O RevisAuto não se responsabiliza por danos físicos ou materiais decorrentes da aplicação de sugestões geradas no aplicativo.</p>
             <p>7.3. Dicas de Produtos: A compatibilidade de produtos químicos ou peças automotivas é de inteira responsabilidade do Usuário.</p>
 
-            <h4 className="font-bold text-revis-gray mt-4 text-sm">8. FORO E LEGISLAÇÃO APLICÁVEL</h4>
+            <h4 className="font-bold text-[--color-revis-gray] mt-4 text-sm">8. FORO E LEGISLAÇÃO APLICÁVEL</h4>
             <p>8.1. Regido pelas leis da República Federativa do Brasil (Marco Civil da Internet e LGPD).</p>
             <p>8.2. Eleito o Foro da Comarca de Vila Velha, Estado do Espírito Santo.</p>
           </>
@@ -3175,7 +3909,7 @@ export default function App() {
 
       <div className="space-y-3 mb-6">
         <label className={`flex items-center gap-3 cursor-pointer transition-opacity duration-300 ${hasScrolledTerms ? 'opacity-100' : 'opacity-50 pointer-events-none'}`}>
-          <div className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${acceptedTerms ? 'bg-revis-green border-revis-green' : 'border-revis-gray'}`}>
+          <div className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${acceptedTerms ? 'bg-[#34a06a] border-[#34a06a]' : 'border-revis-gray'}`}>
             {acceptedTerms && <Check className="w-3 h-3 text-black" />}
           </div>
           <input
@@ -3192,61 +3926,61 @@ export default function App() {
               }
             }}
           />
-          <span className="text-xs text-revis-light-gray">{t('readAndAcceptTerms')} <span className="text-revis-green font-bold">{t('terms')}</span></span>
+          <span className="text-xs text-[--color-text]">{t('readAndAcceptTerms')} <span className="text-[#34a06a] font-bold">{t('terms')}</span></span>
         </label>
         
         <label className={`flex items-center gap-3 cursor-pointer transition-opacity duration-300 ${hasScrolledPrivacy ? 'opacity-100' : 'opacity-50 pointer-events-none'}`}>
-          <div className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${acceptedPrivacy ? 'bg-revis-green border-revis-green' : 'border-revis-gray'}`}>
+          <div className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${acceptedPrivacy ? 'bg-[#34a06a] border-[#34a06a]' : 'border-revis-gray'}`}>
             {acceptedPrivacy && <Check className="w-3 h-3 text-black" />}
           </div>
           <input type="checkbox" className="hidden" checked={acceptedPrivacy} onChange={() => setAcceptedPrivacy(!acceptedPrivacy)} />
-          <span className="text-xs text-revis-light-gray">{t('readAndAcceptPrivacy')} <span className="text-revis-green font-bold">{t('privacy')}</span></span>
+          <span className="text-xs text-[--color-text]">{t('readAndAcceptPrivacy')} <span className="text-[#34a06a] font-bold">{t('privacy')}</span></span>
         </label>
       </div>
       
       {((activeTermsTab === 'terms' && !hasScrolledTerms) || (activeTermsTab === 'privacy' && !hasScrolledPrivacy)) && (
-        <p className="text-[11px] text-center text-revis-alert-medium font-bold mb-2 animate-pulse">{t('scrollDown')}</p>
+        <p className="text-[11px] text-center text-[#ffcc00] font-bold mb-2 animate-pulse">{t('scrollDown')}</p>
       )}
 
       <div className="flex gap-4">
         <button 
           onClick={() => setAuthScreen('register')}
-          className="flex-1 bg-revis-dark-gray text-gray-500 font-bold py-3 rounded-xl hover:bg-revis-gray/20 transition-colors text-sm"
+          className="flex-1 glass text-gray-500 font-bold py-3 rounded-xl hover:bg-white/8 transition-colors text-sm"
         >
           &lt; {t('back')}
         </button>
         <button 
           onClick={confirmRegister} 
           disabled={!acceptedTerms || !acceptedPrivacy}
-          className="flex-1 bg-revis-green disabled:opacity-50 disabled:cursor-not-allowed text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm"
+          className="flex-1 bg-[#34a06a] disabled:opacity-50 disabled:cursor-not-allowed text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm"
         >
           {t('next')}
         </button>
       </div>
-      <Footer />
+      <Footer showHelp />
     </div>
   );
 
   const renderSuccess = () => (
-    <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-revis-black text-center">
-      <h1 className="text-2xl font-bold text-revis-heading mb-2">{t('accountCreated')}</h1>
+    <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-black text-center">
+      <h1 className="text-2xl font-bold text-[--color-heading] font-display mb-2">{t('accountCreated')}</h1>
       <p className="text-gray-500 mb-8 max-w-xs text-xs">
         {t('journeyBegins')}
       </p>
       <button 
         onClick={() => { setAuthScreen('app'); setMileageInput(''); setShowAddVehicle(true); }}
-        className="w-full max-w-sm bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm mb-3"
+        className="w-full max-w-sm bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors text-sm mb-3"
       >
         {t('addVehicle')}
       </button>
       <button 
         onClick={() => { setAuthScreen('app'); setActiveTab('garage'); }}
-        className="w-full max-w-sm bg-revis-dark-gray text-revis-heading font-bold py-3 rounded-xl hover:bg-revis-gray/20 transition-colors text-sm"
+        className="w-full max-w-sm glass text-[--color-heading] font-display font-bold py-3 rounded-xl hover:bg-white/8 transition-colors text-sm"
       >
         {t('goToGarage')}
       </button>
-      <p className="text-xs text-revis-gray mt-4">
-        {t('manageFree')} <span className="text-revis-green font-bold cursor-pointer">{t('viewPlans')}</span>
+      <p className="text-xs text-[--color-revis-gray] mt-4">
+        {t('manageFree')} <span className="text-[#34a06a] font-bold cursor-pointer">{t('viewPlans')}</span>
       </p>
       <Footer />
     </div>
@@ -3254,15 +3988,15 @@ export default function App() {
 
   const renderDashboard = () => (
     <div className="space-y-4 pb-24">
-      <div className="bg-revis-dark-gray rounded-2xl p-6 border border-revis-gray/20">
-        <h2 className="text-xl font-bold text-revis-heading mb-2">{t('welcomeUser')} {user?.nickname || user?.name?.split(' ')[0]}!</h2>
-        <p className="text-revis-gray text-sm">
+      <div className="glass rounded-2xl p-6 border border-white/12">
+        <h2 className="text-xl font-bold text-[--color-heading] font-display mb-2">{t('welcomeUser')} {user?.nickname || user?.name?.split(' ')[0]}!</h2>
+        <p className="text-[--color-revis-gray] text-sm">
           {t('vehiclesRegistered').replace('{count}', vehicles.length.toString()).replace(/{s}/g, vehicles.length !== 1 ? 's' : '')}
         </p>
         <div className="mt-4 flex gap-2">
           <button 
             onClick={() => setActiveTab('garage')}
-            className="bg-revis-green text-black font-bold py-2 px-4 rounded-xl text-sm hover:bg-opacity-90 transition-colors"
+            className="bg-[#34a06a] text-black font-bold py-2 px-4 rounded-xl text-sm hover:bg-opacity-90 transition-colors"
           >
             {t('goToGarage')}
           </button>
@@ -3276,7 +4010,7 @@ export default function App() {
               setChatMessages([]);
               setAiPrompt('');
             }}
-            className="bg-revis-dark-gray border border-revis-gray/30 text-white font-bold py-2 px-4 rounded-xl text-sm hover:bg-revis-gray/20 transition-colors"
+            className="glass border border-white/18 text-white font-bold py-2 px-4 rounded-xl text-sm hover:bg-white/8 transition-colors"
           >
             {t('talkToDrGraxa')}
           </button>
@@ -3289,28 +4023,28 @@ export default function App() {
 
   const renderMenu = () => (
     <div className="space-y-4 animate-in fade-in duration-300">
-      <h2 className="text-2xl font-bold text-revis-heading mb-6">{t('menu')}</h2>
+      <h2 className="text-2xl font-bold text-[--color-heading] font-display mb-6">{t('menu')}</h2>
       
-      <div className="bg-revis-dark-gray rounded-xl p-4 flex items-center gap-4 mb-6">
-        <div className="w-12 h-12 rounded-full bg-revis-black border border-revis-gray/30 flex items-center justify-center text-revis-green font-bold text-xl">
+      <div className="glass rounded-xl p-4 flex items-center gap-4 mb-6">
+        <div className="w-12 h-12 rounded-full bg-[--color-bg] border border-[--color-border] flex items-center justify-center text-[#34a06a] font-bold text-xl">
           {user?.name?.charAt(0)?.toUpperCase() || 'U'}
         </div>
         <div>
-          <h3 className="font-bold text-revis-heading">{user?.name}</h3>
-          <p className="text-sm text-revis-gray">{user?.email}</p>
+          <h3 className="font-bold text-[--color-heading] font-display">{user?.name}</h3>
+          <p className="text-sm text-[--color-revis-gray]">{user?.email}</p>
         </div>
       </div>
 
       <div className="space-y-3">
         <button 
           onClick={() => setShowProfileEdit(true)}
-          className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
+          className="w-full glass p-4 rounded-xl flex justify-between items-center text-[--color-heading] font-display hover:bg-white/8 transition-colors"
         >
           <div className="flex items-center gap-3">
-            <UserIcon className="w-5 h-5 text-revis-green" />
+            <UserIcon className="w-5 h-5 text-[#34a06a]" />
             <span className="font-medium">{t('profileData')}</span>
           </div>
-          <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
+          <ChevronLeft className="w-5 h-5 rotate-180 text-[--color-revis-gray]" />
         </button>
 
         <button 
@@ -3323,20 +4057,22 @@ export default function App() {
               setCurrentSessionId(null);
               setChatMessages([]);
               setAiPrompt('');
+              setShowChatTrash(true);
+              void fetchChatTrash();
             } else {
               setShowUpgradeModal(true);
             }
           }}
-          className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
+          className="w-full glass p-4 rounded-xl flex justify-between items-center text-[--color-heading] font-display hover:bg-white/8 transition-colors"
         >
           <div className="flex items-center gap-3">
-            <MessageSquare className="w-5 h-5 text-revis-green" />
+            <MessageSquare className="w-5 h-5 text-[#34a06a]" />
             <div className="flex items-center gap-2">
               <span className="font-medium">{t('chatHistory')}</span>
               <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" />
             </div>
           </div>
-          <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
+          <ChevronLeft className="w-5 h-5 rotate-180 text-[--color-revis-gray]" />
         </button>
 
         <button
@@ -3345,61 +4081,61 @@ export default function App() {
             if (isPremiumPlan(user?.plan)) setShowVehicleHistory(true);
             else setShowUpgradeModal(true);
           }}
-          className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
+          className="w-full glass p-4 rounded-xl flex justify-between items-center text-[--color-heading] font-display hover:bg-white/8 transition-colors"
         >
           <div className="flex items-center gap-3">
-            <History className="w-5 h-5 text-revis-green" />
+            <History className="w-5 h-5 text-[#34a06a]" />
             <div className="flex items-center gap-2">
               <span className="font-medium">{t('vehicleHistory')}</span>
               <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" />
             </div>
           </div>
-          <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
+          <ChevronLeft className="w-5 h-5 rotate-180 text-[--color-revis-gray]" />
         </button>
 
         <button 
           onClick={() => setShowUpgradeModal(true)}
-          className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
+          className="w-full glass p-4 rounded-xl flex justify-between items-center text-[--color-heading] font-display hover:bg-white/8 transition-colors"
         >
           <div className="flex items-center gap-3">
             <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="sm" />
             <span className="font-medium">{isPlusOrPremium(user?.plan) ? t('managePlan') : t('plans')}</span>
           </div>
-          <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
+          <ChevronLeft className="w-5 h-5 rotate-180 text-[--color-revis-gray]" />
         </button>
 
         <button
           type="button"
           onClick={() => { setSupportMethod(null); setIsSupportModalOpen(true); }}
-          className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
+          className="w-full glass p-4 rounded-xl flex justify-between items-center text-[--color-heading] font-display hover:bg-white/8 transition-colors"
         >
           <div className="flex items-center gap-3">
-            <MessageSquare className="w-5 h-5 text-revis-green" />
+            <MessageSquare className="w-5 h-5 text-[#34a06a]" />
             <span className="font-medium">{t('support')}</span>
           </div>
-          <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
+          <ChevronLeft className="w-5 h-5 rotate-180 text-[--color-revis-gray]" />
         </button>
 
         <button 
           onClick={() => setShowTermsModal(true)}
-          className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
+          className="w-full glass p-4 rounded-xl flex justify-between items-center text-[--color-heading] font-display hover:bg-white/8 transition-colors"
         >
           <div className="flex items-center gap-3">
-            <FileText className="w-5 h-5 text-revis-green" />
+            <FileText className="w-5 h-5 text-[#34a06a]" />
             <span className="font-medium">{t('terms')}</span>
           </div>
-          <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
+          <ChevronLeft className="w-5 h-5 rotate-180 text-[--color-revis-gray]" />
         </button>
 
         <button 
           onClick={() => setShowPrivacyModal(true)}
-          className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-heading hover:bg-revis-gray/20 transition-colors"
+          className="w-full glass p-4 rounded-xl flex justify-between items-center text-[--color-heading] font-display hover:bg-white/8 transition-colors"
         >
           <div className="flex items-center gap-3">
-            <Shield className="w-5 h-5 text-revis-green" />
+            <Shield className="w-5 h-5 text-[#34a06a]" />
             <span className="font-medium">{t('privacy')}</span>
           </div>
-          <ChevronLeft className="w-5 h-5 rotate-180 text-revis-gray" />
+          <ChevronLeft className="w-5 h-5 rotate-180 text-[--color-revis-gray]" />
         </button>
       </div>
 
@@ -3411,7 +4147,7 @@ export default function App() {
           setAuthScreen('login');
           setActiveTab('garage');
         }}
-        className="w-full bg-revis-dark-gray p-4 rounded-xl flex justify-between items-center text-revis-alert-critical hover:bg-revis-gray/20 transition-colors mt-8"
+        className="w-full glass p-4 rounded-xl flex justify-between items-center text-[#e0473f] hover:bg-white/8 transition-colors mt-8"
       >
         <span className="font-medium">{t('logout')}</span>
       </button>
@@ -3424,43 +4160,43 @@ export default function App() {
 
   const renderPreferences = () => (
     <div className="space-y-4 animate-in fade-in duration-300 pb-20">
-      <h2 className="text-2xl font-bold text-revis-heading mb-6">{t('preferences')}</h2>
+      <h2 className="text-2xl font-bold text-[--color-heading] font-display mb-6">{t('preferences')}</h2>
       
       <div className="space-y-6">
         {/* Theme */}
-        <div className="bg-revis-dark-gray p-4 rounded-xl space-y-4">
-          <h3 className="font-medium text-revis-heading flex items-center gap-2">
-            <Paintbrush className="w-5 h-5 text-revis-green" />
-            Tema
+        <div className="glass p-4 rounded-xl space-y-4">
+          <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+            <Paintbrush className="w-5 h-5 text-[#34a06a]" />
+            {t('themeLabel')}
           </h3>
           <div className="grid grid-cols-2 gap-2">
             <button
               onClick={() => applyThemeImmediate('dark')}
-              className={`p-3 rounded-lg border text-sm font-medium transition-colors ${tempTheme === 'dark' ? 'bg-revis-green text-black border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+              className={`p-3 rounded-lg border text-sm font-medium transition-colors ${tempTheme === 'dark' ? 'bg-[#34a06a] text-black border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
             >
-              Escuro
+              {t('darkTheme')}
             </button>
             <button
               onClick={() => applyThemeImmediate('light')}
-              className={`p-3 rounded-lg border text-sm font-medium transition-colors ${tempTheme === 'light' ? 'bg-revis-green text-black border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+              className={`p-3 rounded-lg border text-sm font-medium transition-colors ${tempTheme === 'light' ? 'bg-[#34a06a] text-black border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
             >
-              Claro
+              {t('lightTheme')}
             </button>
           </div>
         </div>
 
         {/* Language */}
-        <div className="bg-revis-dark-gray p-4 rounded-xl space-y-4">
-          <h3 className="font-medium text-revis-heading flex items-center gap-2">
-            <Globe className="w-5 h-5 text-revis-green" />
-            Idioma
+        <div className="glass p-4 rounded-xl space-y-4">
+          <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+            <Globe className="w-5 h-5 text-[#34a06a]" />
+            {t('languageLabel')}
           </h3>
           <div className="space-y-2">
             {Object.keys(translations).map((lang) => (
               <button
                 key={lang}
                 onClick={() => applyLanguageImmediate(lang)}
-                className={`w-full p-3 rounded-lg border text-sm font-medium transition-colors flex justify-between items-center ${tempLanguage === lang ? 'bg-revis-green/10 text-revis-green border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+                className={`w-full p-3 rounded-lg border text-sm font-medium transition-colors flex justify-between items-center ${tempLanguage === lang ? 'bg-[#34a06a]/10 text-[#34a06a] border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
               >
                 {lang}
                 {tempLanguage === lang && <Check className="w-4 h-4" />}
@@ -3470,13 +4206,13 @@ export default function App() {
         </div>
 
         {/* Font Size */}
-        <div className="bg-revis-dark-gray p-4 rounded-xl space-y-4">
-          <h3 className="font-medium text-revis-heading flex items-center gap-2">
-            <Type className="w-5 h-5 text-revis-green" />
-            Tamanho da Fonte
+        <div className="glass p-4 rounded-xl space-y-4">
+          <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+            <Type className="w-5 h-5 text-[#34a06a]" />
+            {t('fontSizeLabel')}
           </h3>
           <div className="flex items-center gap-4">
-            <span className="text-xs text-revis-gray">A</span>
+            <span className="text-xs text-[--color-revis-gray]">A</span>
             <input
               type="range"
               min="0"
@@ -3484,28 +4220,29 @@ export default function App() {
               step="1"
               value={tempFontSize}
               onChange={(e) => applyFontSizeImmediate(parseInt(e.target.value))}
-              className="flex-1 h-2 bg-revis-black rounded-lg appearance-none cursor-pointer accent-revis-green"
+              className="flex-1 h-2 rounded-lg appearance-none cursor-pointer accent-revis-green"
+              style={{ background: theme === 'light' ? 'rgba(0,0,0,0.14)' : 'rgba(255,255,255,0.18)' }}
             />
-            <span className="text-xl text-revis-heading">A</span>
+            <span className="text-xl text-[--color-heading] font-display">A</span>
           </div>
-          <p className="text-xs text-revis-gray text-center">
-            {tempFontSize === 0 && 'Muito Pequeno'}
-            {tempFontSize === 1 && 'Pequeno'}
-            {tempFontSize === 2 && 'Normal'}
-            {tempFontSize === 3 && 'Grande'}
-            {tempFontSize === 4 && 'Muito Grande'}
+          <p className="text-xs text-[--color-revis-gray] text-center">
+            {tempFontSize === 0 && t(FONT_SIZE_LABEL_KEYS[0])}
+            {tempFontSize === 1 && t(FONT_SIZE_LABEL_KEYS[1])}
+            {tempFontSize === 2 && t(FONT_SIZE_LABEL_KEYS[2])}
+            {tempFontSize === 3 && t(FONT_SIZE_LABEL_KEYS[3])}
+            {tempFontSize === 4 && t(FONT_SIZE_LABEL_KEYS[4])}
           </p>
         </div>
 
         {/* Date Format */}
-        <div className="bg-revis-dark-gray p-4 rounded-xl space-y-4">
-          <h3 className="font-medium text-revis-heading flex items-center gap-2">
-            <CalendarDays className="w-5 h-5 text-revis-green" />
+        <div className="glass p-4 rounded-xl space-y-4">
+          <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+            <CalendarDays className="w-5 h-5 text-[#34a06a]" />
             {t('dateFormatLabel')}
           </h3>
           <div className="grid grid-cols-2 gap-2">
             <label
-              className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${tempDateFormat === 'dd/mm/yyyy' ? 'bg-revis-green/10 text-revis-green border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+              className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${tempDateFormat === 'dd/mm/yyyy' ? 'bg-[#34a06a]/10 text-[#34a06a] border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
             >
               <input
                 type="radio"
@@ -3518,7 +4255,7 @@ export default function App() {
               <span>{getDateFormatDisplay('dd/mm/yyyy', language)}</span>
             </label>
             <label
-              className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${tempDateFormat === 'mm/dd/yyyy' ? 'bg-revis-green/10 text-revis-green border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+              className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${tempDateFormat === 'mm/dd/yyyy' ? 'bg-[#34a06a]/10 text-[#34a06a] border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
             >
               <input
                 type="radio"
@@ -3531,66 +4268,34 @@ export default function App() {
               <span>{getDateFormatDisplay('mm/dd/yyyy', language)}</span>
             </label>
           </div>
-          <p className="text-xs text-revis-gray">
-            {t('dateFormatPreview')}: <span className="text-revis-light-gray font-medium">{formatAppDate(new Date(), tempDateFormat)}</span>
+          <p className="text-xs text-[--color-revis-gray]">
+            {t('dateFormatPreview')}: <span className="text-[--color-text] font-medium">{formatAppDate(new Date(), tempDateFormat)}</span>
           </p>
         </div>
 
         {/* Currency */}
-        <div className="bg-revis-dark-gray p-4 rounded-xl space-y-4">
-          <h3 className="font-medium text-revis-heading flex items-center gap-2">
-            <DollarSign className="w-5 h-5 text-revis-green" />
+        <div className="glass p-4 rounded-xl space-y-4">
+          <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+            <DollarSign className="w-5 h-5 text-[#34a06a]" />
             {t('currencyLabel')}
           </h3>
-          <select
-            value={tempCurrency}
-            onChange={(e) => applyCurrencyImmediate(e.target.value)}
-            className="w-full bg-revis-black/40 border border-revis-gray/30 rounded-lg p-3 text-sm text-revis-light-gray focus:border-revis-green outline-none"
-          >
-            {CURRENCY_OPTIONS.map((opt) => (
-              <option key={opt.code} value={opt.code} className="bg-revis-dark-gray text-revis-light-gray">
-                {opt.code} — {opt.label}
-              </option>
-            ))}
-          </select>
-          <p className="text-xs text-revis-gray">
-            {t('currencyPreview')}: <span className="text-revis-light-gray font-medium">{formatAppCurrency(1234.56, tempCurrency, tempLanguage)}</span>
+          <CustomSelect value={tempCurrency} onChange={v=>applyCurrencyImmediate(v)} options={CURRENCY_OPTIONS.map(opt=>({"value":opt.code,"label":`${opt.code} — ${currencyLabel(opt.code)}`}))} />
+          <p className="text-xs text-[--color-revis-gray]">
+            {t('currencyPreview')}: <span className="text-[--color-text] font-medium">{formatAppCurrency(1234.56, tempCurrency, tempLanguage)}</span>
           </p>
         </div>
-
-        {loginBiometricOffered && (
-          <div className="bg-revis-dark-gray p-4 rounded-xl space-y-3">
-            <h3 className="font-medium text-revis-heading flex items-center gap-2">
-              <UserIcon className="w-5 h-5 text-revis-green" />
-              {t('biometricSettingsTitle')}
-            </h3>
-            <label className="flex items-center gap-3 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={prefsBiometricEnabled}
-                onChange={async (e) => {
-                  const v = e.target.checked;
-                  await setBiometricUnlockEnabled(v);
-                  setPrefsBiometricEnabled(v);
-                }}
-                className="accent-revis-green w-4 h-4 rounded shrink-0"
-              />
-              <span className="text-sm text-revis-gray leading-snug">{t('biometricEnableLabel')}</span>
-            </label>
-          </div>
-        )}
 
         {/* Action Buttons */}
         <div className="flex gap-4 pt-4">
           <button 
             onClick={() => setShowPreferencesCancelConfirmation(true)}
-            className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/20 transition-colors"
+            className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/8 transition-colors"
           >
             {t('cancel')}
           </button>
           <button 
             onClick={() => setShowPreferencesSaveConfirmation(true)}
-            className="flex-1 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+            className="flex-1 bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
           >
             {t('save')}
           </button>
@@ -3611,7 +4316,7 @@ export default function App() {
       return (
         <div className="space-y-4 pb-24 md:pb-4">
           <div className="flex justify-between items-center mb-2">
-            <h2 className="text-xl font-bold text-revis-heading flex items-center gap-2">
+            <h2 className="text-xl font-bold text-[--color-heading] font-display flex items-center gap-2">
               {t('garageOf')} {user?.nickname || user?.name?.split(' ')[0]}
               {isPlusOrPremium(user?.plan) && (
                 <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="sm" />
@@ -3620,11 +4325,11 @@ export default function App() {
           </div>
 
           <div className="relative mb-4">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-revis-gray" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[--color-revis-gray]" />
             <input 
               type="text"
               placeholder={t('searchVehicle')}
-              className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl py-3 pl-10 pr-4 text-revis-light-gray outline-none transition-colors text-sm"
+              className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl py-3 pl-10 pr-4 text-[--color-text] outline-none transition-colors text-sm"
               value={vehicleSearch}
               onChange={(e) => setVehicleSearch(e.target.value)}
             />
@@ -3643,7 +4348,9 @@ export default function App() {
                   current_mileage: 0,
                   last_service_date: new Date().toISOString().split('T')[0],
                   nickname: '',
-                  color: ''
+                  color: '',
+                  plate: '',
+                  document_path: null,
                 });
                 setCustomBrand('');
                 setCustomModel('');
@@ -3651,13 +4358,14 @@ export default function App() {
                 setOtherColor('');
                 setIsEditingVehicle(false);
                 setMileageInput('');
+                setCrlvWarnings([]);
                 setShowAddVehicle(true);
               }
             }}
             className={`w-full font-bold py-3 rounded-xl transition-colors flex items-center justify-center gap-2 mb-4 ${
               atVehicleLimit 
-                ? 'bg-revis-dark-gray text-revis-gray cursor-not-allowed border border-revis-gray/20' 
-                : 'bg-revis-green text-black hover:bg-opacity-90'
+                ? 'glass text-[--color-revis-gray] cursor-not-allowed border border-[--color-border]' 
+                : 'bg-[#34a06a] text-black hover:bg-opacity-90'
             }`}
           >
             {atVehicleLimit ? (
@@ -3677,22 +4385,22 @@ export default function App() {
             {filteredVehicles.map(vehicle => (
               <div
                 key={vehicle.id}
-                className="bg-revis-dark-gray rounded-xl p-4 border border-revis-gray/10 flex items-center gap-4"
+                className="glass rounded-xl p-4 border border-[--color-border] flex items-center gap-4"
               >
-                <div className="p-3 bg-revis-black/30 rounded-full flex-shrink-0">
-                  {vehicle.type === 'Carro' && <Car className="w-5 h-5 text-revis-green" />}
-                  {vehicle.type === 'Moto' && <Bike className="w-5 h-5 text-revis-green" />}
-                  {vehicle.type === 'Bike' && <Zap className="w-5 h-5 text-revis-green" />}
+                <div className="p-3 bg-black/30 rounded-full flex-shrink-0">
+                  {vehicle.type === 'Carro' && <Car className="w-5 h-5 text-[#34a06a]" />}
+                  {vehicle.type === 'Moto' && <Bike className="w-5 h-5 text-[#34a06a]" />}
+                  {vehicle.type === 'Bike' && <Zap className="w-5 h-5 text-[#34a06a]" />}
                 </div>
                 
                 <div className="flex-1 min-w-0">
-                  <h3 className="font-bold text-revis-heading text-base truncate">
+                  <h3 className="font-bold text-[--color-heading] font-display text-base truncate">
                     {isPlusOrPremium(user?.plan) && vehicle.nickname ? vehicle.nickname : vehicle.model}
                   </h3>
-                  <p className="text-xs text-revis-gray truncate">
+                  <p className="text-xs text-[--color-revis-gray] truncate">
                     {isPlusOrPremium(user?.plan) && vehicle.nickname ? `${vehicle.model} • ` : ''}
                     {vehicle.brand} • {vehicle.year}
-                    {isPlusOrPremium(user?.plan) && vehicle.color ? ` • ${vehicle.color}` : ''}
+                    {isPlusOrPremium(user?.plan) && vehicle.color ? ` • ${colorLabel(vehicle.color)}` : ''}
                     {!(isPlusOrPremium(user?.plan) && (vehicle.nickname || vehicle.color)) ? ` • ${(vehicle.current_mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km` : ''}
                   </p>
                 </div>
@@ -3702,7 +4410,7 @@ export default function App() {
                     setSelectedVehicle(vehicle);
                     setExpandedCards({ mileage: false, services: false, financial: false });
                   }}
-                  className="text-xs text-revis-green font-medium whitespace-nowrap hover:underline"
+                  className="text-xs text-[#34a06a] font-medium whitespace-nowrap hover:underline"
                 >
                   {t('details')} &gt;
                 </button>
@@ -3711,7 +4419,7 @@ export default function App() {
           </div>
 
           {filteredVehicles.length === 0 && (
-            <div className="text-center py-10 text-revis-gray">
+            <div className="text-center py-10 text-[--color-revis-gray]">
               <Warehouse className="w-12 h-12 mx-auto mb-3 opacity-20" />
               <p>{vehicles.length === 0 ? t('noVehicles') : t('noVehiclesFound')}</p>
             </div>
@@ -3723,29 +4431,71 @@ export default function App() {
     return (
       <div className="space-y-6 pb-24 md:pb-4">
         {/* Header with Back Button */}
-        <div className="flex items-center gap-2 mb-4 sticky top-16 md:top-0 bg-revis-black z-10 py-2">
+        <div
+          className="flex items-center gap-2 mb-4 sticky top-16 md:top-0 z-10 py-2 vehicle-header-canvas"
+        >
           <button 
             onClick={(e) => {
               e.stopPropagation();
               setSelectedVehicle(null);
             }} 
-            className="p-2 -ml-2 text-revis-gray hover:text-revis-green transition-colors cursor-pointer"
+            className="p-2 -ml-2 text-[--color-revis-gray] hover:text-[#34a06a] transition-colors cursor-pointer"
           >
             <ChevronLeft className="w-8 h-8" />
           </button>
           <div className="flex-1">
-            <h2 className="text-xl font-bold text-revis-heading">{selectedVehicle.brand} {selectedVehicle.model}</h2>
+            <h2 className="text-xl font-bold text-[--color-heading] font-display">{selectedVehicle.brand} {selectedVehicle.model}</h2>
             {isPlusOrPremium(user?.plan) && (selectedVehicle.nickname || selectedVehicle.color) && (
-              <p className="text-sm text-revis-green mb-1">
+              <p className="text-sm text-[#34a06a] mb-1">
                 {selectedVehicle.nickname && <span className="font-medium">{selectedVehicle.nickname}</span>}
                 {selectedVehicle.nickname && selectedVehicle.color && <span className="mx-1">•</span>}
-                {selectedVehicle.color && <span>Cor: {selectedVehicle.color}</span>}
+                {selectedVehicle.color && <span>{t('colorLabelPrefix')}: {colorLabel(selectedVehicle.color)}</span>}
               </p>
             )}
-            <p className="text-sm text-revis-gray">{selectedVehicle.year} • {(selectedVehicle.current_mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km</p>
+            <p className="text-sm text-[--color-revis-gray]">{selectedVehicle.year} • {(selectedVehicle.current_mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km</p>
           </div>
           {selectedVehicle.status !== 'archived' && (
             <div className="flex gap-2">
+              <input
+                id="crlv-header-input"
+                type="file"
+                accept="application/pdf,image/jpeg,image/png,image/webp"
+                className="hidden"
+                disabled={isUploadingCrlv}
+                onChange={e => {
+                  const file = e.target.files?.[0];
+                  if (file) void handleVehicleDocUploadFromHeader(file);
+                  e.target.value = '';
+                }}
+              />
+              <button
+                type="button"
+                disabled={isUploadingCrlv}
+                onClick={() => {
+                  if (selectedVehicle.document_path) {
+                    void openStorageFile(selectedVehicle.document_path);
+                  } else {
+                    document.getElementById('crlv-header-input')?.click();
+                  }
+                }}
+                className={`p-2 rounded-lg transition-colors ${
+                  selectedVehicle.document_path
+                    ? 'text-[#34a06a] hover:bg-[#34a06a]/10'
+                    : 'text-[--color-revis-gray] hover:text-[#34a06a] hover:bg-[#34a06a]/10'
+                } ${isUploadingCrlv ? 'opacity-50 cursor-wait' : ''}`}
+                title={selectedVehicle.document_path ? t('crlvOpenAria') : t('crlvUploadAria')}
+              >
+                {isUploadingCrlv ? <Loader2 className="w-5 h-5 animate-spin" /> : <Paperclip className="w-5 h-5" />}
+              </button>
+              <button
+                type="button"
+                disabled={isGeneratingReport}
+                onClick={() => void handleExportVehicleReport()}
+                className={`p-2 rounded-lg text-[--color-revis-gray] hover:text-[#34a06a] hover:bg-[#34a06a]/10 transition-colors ${isGeneratingReport ? 'opacity-50 cursor-wait' : ''}`}
+                title={t('exportReportAria')}
+              >
+                {isGeneratingReport ? <Loader2 className="w-5 h-5 animate-spin" /> : <FileText className="w-5 h-5" />}
+              </button>
               <button 
                 onClick={() => {
                   setNewVehicle(selectedVehicle);
@@ -3757,14 +4507,14 @@ export default function App() {
                   setMileageInput(formatMileageThousandsDots(selectedVehicle.current_mileage ?? 0));
                   setShowAddVehicle(true);
                 }}
-                className="p-2 text-revis-gray hover:text-revis-green hover:bg-revis-green/10 rounded-lg transition-colors"
-                title="Editar veículo"
+                className="p-2 text-[--color-revis-gray] hover:text-[#34a06a] hover:bg-[#34a06a]/10 rounded-lg transition-colors"
+                title={t('editVehicleAria')}
               >
                 <Pencil className="w-5 h-5" />
               </button>
               <button 
                 onClick={() => setShowDeleteVehicleModal(true)}
-                className="p-2 text-revis-alert-critical hover:bg-revis-alert-critical/10 rounded-lg transition-colors"
+                className="p-2 text-[#e0473f] hover:bg-revis-alert-critical/10 rounded-lg transition-colors"
                 title={t('deleteVehicleAria')}
               >
                 <Trash2 className="w-5 h-5" />
@@ -3774,13 +4524,13 @@ export default function App() {
         </div>
 
         {/* Fueling History Card */}
-        <div className="bg-revis-dark-gray rounded-2xl p-5 border border-revis-gray/20">
+        <div className="glass rounded-2xl p-5 border border-[--color-border]">
           <div
             className="flex justify-between items-center cursor-pointer gap-2"
             onClick={() => setExpandedCards(prev => ({ ...prev, mileage: !prev.mileage }))}
           >
             <div className="flex items-center gap-2 min-w-0">
-              <h3 className="font-bold text-revis-heading truncate">{t('mileageHistory')}</h3>
+              <h3 className="font-bold text-[--color-heading] font-display truncate">{t('mileageHistory')}</h3>
               <div
                 ref={mileageHelpRef}
                 className="relative shrink-0"
@@ -3791,21 +4541,21 @@ export default function App() {
                   aria-label={t('mileageHelpTooltip')}
                   aria-expanded={showMileageHelp}
                   onClick={() => setShowMileageHelp(prev => !prev)}
-                  className="flex items-center justify-center w-5 h-5 rounded-full bg-revis-gray/20 text-revis-gray text-[11px] font-bold leading-none hover:bg-revis-green/20 hover:text-revis-green transition-colors"
+                  className="flex items-center justify-center w-5 h-5 rounded-full bg-white/8 text-[--color-revis-gray] text-[11px] font-bold leading-none hover:bg-[#34a06a]/20 hover:text-[#34a06a] transition-colors"
                 >
                   ?
                 </button>
                 {showMileageHelp && (
                   <div
                     role="tooltip"
-                    className="absolute left-0 top-full mt-2 z-30 w-[260px] max-w-[calc(100vw-2.5rem)] bg-revis-black border border-revis-gray/30 rounded-lg p-3 text-xs text-revis-light-gray leading-relaxed shadow-lg"
+                    className="absolute left-0 top-full mt-2 z-30 w-[260px] max-w-[calc(100vw-2.5rem)] bg-[--color-bg] border border-[--color-border] rounded-lg p-3 text-xs text-[--color-text] leading-relaxed shadow-lg"
                   >
                     {t('mileageHelpTooltip')}
                   </div>
                 )}
               </div>
             </div>
-            {expandedCards.mileage ? <ChevronUp className="w-5 h-5 text-revis-gray shrink-0" /> : <ChevronDown className="w-5 h-5 text-revis-gray shrink-0" />}
+            {expandedCards.mileage ? <ChevronUp className="w-5 h-5 text-[--color-revis-gray] shrink-0" /> : <ChevronDown className="w-5 h-5 text-[--color-revis-gray] shrink-0" />}
           </div>
           
           {expandedCards.mileage && (
@@ -3813,16 +4563,16 @@ export default function App() {
               {selectedVehicle.status !== 'archived' && (
                 <button 
                   onClick={openCreateMileage}
-                  className="w-full bg-revis-green/10 text-revis-green font-medium px-4 py-3 rounded-xl text-sm hover:bg-revis-green/20 transition-colors mb-4 text-left"
+                  className="w-full bg-[#34a06a]/10 text-[#34a06a] font-medium px-4 py-3 rounded-xl text-sm hover:bg-[#34a06a]/20 transition-colors mb-4 text-left"
                 >
                   {t('addLog')}
                 </button>
               )}
 
-              <div className="mb-4">
+              <div className="mb-4 relative">
                 <button
                   onClick={toggleDateFilters}
-                  className="flex items-center gap-2 text-xs text-revis-gray hover:text-revis-green transition-colors mb-2"
+                  className="flex items-center gap-2 text-xs text-[--color-revis-gray] hover:text-[#34a06a] transition-colors mb-2"
                 >
                   <Calendar className="w-4 h-4" />
                   {t('filterByDate')}
@@ -3830,32 +4580,32 @@ export default function App() {
                 </button>
 
                 {showDateFilters && (
-                  <div className="animate-in fade-in slide-in-from-top-2 duration-200 relative rounded-lg min-h-[7.5rem]">
+                  <div className="glass animate-in fade-in slide-in-from-top-2 duration-200 absolute z-30 top-full mt-2 left-0 rounded-xl p-3 w-[17.5rem] shadow-xl">
                     <div
                       className={`flex flex-col gap-2 ${isFreePlan(user?.plan) ? 'opacity-[0.38] pointer-events-none' : ''}`}
                       aria-hidden={isFreePlan(user?.plan)}
                     >
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid grid-cols-2 gap-1.5">
                         <div>
-                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateStartLabel')}</label>
+                          <label className="text-[10px] text-[--color-revis-gray] mb-1 block">{t('dateStartLabel')}</label>
                           <LocalizedDateInput
                             dateFormat={dateFormat}
                             locale={getLocaleFromLanguage(language)}
                             value={mileageFilterDate.start}
                             onChange={handleMileageStartChange}
                             ariaLabel={t('dateStartLabel')}
-                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                            className="w-full input-glass text-[11px] px-2 py-1.5"
                           />
                         </div>
                         <div>
-                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateEndLabel')}</label>
+                          <label className="text-[10px] text-[--color-revis-gray] mb-1 block">{t('dateEndLabel')}</label>
                           <LocalizedDateInput
                             dateFormat={dateFormat}
                             locale={getLocaleFromLanguage(language)}
                             value={mileageFilterDate.end}
                             onChange={handleMileageEndChange}
                             ariaLabel={t('dateEndLabel')}
-                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                            className="w-full input-glass text-[11px] px-2 py-1.5"
                           />
                         </div>
                       </div>
@@ -3870,17 +4620,17 @@ export default function App() {
                       </button>
                     </div>
                     {isFreePlan(user?.plan) && (
-                      <div className="absolute inset-0 z-10 rounded-lg bg-revis-black/65 border border-revis-gray/20 flex flex-col items-center justify-center gap-2 p-4 text-center">
+                      <div className="absolute inset-0 z-10 rounded-lg bg-[--color-bg]/75 border border-[--color-border] flex flex-col items-center justify-center gap-2 p-4 text-center">
                         <PremiumCrown
                           tooltip={t('premiumCrownTooltip')}
                           onOpenPlans={() => setShowUpgradeModal(true)}
                           size="lg"
                         />
-                        <p className="text-[11px] text-revis-light-gray leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
+                        <p className="text-[11px] text-[--color-text] leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
                         <button
                           type="button"
                           onClick={() => setShowUpgradeModal(true)}
-                          className="text-xs font-bold text-revis-green underline decoration-revis-green/40 hover:text-revis-green/90"
+                          className="text-xs font-bold text-[#34a06a] underline decoration-revis-green/40 hover:text-[#34a06a]/90"
                         >
                           {t('plans')}
                         </button>
@@ -3890,8 +4640,8 @@ export default function App() {
                 )}
               </div>
 
-              <div className="space-y-2">
-                <div className="grid grid-cols-5 gap-1 text-[10px] sm:text-xs text-revis-gray font-medium pl-1 pr-12 text-center">
+              <div className="space-y-3">
+                <div className="hidden sm:grid sm:grid-cols-5 sm:gap-1 sm:text-xs text-[--color-revis-gray] font-medium pl-1 pr-12 text-center">
                   <span>{t('date')}</span>
                   <span>{t('value')}</span>
                   <span>{t('litersLabel')}</span>
@@ -3957,28 +4707,51 @@ export default function App() {
                         const stableKey = log.id ? String(log.id) : `${log.date}-${log.mileage}-${index}`;
                         const eff = efficiencyByKey.get(stableKey) ?? { kmPerLiter: null, isInitial: false };
 
+                        const valorText = log.valor !== null && log.valor !== undefined
+                          ? formatAppCurrency(Number(log.valor), currency, language)
+                          : '-';
+                        const litrosText = log.litros !== null && log.litros !== undefined
+                          ? `${formatDecimal(Number(log.litros), language, 2)} ${t('litersShort')}`
+                          : '-';
+                        const kmText = (log.mileage || 0).toLocaleString(getLocaleFromLanguage(language));
+                        const kmPerLiterText = eff.isInitial
+                          ? t('initialRecord')
+                          : eff.kmPerLiter !== null
+                          ? `${formatDecimal(eff.kmPerLiter, language, 1)} km/l`
+                          : '-';
+
                         return (
-                          <div key={stableKey} className="relative grid grid-cols-5 gap-1 text-[11px] sm:text-xs pl-1 pr-12 py-2 border-b border-revis-gray/10 last:border-0 text-center items-center group">
-                            <span className="text-revis-light-gray break-words">{formatAppDate(log.date, dateFormat)}</span>
-                            <span className="text-revis-light-gray break-words">
-                              {log.valor !== null && log.valor !== undefined
-                                ? formatAppCurrency(Number(log.valor), currency, language)
-                                : '-'}
-                            </span>
-                            <span className="text-revis-light-gray break-words">
-                              {log.litros !== null && log.litros !== undefined
-                                ? `${formatDecimal(Number(log.litros), language, 2)} ${t('litersShort')}`
-                                : '-'}
-                            </span>
-                            <span className="text-revis-light-gray break-words">{(log.mileage || 0).toLocaleString(getLocaleFromLanguage(language))}</span>
-                            <span className="text-revis-light-gray break-words">
-                              {eff.isInitial
-                                ? t('initialRecord')
-                                : eff.kmPerLiter !== null
-                                ? `${formatDecimal(eff.kmPerLiter, language, 1)} km/l`
-                                : '-'}
-                            </span>
-                            <div className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                          <div key={stableKey} className="relative border-b border-[--color-border] last:border-0 py-3.5 pr-14 group">
+                            {/* Mobile: cartão empilhado, com data/valor em destaque e os 3 dados secundários num mini-grid com rótulo próprio */}
+                            <div className="sm:hidden pl-1 space-y-2.5">
+                              <div className="flex items-baseline justify-between gap-2">
+                                <span className="text-sm font-semibold text-[--color-text]">{formatAppDate(log.date, dateFormat)}</span>
+                                <span className="text-sm font-semibold text-[--color-text] break-words text-right">{valorText}</span>
+                              </div>
+                              <div className="grid grid-cols-3 gap-2">
+                                <div className="flex flex-col gap-0.5 min-w-0">
+                                  <span className="text-[9px] uppercase tracking-wide text-[--color-revis-gray]/70">{t('litersLabel')}</span>
+                                  <span className="text-xs font-medium text-[--color-text] truncate">{litrosText}</span>
+                                </div>
+                                <div className="flex flex-col gap-0.5 min-w-0">
+                                  <span className="text-[9px] uppercase tracking-wide text-[--color-revis-gray]/70">{t('km')}</span>
+                                  <span className="text-xs font-medium text-[--color-text] truncate">{kmText}</span>
+                                </div>
+                                <div className="flex flex-col gap-0.5 min-w-0">
+                                  <span className="text-[9px] uppercase tracking-wide text-[--color-revis-gray]/70">{t('kmPerLiter')}</span>
+                                  <span className="text-xs font-medium text-[--color-text] truncate">{kmPerLiterText}</span>
+                                </div>
+                              </div>
+                            </div>
+                            {/* sm e acima: grade original em colunas */}
+                            <div className="hidden sm:grid sm:grid-cols-5 sm:gap-1 sm:text-xs sm:pl-1 sm:text-center sm:items-center">
+                              <span className="text-[--color-text] break-words">{formatAppDate(log.date, dateFormat)}</span>
+                              <span className="text-[--color-text] break-words">{valorText}</span>
+                              <span className="text-[--color-text] break-words">{litrosText}</span>
+                              <span className="text-[--color-text] break-words">{kmText}</span>
+                              <span className="text-[--color-text] break-words">{kmPerLiterText}</span>
+                            </div>
+                            <div className="absolute right-1 top-3.5 -translate-y-0 sm:top-1/2 sm:-translate-y-1/2 flex items-center gap-1">
                               <button
                                 type="button"
                                 onClick={() => openViewRecord({ kind: 'mileage', data: log })}
@@ -3986,6 +4759,19 @@ export default function App() {
                                 className="p-1 text-gray-400 hover:text-gray-200 transition-colors"
                               >
                                 <Eye className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => { if (log.attachment_path) void openStorageFile(log.attachment_path); }}
+                                aria-label={t('attachmentOpenAria')}
+                                disabled={!log.attachment_path}
+                                className={`p-1 transition-colors ${
+                                  log.attachment_path
+                                    ? 'text-[#34a06a] hover:text-[#2d8f5d] cursor-pointer'
+                                    : 'text-gray-600 cursor-default'
+                                }`}
+                              >
+                                <Paperclip className="w-4 h-4" />
                               </button>
                               {log.id && (
                                 <button
@@ -4003,13 +4789,13 @@ export default function App() {
                       })}
 
                       {displayLogs.length === 0 && (
-                         <div className="text-center text-xs text-revis-gray py-2">{t('noRecords')}</div>
+                         <div className="text-center text-xs text-[--color-revis-gray] py-2">{t('noRecords')}</div>
                       )}
 
                       {hasMore && (
                         <button
                           onClick={() => setMileageLimit(prev => prev + 3)}
-                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-revis-green/40 bg-revis-green/10 text-xs text-revis-green font-medium hover:bg-revis-green/20 hover:border-revis-green transition-colors"
+                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-[#34a06a]/40 bg-[#34a06a]/10 text-xs text-[#34a06a] font-medium hover:bg-[#34a06a]/20 hover:border-[#34a06a] transition-colors"
                         >
                           {t('seeMore')}
                         </button>
@@ -4039,23 +4825,23 @@ export default function App() {
                 const mileages = footerLogs.map(l => Number(l.mileage) || 0);
                 const totalKm = Math.max(...mileages) - Math.min(...mileages);
                 return (
-                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-revis-black/30 border-t border-revis-gray/20 rounded-b-2xl">
+                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-black/30 border-t border-[--color-border] rounded-b-2xl">
                     <div className="grid grid-cols-3 gap-2 text-center">
                       <div>
-                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
-                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                        <div className="text-[10px] text-[--color-revis-gray] uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
+                        <div className="text-[--color-heading] font-display font-bold text-xs sm:text-sm break-words">
                           {formatAppCurrency(totalValue, currency, language)}
                         </div>
                       </div>
                       <div>
-                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalLiters')}</div>
-                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                        <div className="text-[10px] text-[--color-revis-gray] uppercase tracking-wider mb-0.5">{t('totalLiters')}</div>
+                        <div className="text-[--color-heading] font-display font-bold text-xs sm:text-sm break-words">
                           {`${formatDecimal(totalLiters, language, 2)} ${t('litersShort')}`}
                         </div>
                       </div>
                       <div>
-                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('kmDriven')}</div>
-                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                        <div className="text-[10px] text-[--color-revis-gray] uppercase tracking-wider mb-0.5">{t('kmDriven')}</div>
+                        <div className="text-[--color-heading] font-display font-bold text-xs sm:text-sm break-words">
                           {`${totalKm.toLocaleString(getLocaleFromLanguage(language))} km`}
                         </div>
                       </div>
@@ -4068,13 +4854,13 @@ export default function App() {
         </div>
 
         {/* Service History Card */}
-        <div className="bg-revis-dark-gray rounded-2xl p-5 border border-revis-gray/20">
+        <div className="glass rounded-2xl p-5 border border-[--color-border]">
           <div 
             className="flex justify-between items-center cursor-pointer" 
             onClick={() => setExpandedCards(prev => ({ ...prev, services: !prev.services }))}
           >
-            <h3 className="font-bold text-revis-heading">{t('serviceHistory')}</h3>
-            {expandedCards.services ? <ChevronUp className="w-5 h-5 text-revis-gray" /> : <ChevronDown className="w-5 h-5 text-revis-gray" />}
+            <h3 className="font-bold text-[--color-heading] font-display">{t('serviceHistory')}</h3>
+            {expandedCards.services ? <ChevronUp className="w-5 h-5 text-[--color-revis-gray]" /> : <ChevronDown className="w-5 h-5 text-[--color-revis-gray]" />}
           </div>
 
           {expandedCards.services && (
@@ -4082,16 +4868,16 @@ export default function App() {
               {selectedVehicle.status !== 'archived' && (
                 <button 
                   onClick={openCreateLog}
-                  className="w-full bg-revis-green/10 text-revis-green font-medium px-4 py-3 rounded-xl text-sm hover:bg-revis-green/20 transition-colors mb-4 text-left"
+                  className="w-full bg-[#34a06a]/10 text-[#34a06a] font-medium px-4 py-3 rounded-xl text-sm hover:bg-[#34a06a]/20 transition-colors mb-4 text-left"
                 >
                   {t('addLog')}
                 </button>
               )}
 
-              <div className="mb-4">
+              <div className="mb-4 relative">
                 <button
                   onClick={toggleDateFilters}
-                  className="flex items-center gap-2 text-xs text-revis-gray hover:text-revis-green transition-colors mb-2"
+                  className="flex items-center gap-2 text-xs text-[--color-revis-gray] hover:text-[#34a06a] transition-colors mb-2"
                 >
                   <Calendar className="w-4 h-4" />
                   {t('filterByDate')}
@@ -4099,32 +4885,32 @@ export default function App() {
                 </button>
 
                 {showDateFilters && (
-                  <div className="animate-in fade-in slide-in-from-top-2 duration-200 relative rounded-lg min-h-[7.5rem]">
+                  <div className="glass animate-in fade-in slide-in-from-top-2 duration-200 absolute z-30 top-full mt-2 left-0 rounded-xl p-3 w-[17.5rem] shadow-xl">
                     <div
                       className={`flex flex-col gap-2 ${isFreePlan(user?.plan) ? 'opacity-[0.38] pointer-events-none' : ''}`}
                       aria-hidden={isFreePlan(user?.plan)}
                     >
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid grid-cols-2 gap-1.5">
                         <div>
-                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateStartLabel')}</label>
+                          <label className="text-[10px] text-[--color-revis-gray] mb-1 block">{t('dateStartLabel')}</label>
                           <LocalizedDateInput
                             dateFormat={dateFormat}
                             locale={getLocaleFromLanguage(language)}
                             value={servicesFilterDate.start}
                             onChange={handleServicesStartChange}
                             ariaLabel={t('dateStartLabel')}
-                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                            className="w-full input-glass text-[11px] px-2 py-1.5"
                           />
                         </div>
                         <div>
-                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateEndLabel')}</label>
+                          <label className="text-[10px] text-[--color-revis-gray] mb-1 block">{t('dateEndLabel')}</label>
                           <LocalizedDateInput
                             dateFormat={dateFormat}
                             locale={getLocaleFromLanguage(language)}
                             value={servicesFilterDate.end}
                             onChange={handleServicesEndChange}
                             ariaLabel={t('dateEndLabel')}
-                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                            className="w-full input-glass text-[11px] px-2 py-1.5"
                           />
                         </div>
                       </div>
@@ -4139,17 +4925,17 @@ export default function App() {
                       </button>
                     </div>
                     {isFreePlan(user?.plan) && (
-                      <div className="absolute inset-0 z-10 rounded-lg bg-revis-black/65 border border-revis-gray/20 flex flex-col items-center justify-center gap-2 p-4 text-center">
+                      <div className="absolute inset-0 z-10 rounded-lg bg-[--color-bg]/75 border border-[--color-border] flex flex-col items-center justify-center gap-2 p-4 text-center">
                         <PremiumCrown
                           tooltip={t('premiumCrownTooltip')}
                           onOpenPlans={() => setShowUpgradeModal(true)}
                           size="lg"
                         />
-                        <p className="text-[11px] text-revis-light-gray leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
+                        <p className="text-[11px] text-[--color-text] leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
                         <button
                           type="button"
                           onClick={() => setShowUpgradeModal(true)}
-                          className="text-xs font-bold text-revis-green underline decoration-revis-green/40 hover:text-revis-green/90"
+                          className="text-xs font-bold text-[#34a06a] underline decoration-revis-green/40 hover:text-[#34a06a]/90"
                         >
                           {t('plans')}
                         </button>
@@ -4159,8 +4945,8 @@ export default function App() {
                 )}
               </div>
 
-              <div className="space-y-2">
-                <div className="grid grid-cols-4 text-xs text-revis-gray font-medium pl-2 pr-16 gap-2 text-center">
+              <div className="space-y-3">
+                <div className="hidden sm:grid sm:grid-cols-4 sm:text-xs text-[--color-revis-gray] font-medium pl-2 pr-16 gap-2 text-center">
                   <span>{t('date')}</span>
                   <span>{t('service')}</span>
                   <span>{t('responsible')}</span>
@@ -4180,19 +4966,35 @@ export default function App() {
                       return true;
                     });
                   }
-                  
+
                   const hasMore = displayLogs.length > servicesLimit;
                   const paginatedLogs = displayLogs.slice(0, servicesLimit);
 
                   return (
                     <>
-                      {paginatedLogs.map(log => (
-                        <div key={log.id} className="relative grid grid-cols-4 text-sm pl-2 pr-16 py-2 border-b border-revis-gray/10 last:border-0 gap-2 items-center text-center group">
-                          <span className="text-revis-light-gray text-xs">{formatAppDate(log.date, dateFormat)}</span>
-                          <span className="text-revis-light-gray truncate" title={log.description}>{log.description}</span>
-                          <span className="text-revis-light-gray truncate" title={log.provider || '-'}>{log.provider || '-'}</span>
-                          <span className="text-revis-green text-xs">{formatAppCurrency(log.cost, currency, language)}</span>
-                          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                      {paginatedLogs.map(log => {
+                        const valorText = formatAppCurrency(log.cost, currency, language);
+                        return (
+                        <div key={log.id} className="relative border-b border-[--color-border] last:border-0 py-3.5 pr-16 group">
+                          <div className="sm:hidden pl-2 pr-2 space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[--color-text] text-xs">{formatAppDate(log.date, dateFormat)}</span>
+                              <span className="text-[#34a06a] text-sm font-semibold">{valorText}</span>
+                            </div>
+                            <div className="min-w-0">
+                              <p className="text-[--color-text] text-sm font-medium truncate" title={log.description}>{log.description}</p>
+                              {log.provider ? (
+                                <p className="text-[--color-revis-gray] text-[11px] truncate mt-0.5" title={log.provider}>{t('responsible')}: {log.provider}</p>
+                              ) : null}
+                            </div>
+                          </div>
+                          <div className="hidden sm:grid sm:grid-cols-4 text-sm pl-2 gap-2 items-center text-center">
+                            <span className="text-[--color-text] text-xs">{formatAppDate(log.date, dateFormat)}</span>
+                            <span className="text-[--color-text] truncate" title={log.description}>{log.description}</span>
+                            <span className="text-[--color-text] truncate" title={log.provider || '-'}>{log.provider || '-'}</span>
+                            <span className="text-[#34a06a] text-xs">{valorText}</span>
+                          </div>
+                          <div className="absolute right-2 top-3.5 -translate-y-0 sm:top-1/2 sm:-translate-y-1/2 flex items-center gap-2">
                             <button
                               type="button"
                               onClick={() => openViewRecord({ kind: 'maintenance', data: log })}
@@ -4200,6 +5002,19 @@ export default function App() {
                               className="p-1 text-gray-400 hover:text-gray-200 transition-colors"
                             >
                               <Eye className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => { if (log.attachment_path) void openStorageFile(log.attachment_path); }}
+                              aria-label={t('attachmentOpenAria')}
+                              disabled={!log.attachment_path}
+                              className={`p-1 transition-colors ${
+                                log.attachment_path
+                                  ? 'text-[#34a06a] hover:text-[#2d8f5d] cursor-pointer'
+                                  : 'text-gray-600 cursor-default'
+                              }`}
+                            >
+                              <Paperclip className="w-4 h-4" />
                             </button>
                             <button
                               type="button"
@@ -4211,16 +5026,17 @@ export default function App() {
                             </button>
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
 
                       {displayLogs.length === 0 && (
-                        <div className="text-center text-xs text-revis-gray py-2">{t('noRecords')}</div>
+                        <div className="text-center text-xs text-[--color-revis-gray] py-2">{t('noRecords')}</div>
                       )}
 
                       {hasMore && (
                         <button 
                           onClick={() => setServicesLimit(prev => prev + 3)}
-                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-revis-green/40 bg-revis-green/10 text-xs text-revis-green font-medium hover:bg-revis-green/20 hover:border-revis-green transition-colors"
+                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-[#34a06a]/40 bg-[#34a06a]/10 text-xs text-[#34a06a] font-medium hover:bg-[#34a06a]/20 hover:border-[#34a06a] transition-colors"
                         >
                           {t('seeMore')}
                         </button>
@@ -4246,11 +5062,11 @@ export default function App() {
                 if (footerLogs.length === 0) return null;
                 const totalValue = footerLogs.reduce((acc, log) => acc + (Number(log.cost) || 0), 0);
                 return (
-                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-revis-black/30 border-t border-revis-gray/20 rounded-b-2xl">
+                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-black/30 border-t border-[--color-border] rounded-b-2xl">
                     <div className="grid grid-cols-1 gap-2 text-center">
                       <div>
-                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
-                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                        <div className="text-[10px] text-[--color-revis-gray] uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
+                        <div className="text-[--color-heading] font-display font-bold text-xs sm:text-sm break-words">
                           {formatAppCurrency(totalValue, currency, language)}
                         </div>
                       </div>
@@ -4263,7 +5079,7 @@ export default function App() {
         </div>
 
         {/* Financial Records Card */}
-        <div className={`bg-revis-dark-gray rounded-2xl p-5 border ${isFreePlan(user?.plan) ? 'border-revis-gray/20 opacity-75' : 'border-revis-gray/20'}`}>
+        <div className={`glass rounded-2xl p-5 border ${isFreePlan(user?.plan) ? 'border-[--color-border] opacity-75' : 'border-[--color-border]'}`}>
           <div 
             className="flex justify-between items-center cursor-pointer" 
             onClick={() => {
@@ -4275,16 +5091,16 @@ export default function App() {
             }}
           >
             <div className="flex items-center gap-2">
-              <h3 className="font-bold text-revis-heading">{t('financialSectionTitle')}</h3>
+              <h3 className="font-bold text-[--color-heading] font-display">{t('financialSectionTitle')}</h3>
               <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" />
             </div>
             {isPlusOrPremium(user?.plan) && (
-              expandedCards.financial ? <ChevronUp className="w-5 h-5 text-revis-gray" /> : <ChevronDown className="w-5 h-5 text-revis-gray" />
+              expandedCards.financial ? <ChevronUp className="w-5 h-5 text-[--color-revis-gray]" /> : <ChevronDown className="w-5 h-5 text-[--color-revis-gray]" />
             )}
           </div>
 
           {isFreePlan(user?.plan) && (
-            <div className="mt-2 text-xs text-revis-green font-medium flex items-center gap-1">
+            <div className="mt-2 text-xs text-[#34a06a] font-medium flex items-center gap-1">
               {t('plansUnlockFinancial')}
             </div>
           )}
@@ -4294,16 +5110,16 @@ export default function App() {
               {selectedVehicle.status !== 'archived' && (
                 <button 
                   onClick={openCreateFinancial}
-                  className="w-full bg-revis-green/10 text-revis-green font-medium px-4 py-3 rounded-xl text-sm hover:bg-revis-green/20 transition-colors mb-4 text-left"
+                  className="w-full bg-[#34a06a]/10 text-[#34a06a] font-medium px-4 py-3 rounded-xl text-sm hover:bg-[#34a06a]/20 transition-colors mb-4 text-left"
                 >
                   {t('addLog')}
                 </button>
               )}
 
-              <div className="mb-4">
+              <div className="mb-4 relative">
                 <button
                   onClick={toggleDateFilters}
-                  className="flex items-center gap-2 text-xs text-revis-gray hover:text-revis-green transition-colors mb-2"
+                  className="flex items-center gap-2 text-xs text-[--color-revis-gray] hover:text-[#34a06a] transition-colors mb-2"
                 >
                   <Calendar className="w-4 h-4" />
                   {t('filterByDate')}
@@ -4311,32 +5127,32 @@ export default function App() {
                 </button>
 
                 {showDateFilters && (
-                  <div className="animate-in fade-in slide-in-from-top-2 duration-200 relative rounded-lg min-h-[7.5rem]">
+                  <div className="glass animate-in fade-in slide-in-from-top-2 duration-200 absolute z-30 top-full mt-2 left-0 rounded-xl p-3 w-[17.5rem] shadow-xl">
                     <div
                       className={`flex flex-col gap-2 ${isFreePlan(user?.plan) ? 'opacity-[0.38] pointer-events-none' : ''}`}
                       aria-hidden={isFreePlan(user?.plan)}
                     >
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid grid-cols-2 gap-1.5">
                         <div>
-                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateStartLabel')}</label>
+                          <label className="text-[10px] text-[--color-revis-gray] mb-1 block">{t('dateStartLabel')}</label>
                           <LocalizedDateInput
                             dateFormat={dateFormat}
                             locale={getLocaleFromLanguage(language)}
                             value={financialFilterDate.start}
                             onChange={handleFinancialStartChange}
                             ariaLabel={t('dateStartLabel')}
-                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                            className="w-full input-glass text-[11px] px-2 py-1.5"
                           />
                         </div>
                         <div>
-                          <label className="text-[10px] text-revis-gray mb-1 block">{t('dateEndLabel')}</label>
+                          <label className="text-[10px] text-[--color-revis-gray] mb-1 block">{t('dateEndLabel')}</label>
                           <LocalizedDateInput
                             dateFormat={dateFormat}
                             locale={getLocaleFromLanguage(language)}
                             value={financialFilterDate.end}
                             onChange={handleFinancialEndChange}
                             ariaLabel={t('dateEndLabel')}
-                            className="w-full bg-revis-black/30 text-revis-light-gray text-[11px] rounded-lg px-2 py-1.5 border border-revis-gray/20 focus:border-revis-green outline-none"
+                            className="w-full input-glass text-[11px] px-2 py-1.5"
                           />
                         </div>
                       </div>
@@ -4351,17 +5167,17 @@ export default function App() {
                       </button>
                     </div>
                     {isFreePlan(user?.plan) && (
-                      <div className="absolute inset-0 z-10 rounded-lg bg-revis-black/65 border border-revis-gray/20 flex flex-col items-center justify-center gap-2 p-4 text-center">
+                      <div className="absolute inset-0 z-10 rounded-lg bg-[--color-bg]/75 border border-[--color-border] flex flex-col items-center justify-center gap-2 p-4 text-center">
                         <PremiumCrown
                           tooltip={t('premiumCrownTooltip')}
                           onOpenPlans={() => setShowUpgradeModal(true)}
                           size="lg"
                         />
-                        <p className="text-[11px] text-revis-light-gray leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
+                        <p className="text-[11px] text-[--color-text] leading-snug max-w-[14rem]">{t('filtersUpgradeHint')}</p>
                         <button
                           type="button"
                           onClick={() => setShowUpgradeModal(true)}
-                          className="text-xs font-bold text-revis-green underline decoration-revis-green/40 hover:text-revis-green/90"
+                          className="text-xs font-bold text-[#34a06a] underline decoration-revis-green/40 hover:text-[#34a06a]/90"
                         >
                           {t('plans')}
                         </button>
@@ -4371,12 +5187,12 @@ export default function App() {
                 )}
               </div>
 
-              <div className="space-y-2">
-                <div className="grid grid-cols-4 text-xs text-revis-gray font-medium pl-2 pr-16 gap-2 text-center">
-                  <span>Vencimento</span>
-                  <span>Descrição</span>
-                  <span>Situação</span>
-                  <span>Valor</span>
+              <div className="space-y-3">
+                <div className="hidden sm:grid sm:grid-cols-4 sm:text-xs text-[--color-revis-gray] font-medium pl-2 pr-16 gap-2 text-center">
+                  <span>{t('dueDateLabel')}</span>
+                  <span>{t('descriptionLabel')}</span>
+                  <span>{t('statusLabel')}</span>
+                  <span>{t('value')}</span>
                 </div>
 
                 {(() => {
@@ -4392,19 +5208,35 @@ export default function App() {
                       return true;
                     });
                   }
-                  
+
                   const hasMore = displayRecords.length > financialLimit;
                   const paginatedRecords = displayRecords.slice(0, financialLimit);
 
                   return (
                     <>
-                      {paginatedRecords.map(rec => (
-                        <div key={rec.id} className="relative grid grid-cols-4 text-sm pl-2 pr-16 py-2 border-b border-revis-gray/10 last:border-0 gap-2 items-center text-center group">
-                          <span className="text-revis-light-gray text-xs">{formatAppDate(rec.due_date, dateFormat)}</span>
-                          <span className="text-revis-light-gray truncate" title={rec.description}>{rec.description}</span>
-                          <span className={`text-xs ${rec.status === 'Pago' ? 'text-revis-green' : rec.status === 'Atrasado' ? 'text-revis-alert-critical' : 'text-revis-alert-medium'}`}>{rec.status}</span>
-                          <span className="text-revis-green text-xs">{formatAppCurrency(rec.value, currency, language)}</span>
-                          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                      {paginatedRecords.map(rec => {
+                        const statusClass = rec.status === 'Pago' ? 'text-[#34a06a]' : rec.status === 'Atrasado' ? 'text-[#e0473f]' : 'text-[#ffcc00]';
+                        const statusLabelText = financialStatusLabel(rec.status);
+                        const valorText = formatAppCurrency(rec.value, currency, language);
+                        return (
+                        <div key={rec.id} className="relative border-b border-[--color-border] last:border-0 py-3.5 pr-16 group">
+                          <div className="sm:hidden pl-2 pr-2 space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[--color-text] text-xs">{formatAppDate(rec.due_date, dateFormat)}</span>
+                              <span className="text-[#34a06a] text-sm font-semibold">{valorText}</span>
+                            </div>
+                            <div className="flex items-center justify-between gap-2 min-w-0">
+                              <p className="text-[--color-text] text-sm font-medium truncate" title={rec.description}>{rec.description}</p>
+                              <span className={`text-[11px] font-medium shrink-0 ${statusClass}`}>{statusLabelText}</span>
+                            </div>
+                          </div>
+                          <div className="hidden sm:grid sm:grid-cols-4 text-sm pl-2 gap-2 items-center text-center">
+                            <span className="text-[--color-text] text-xs">{formatAppDate(rec.due_date, dateFormat)}</span>
+                            <span className="text-[--color-text] truncate" title={rec.description}>{rec.description}</span>
+                            <span className={`text-xs ${statusClass}`}>{statusLabelText}</span>
+                            <span className="text-[#34a06a] text-xs">{valorText}</span>
+                          </div>
+                          <div className="absolute right-2 top-3.5 -translate-y-0 sm:top-1/2 sm:-translate-y-1/2 flex items-center gap-2">
                             <button
                               type="button"
                               onClick={() => openViewRecord({ kind: 'financial', data: rec })}
@@ -4412,6 +5244,19 @@ export default function App() {
                               className="p-1 text-gray-400 hover:text-gray-200 transition-colors"
                             >
                               <Eye className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => { if (rec.attachment_path) void openStorageFile(rec.attachment_path); }}
+                              aria-label={t('attachmentOpenAria')}
+                              disabled={!rec.attachment_path}
+                              className={`p-1 transition-colors ${
+                                rec.attachment_path
+                                  ? 'text-[#34a06a] hover:text-[#2d8f5d] cursor-pointer'
+                                  : 'text-gray-600 cursor-default'
+                              }`}
+                            >
+                              <Paperclip className="w-4 h-4" />
                             </button>
                             <button
                               type="button"
@@ -4423,16 +5268,17 @@ export default function App() {
                             </button>
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
 
                       {displayRecords.length === 0 && (
-                        <div className="text-center text-xs text-revis-gray py-2">{t('noRecords')}</div>
+                        <div className="text-center text-xs text-[--color-revis-gray] py-2">{t('noRecords')}</div>
                       )}
 
                       {hasMore && (
                         <button 
                           onClick={() => setFinancialLimit(prev => prev + 3)}
-                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-revis-green/40 bg-revis-green/10 text-xs text-revis-green font-medium hover:bg-revis-green/20 hover:border-revis-green transition-colors"
+                          className="mx-auto mt-3 flex items-center justify-center gap-1 px-4 py-2 rounded-full border border-[#34a06a]/40 bg-[#34a06a]/10 text-xs text-[#34a06a] font-medium hover:bg-[#34a06a]/20 hover:border-[#34a06a] transition-colors"
                         >
                           {t('seeMore')}
                         </button>
@@ -4458,11 +5304,11 @@ export default function App() {
                 if (footerRecords.length === 0) return null;
                 const totalValue = footerRecords.reduce((acc, rec) => acc + (Number(rec.value) || 0), 0);
                 return (
-                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-revis-black/30 border-t border-revis-gray/20 rounded-b-2xl">
+                  <div className="-mx-5 -mb-5 mt-4 px-4 py-3 bg-black/30 border-t border-[--color-border] rounded-b-2xl">
                     <div className="grid grid-cols-1 gap-2 text-center">
                       <div>
-                        <div className="text-[10px] text-revis-gray uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
-                        <div className="text-revis-heading font-bold text-xs sm:text-sm break-words">
+                        <div className="text-[10px] text-[--color-revis-gray] uppercase tracking-wider mb-0.5">{t('totalValue')}</div>
+                        <div className="text-[--color-heading] font-display font-bold text-xs sm:text-sm break-words">
                           {formatAppCurrency(totalValue, currency, language)}
                         </div>
                       </div>
@@ -4481,14 +5327,14 @@ export default function App() {
     if (isFreePlan(user?.plan)) {
       return (
         <div className="flex flex-col items-center justify-center h-[calc(100vh-140px)] text-center px-6">
-          <div className="w-20 h-20 bg-revis-dark-gray rounded-full flex items-center justify-center mb-6 animate-pulse">
-            <Shield className="w-10 h-10 text-revis-green" />
+          <div className="w-20 h-20 glass rounded-full flex items-center justify-center mb-6 animate-pulse">
+            <Shield className="w-10 h-10 text-[#34a06a]" />
           </div>
-          <h2 className="text-xl font-bold text-revis-heading mb-3">{t('premiumFeature')}</h2>
-          <p className="text-revis-gray mb-8 text-sm leading-relaxed max-w-xs mx-auto">{t('drGraxaLocked')}</p>
+          <h2 className="text-xl font-bold text-[--color-heading] font-display mb-3">{t('premiumFeature')}</h2>
+          <p className="text-[--color-revis-gray] mb-8 text-sm leading-relaxed max-w-xs mx-auto">{t('drGraxaLocked')}</p>
           <button
             onClick={() => setShowUpgradeModal(true)}
-            className="w-full max-w-xs bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors shadow-lg shadow-revis-green/20"
+            className="w-full max-w-xs bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors shadow-lg shadow-revis-green/20"
           >
             {t('knowPlans')}
           </button>
@@ -4511,7 +5357,7 @@ export default function App() {
     const quotaHeaderLine = (
       <p
         className={`text-center text-[11px] sm:text-xs font-medium leading-snug px-0.5 ${
-          quotaReached ? 'text-amber-800 dark:text-amber-200' : 'text-revis-gray'
+          quotaReached ? 'text-amber-800 dark:text-amber-200' : 'text-[--color-revis-gray]'
         }`}
         role="status"
       >
@@ -4521,35 +5367,14 @@ export default function App() {
 
     const vehicleRow = (
       <div className="mt-2 flex items-center gap-2">
-        <span className="text-xs text-revis-gray whitespace-nowrap">{t('advisorVehiclePrompt')}</span>
-        <select
-          className="flex-1 bg-revis-dark-gray border border-revis-gray/20 rounded-xl px-4 py-2 text-xs text-revis-light-gray outline-none focus:border-revis-green transition-colors appearance-none"
-          value={selectedVehicle?.id || ''}
-          onChange={(e) => {
-            const vehicleId = parseInt(e.target.value, 10);
-            const vehicle = vehicles.find(v => v.id === vehicleId);
-            setSelectedVehicle(vehicle || null);
-            if (vehicle) {
-              setExpandedCards({ mileage: false, services: false, financial: false });
-              fetchLogs(vehicle.id);
-              fetchFinancialRecords(vehicle.id);
-            } else {
-              setLogs([]);
-              setFinancialRecords([]);
-            }
-          }}
-        >
-          <option value="">Nenhum</option>
-          {[...vehicles]
-            .sort((a, b) =>
-              (a.brand || '').localeCompare(b.brand || '') || (a.model || '').localeCompare(b.model || ''),
-            )
-            .map(vehicle => (
-              <option key={vehicle.id} value={vehicle.id}>
-                {vehicle.brand} {vehicle.model} ({vehicle.year})
-              </option>
-            ))}
-        </select>
+        <span className="text-xs text-[--color-revis-gray] whitespace-nowrap">{t('advisorVehiclePrompt')}</span>
+        <CustomSelect
+          className="flex-1"
+          value={selectedVehicle?.id?.toString()||''}
+          onChange={v=>{const id=parseInt(v,10);const vh=vehicles.find(x=>x.id===id);setSelectedVehicle(vh||null);if(vh){setExpandedCards({mileage:false,services:false,financial:false});fetchLogs(vh.id);fetchFinancialRecords(vh.id);}else{setLogs([]);setFinancialRecords([]);}}}
+          options={[{value:'',label:t('optionNone')},...[...vehicles].sort((a,b)=>(a.brand||'').localeCompare(b.brand||'')||(a.model||'').localeCompare(b.model||'')).map(v=>({value:v.id.toString(),label:`${v.brand} ${v.model} (${v.year})`}))]}
+          placeholder={t('optionNone')}
+        />
       </div>
     );
 
@@ -4558,10 +5383,18 @@ export default function App() {
         <div className="flex flex-col h-[calc(100dvh-135px)] md:h-[calc(100vh-4rem)] max-w-4xl mx-auto">
           <div className="mb-3 shrink-0">
             <div className="flex justify-between items-center">
-              <h2 className="text-lg font-bold text-revis-heading flex items-center gap-2">
+              <h2 className="text-lg font-bold text-[--color-heading] font-display flex items-center gap-2">
                 <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="sm" />
-                Dr. Graxa
+                {t('advisor')}
               </h2>
+              <button
+                type="button"
+                onClick={() => { setShowChatTrash(true); void fetchChatTrash(); }}
+                className="text-xs text-[--color-revis-gray] hover:text-[#34a06a] transition-colors flex items-center gap-1"
+              >
+                <Archive className="w-3.5 h-3.5" />
+                {t('chatTrashButton')}
+              </button>
             </div>
             <div className="mt-1.5">{quotaHeaderLine}</div>
             {vehicleRow}
@@ -4571,12 +5404,12 @@ export default function App() {
             type="button"
             disabled={quotaReached}
             onClick={() => setShowDrGraxaManualModal(true)}
-            className="mt-3 w-full py-4 rounded-xl bg-revis-green text-black font-bold text-sm shadow-lg shadow-revis-green/20 hover:bg-opacity-90 transition-colors disabled:opacity-45 disabled:cursor-not-allowed flex items-center justify-center shrink-0"
+            className="mt-3 w-full py-4 rounded-xl bg-[#34a06a] text-black font-bold text-sm shadow-lg shadow-revis-green/20 hover:bg-opacity-90 transition-colors disabled:opacity-45 disabled:cursor-not-allowed flex items-center justify-center shrink-0"
           >
             <span>{t('drGraxaNewChat')}</span>
           </button>
 
-          <p className="text-xs font-semibold text-revis-heading mt-5 mb-2 shrink-0">{t('drGraxaChatsSubtitle')}</p>
+          <p className="text-xs font-semibold text-[--color-heading] font-display mt-5 mb-2 shrink-0">{t('drGraxaChatsSubtitle')}</p>
 
           <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-1 scrollbar-hide pb-4">
             {chatSessions.map(session => {
@@ -4586,10 +5419,10 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => void loadChatSession(session.id)}
-                    className="w-full bg-revis-dark-gray p-4 rounded-xl text-left hover:bg-revis-gray/20 transition-colors pr-12 border border-revis-gray/10 hover:border-revis-green/30"
+                    className="w-full glass p-4 rounded-xl text-left hover:bg-white/8 transition-colors pr-12 border border-[--color-border] hover:border-[#34a06a]/30"
                   >
-                    <h4 className="text-revis-heading font-medium text-sm line-clamp-2 mb-2">{displayTitle}</h4>
-                    <span className="text-[10px] text-revis-green font-semibold inline-flex items-center gap-1">
+                    <h4 className="text-[--color-heading] font-display font-medium text-sm line-clamp-2 mb-2">{displayTitle}</h4>
+                    <span className="text-[10px] text-[#34a06a] font-semibold inline-flex items-center gap-1">
                       <Calendar className="w-3 h-3" />
                       {formatAppDate(session.updated_at, dateFormat)}
                     </span>
@@ -4601,7 +5434,7 @@ export default function App() {
                       setChatSessionToDelete(session.id);
                       setShowDeleteChatModal(true);
                     }}
-                    className="absolute bottom-3 right-3 p-2 text-revis-alert-critical hover:bg-revis-alert-critical/10 rounded-lg transition-colors z-10"
+                    className="absolute bottom-3 right-3 p-2 text-[#e0473f] hover:bg-revis-alert-critical/10 rounded-lg transition-colors z-10"
                     title={t('deleteChatAria')}
                   >
                     <Trash2 className="w-4 h-4" />
@@ -4610,7 +5443,7 @@ export default function App() {
               );
             })}
             {chatSessions.length === 0 && (
-              <div className="text-center py-12 px-4 text-revis-gray">
+              <div className="text-center py-12 px-4 text-[--color-revis-gray]">
                 <MessageSquare className="w-12 h-12 mx-auto mb-3 opacity-20" />
                 <p className="text-sm">{t('drGraxaNoChatsYet')}</p>
               </div>
@@ -4626,7 +5459,7 @@ export default function App() {
         <button
           type="button"
           onClick={leaveDrGraxaChat}
-          className="flex items-center gap-1 text-revis-green text-sm font-bold -ml-1"
+          className="flex items-center gap-1 text-[#34a06a] text-sm font-bold -ml-1"
         >
           <ChevronLeft className="w-5 h-5" />
           {t('drGraxaBackToList')}
@@ -4637,7 +5470,7 @@ export default function App() {
       
       <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pb-4 pr-1 scrollbar-hide flex flex-col">
         {chatMessages.length === 0 && (
-          <div className="text-center text-revis-gray mt-10 px-4">
+          <div className="text-center text-[--color-revis-gray] mt-10 px-4">
             <div className="relative w-12 h-12 mx-auto mb-4 opacity-20">
               <Shield className="w-12 h-12" />
               <Wrench className="w-6 h-6 absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 fill-current" />
@@ -4651,7 +5484,7 @@ export default function App() {
             key={msg.id} 
             className={`max-w-[85%] p-3 rounded-2xl text-xs leading-relaxed shadow-md animate-in fade-in slide-in-from-bottom-2 duration-300 ${
               msg.sender === 'user' 
-                ? 'bg-revis-green text-black self-end rounded-tr-none' 
+                ? 'bg-[#34a06a] text-black self-end rounded-tr-none' 
                 : 'bg-white text-black self-start rounded-tl-none'
             }`}
           >
@@ -4664,15 +5497,15 @@ export default function App() {
         {isLoadingAi && (
            <div className="bg-white text-black self-start rounded-2xl rounded-tl-none p-3 shadow-md max-w-[85%]">
              <div className="flex gap-1">
-               <div className="w-1.5 h-1.5 bg-black rounded-full animate-bounce"></div>
-               <div className="w-1.5 h-1.5 bg-black rounded-full animate-bounce delay-100"></div>
-               <div className="w-1.5 h-1.5 bg-black rounded-full animate-bounce delay-200"></div>
+               <div className="w-1.5 h-1.5 bg-[--color-bg] rounded-full animate-bounce"></div>
+               <div className="w-1.5 h-1.5 bg-[--color-bg] rounded-full animate-bounce delay-100"></div>
+               <div className="w-1.5 h-1.5 bg-[--color-bg] rounded-full animate-bounce delay-200"></div>
              </div>
            </div>
         )}
       </div>
 
-      <div className="mt-auto shrink-0 pt-3 border-t border-revis-gray/10">
+      <div className="mt-auto shrink-0 pt-3 border-t border-[--color-border]">
         <div className="flex gap-2">
           <input
             type="text"
@@ -4680,7 +5513,7 @@ export default function App() {
             onChange={(e) => setAiPrompt(e.target.value)}
             placeholder={quotaReached ? t('drGraxaLimitReachedBanner') : t('advisorInputPlaceholder')}
             disabled={quotaReached || isLoadingAi}
-            className="flex-1 bg-revis-dark-gray border border-revis-gray/20 rounded-xl px-4 py-3 text-xs text-revis-light-gray focus:outline-none focus:border-revis-green transition-colors placeholder:text-revis-gray/50 disabled:opacity-50"
+            className="flex-1 glass border border-[--color-border] rounded-xl px-4 py-3 text-xs text-[--color-text] focus:outline-none focus:border-[#34a06a] transition-colors placeholder:text-[--color-revis-gray]/50 disabled:opacity-50"
             onKeyDown={(e) => {
               if (e.key === 'Enter') {
                 e.preventDefault();
@@ -4691,12 +5524,12 @@ export default function App() {
           <button 
             onClick={() => void askAi()}
             disabled={isLoadingAi || !aiPrompt.trim() || quotaReached}
-            className="bg-revis-green disabled:opacity-50 disabled:cursor-not-allowed text-black px-4 rounded-xl transition-colors font-bold flex items-center justify-center shrink-0"
+            className="bg-[#34a06a] disabled:opacity-50 disabled:cursor-not-allowed text-black px-4 rounded-xl transition-colors font-bold flex items-center justify-center shrink-0"
           >
             {isLoadingAi ? <Activity className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5 fill-black" />}
           </button>
         </div>
-        <p className="text-[9px] text-revis-gray text-center mt-2 opacity-60">
+        <p className="text-[9px] text-[--color-revis-gray] text-center mt-2 opacity-60">
           {t('advisorDisclaimer')}
         </p>
       </div>
@@ -4705,32 +5538,32 @@ export default function App() {
   };
 
   const renderOnboardingPreferences = () => (
-    <div className="min-h-screen bg-revis-black text-revis-light-gray flex flex-col">
+    <div className="bg-canvas min-h-screen text-[--color-text] flex flex-col">
       <div className="max-w-md w-full mx-auto px-6 py-10 flex-1 flex flex-col">
         <div className="mb-8 text-center">
-          <h1 className="text-2xl font-bold text-revis-heading mb-2">{t('onboardingTitle')}</h1>
-          <p className="text-revis-gray text-sm">{t('onboardingSubtitle')}</p>
+          <h1 className="text-2xl font-bold text-[--color-heading] font-display mb-2">{t('onboardingTitle')}</h1>
+          <p className="text-[--color-revis-gray] text-sm">{t('onboardingSubtitle')}</p>
         </div>
 
         <div className="space-y-5 flex-1">
           {/* Theme */}
-          <div className="bg-revis-dark-gray p-4 rounded-xl space-y-3">
-            <h3 className="font-medium text-revis-heading flex items-center gap-2">
-              <Paintbrush className="w-5 h-5 text-revis-green" />
+          <div className="glass p-4 rounded-xl space-y-3">
+            <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+              <Paintbrush className="w-5 h-5 text-[#34a06a]" />
               {t('themeLabel')}
             </h3>
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
                 onClick={() => applyThemeImmediate('dark')}
-                className={`p-3 rounded-lg border text-sm font-medium transition-colors ${theme === 'dark' ? 'bg-revis-green text-black border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+                className={`p-3 rounded-lg border text-sm font-medium transition-colors ${theme === 'dark' ? 'bg-[#34a06a] text-black border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
               >
                 {t('darkTheme')}
               </button>
               <button
                 type="button"
                 onClick={() => applyThemeImmediate('light')}
-                className={`p-3 rounded-lg border text-sm font-medium transition-colors ${theme === 'light' ? 'bg-revis-green text-black border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+                className={`p-3 rounded-lg border text-sm font-medium transition-colors ${theme === 'light' ? 'bg-[#34a06a] text-black border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
               >
                 {t('lightTheme')}
               </button>
@@ -4738,9 +5571,9 @@ export default function App() {
           </div>
 
           {/* Language */}
-          <div className="bg-revis-dark-gray p-4 rounded-xl space-y-3">
-            <h3 className="font-medium text-revis-heading flex items-center gap-2">
-              <Globe className="w-5 h-5 text-revis-green" />
+          <div className="glass p-4 rounded-xl space-y-3">
+            <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+              <Globe className="w-5 h-5 text-[#34a06a]" />
               {t('languageLabel')}
             </h3>
             <div className="space-y-2">
@@ -4749,7 +5582,7 @@ export default function App() {
                   key={lang}
                   type="button"
                   onClick={() => applyLanguageImmediate(lang)}
-                  className={`w-full p-3 rounded-lg border text-sm font-medium transition-colors flex justify-between items-center ${language === lang ? 'bg-revis-green/10 text-revis-green border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+                  className={`w-full p-3 rounded-lg border text-sm font-medium transition-colors flex justify-between items-center ${language === lang ? 'bg-[#34a06a]/10 text-[#34a06a] border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
                 >
                   {lang}
                   {language === lang && <Check className="w-4 h-4" />}
@@ -4759,13 +5592,13 @@ export default function App() {
           </div>
 
           {/* Font Size */}
-          <div className="bg-revis-dark-gray p-4 rounded-xl space-y-3">
-            <h3 className="font-medium text-revis-heading flex items-center gap-2">
-              <Type className="w-5 h-5 text-revis-green" />
+          <div className="glass p-4 rounded-xl space-y-3">
+            <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+              <Type className="w-5 h-5 text-[#34a06a]" />
               {t('fontSizeLabel')}
             </h3>
             <div className="flex items-center gap-4">
-              <span className="text-xs text-revis-gray">A</span>
+              <span className="text-xs text-[--color-revis-gray]">A</span>
               <input
                 type="range"
                 min="0"
@@ -4773,21 +5606,22 @@ export default function App() {
                 step="1"
                 value={fontSize}
                 onChange={(e) => applyFontSizeImmediate(parseInt(e.target.value))}
-                className="flex-1 h-2 bg-revis-black rounded-lg appearance-none cursor-pointer accent-revis-green"
+                className="flex-1 h-2 rounded-lg appearance-none cursor-pointer accent-revis-green"
+              style={{ background: theme === 'light' ? 'rgba(0,0,0,0.14)' : 'rgba(255,255,255,0.18)' }}
               />
-              <span className="text-xl text-revis-heading">A</span>
+              <span className="text-xl text-[--color-heading] font-display">A</span>
             </div>
           </div>
 
           {/* Date Format */}
-          <div className="bg-revis-dark-gray p-4 rounded-xl space-y-3">
-            <h3 className="font-medium text-revis-heading flex items-center gap-2">
-              <CalendarDays className="w-5 h-5 text-revis-green" />
+          <div className="glass p-4 rounded-xl space-y-3">
+            <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+              <CalendarDays className="w-5 h-5 text-[#34a06a]" />
               {t('dateFormatLabel')}
             </h3>
             <div className="grid grid-cols-2 gap-2">
               <label
-                className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${dateFormat === 'dd/mm/yyyy' ? 'bg-revis-green/10 text-revis-green border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+                className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${dateFormat === 'dd/mm/yyyy' ? 'bg-[#34a06a]/10 text-[#34a06a] border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
               >
                 <input
                   type="radio"
@@ -4800,7 +5634,7 @@ export default function App() {
                 <span>{getDateFormatDisplay('dd/mm/yyyy', language)}</span>
               </label>
               <label
-                className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${dateFormat === 'mm/dd/yyyy' ? 'bg-revis-green/10 text-revis-green border-revis-green' : 'bg-transparent text-revis-gray border-revis-gray/30'}`}
+                className={`p-3 rounded-lg border text-sm font-medium transition-colors flex items-center gap-3 cursor-pointer ${dateFormat === 'mm/dd/yyyy' ? 'bg-[#34a06a]/10 text-[#34a06a] border-[#34a06a]' : 'bg-transparent text-[--color-revis-gray] border-[--color-border]'}`}
               >
                 <input
                   type="radio"
@@ -4813,30 +5647,20 @@ export default function App() {
                 <span>{getDateFormatDisplay('mm/dd/yyyy', language)}</span>
               </label>
             </div>
-            <p className="text-xs text-revis-gray">
-              {t('dateFormatPreview')}: <span className="text-revis-light-gray font-medium">{formatAppDate(new Date(), dateFormat)}</span>
+            <p className="text-xs text-[--color-revis-gray]">
+              {t('dateFormatPreview')}: <span className="text-[--color-text] font-medium">{formatAppDate(new Date(), dateFormat)}</span>
             </p>
           </div>
 
           {/* Currency */}
-          <div className="bg-revis-dark-gray p-4 rounded-xl space-y-3">
-            <h3 className="font-medium text-revis-heading flex items-center gap-2">
-              <DollarSign className="w-5 h-5 text-revis-green" />
+          <div className="glass p-4 rounded-xl space-y-3">
+            <h3 className="font-medium text-[--color-heading] font-display flex items-center gap-2">
+              <DollarSign className="w-5 h-5 text-[#34a06a]" />
               {t('currencyLabel')}
             </h3>
-            <select
-              value={currency}
-              onChange={(e) => applyCurrencyImmediate(e.target.value)}
-              className="w-full bg-revis-black/40 border border-revis-gray/30 rounded-lg p-3 text-sm text-revis-light-gray focus:border-revis-green outline-none"
-            >
-              {CURRENCY_OPTIONS.map((opt) => (
-                <option key={opt.code} value={opt.code} className="bg-revis-dark-gray text-revis-light-gray">
-                  {opt.code} — {opt.label}
-                </option>
-              ))}
-            </select>
-            <p className="text-xs text-revis-gray">
-              {t('currencyPreview')}: <span className="text-revis-light-gray font-medium">{formatAppCurrency(1234.56, currency, language)}</span>
+            <CustomSelect value={currency} onChange={v=>applyCurrencyImmediate(v)} options={CURRENCY_OPTIONS.map(opt=>({"value":opt.code,"label":`${opt.code} — ${currencyLabel(opt.code)}`}))} />
+            <p className="text-xs text-[--color-revis-gray]">
+              {t('currencyPreview')}: <span className="text-[--color-text] font-medium">{formatAppCurrency(1234.56, currency, language)}</span>
             </p>
           </div>
         </div>
@@ -4849,13 +5673,13 @@ export default function App() {
             // direcionamos para a tela de boas-vindas com o CTA de primeiro veículo.
             setAuthScreen('success');
           }}
-          className="w-full mt-8 bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors text-base"
+          className="w-full mt-8 bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors text-base"
         >
           {t('onboardingFinishCta')}
         </button>
 
         <div className="mt-6">
-          <Footer />
+          <Footer showHelp />
         </div>
       </div>
     </div>
@@ -4863,24 +5687,24 @@ export default function App() {
 
   if (forceUpdateStatus === 'checking') {
     return (
-      <div className="min-h-screen bg-revis-black text-revis-light-gray flex items-center justify-center p-6">
-        <p className="text-sm text-revis-gray">{t('loading')}</p>
+      <div className="min-h-screen bg-[--color-bg] text-[--color-text] flex items-center justify-center p-6">
+        <p className="text-sm text-[--color-revis-gray]">{t('loading')}</p>
       </div>
     );
   }
 
   if (forceUpdateStatus === 'blocked') {
     return (
-      <div className="min-h-screen bg-revis-black text-revis-light-gray flex flex-col items-center justify-center p-6 text-center">
-        <p className="text-lg font-semibold text-revis-heading max-w-sm mb-8">{t('forceUpdateMessage')}</p>
+      <div className="min-h-screen bg-[--color-bg] text-[--color-text] flex flex-col items-center justify-center p-6 text-center">
+        <p className="text-lg font-semibold text-[--color-heading] font-display max-w-sm mb-8">{t('forceUpdateMessage')}</p>
         <button
           type="button"
-          className="w-full max-w-xs bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors"
-          onClick={() => window.open(resolveStoreUpdateUrl(), '_blank', 'noopener,noreferrer')}
+          className="w-full max-w-xs bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors"
+          onClick={() => window.location.reload()}
         >
           {t('forceUpdateButton')}
         </button>
-        <p className="text-[10px] text-revis-gray mt-6">
+        <p className="text-[10px] text-[--color-revis-gray] mt-6">
           v{APP_VERSION}
         </p>
       </div>
@@ -4896,53 +5720,14 @@ export default function App() {
   if (authScreen === 'reset-password') return renderResetPassword();
 
   return (
-    <div className="min-h-screen bg-revis-black text-revis-light-gray font-sans selection:bg-revis-green selection:text-black">
-      {forceUpdateStatus === 'ok' &&
-        authScreen === 'app' &&
-        user &&
-        isNativeCapacitorApp() &&
-        readBiometricEnabledSyncFromStorage() &&
-        !biometricUnlockedThisSession && (
-          <div className="fixed inset-0 z-[200] bg-revis-black flex flex-col items-center justify-center p-6 text-center">
-            <p className="text-lg font-bold text-revis-heading mb-2">{t('biometricGateTitle')}</p>
-            <p className="text-xs text-revis-gray mb-8 max-w-xs">{t('biometricPromptReason')}</p>
-            <button
-              type="button"
-              className="w-full max-w-xs bg-revis-green text-black font-bold py-3 rounded-xl mb-3"
-              onClick={async () => {
-                bioAutoPromptConsumedRef.current = true;
-                try {
-                  await promptBiometricUnlock(t('biometricPromptReason'), 'RevisAuto');
-                  setBiometricUnlockedThisSession(true);
-                } catch {
-                  bioAutoPromptConsumedRef.current = false;
-                }
-              }}
-            >
-              {t('biometricGateRetry')}
-            </button>
-            <button
-              type="button"
-              className="text-revis-alert-critical text-sm font-medium"
-              onClick={() => {
-                resetSensitiveSessionState();
-                localStorage.removeItem('revis_user');
-                setUser(null);
-                setAuthScreen('login');
-                setActiveTab('garage');
-              }}
-            >
-              {t('biometricGateLogout')}
-            </button>
-          </div>
-        )}
+    <div className="bg-canvas min-h-screen text-[--color-text] font-sans selection:bg-[#34a06a] selection:text-black">
       {/* Mobile Header - hidden on desktop */}
-      <header className="md:hidden bg-revis-black/90 backdrop-blur-md border-b border-revis-dark-gray p-4 sticky top-0 z-20">
+      <header className="md:hidden bg-black/90 backdrop-blur-md border-b border-[--color-border] p-4 sticky top-0 z-20">
         <div className="flex justify-between items-center">
           <div className="flex items-center gap-2">
             <h1 className="text-xl font-bold tracking-tight">
-              <span className="text-revis-gray">Revis</span>
-              <span className="text-revis-green">Auto</span>
+              <span className="text-[--color-revis-gray]">Revis</span>
+              <span className="text-[#34a06a]">Auto</span>
             </h1>
           </div>
         </div>
@@ -4950,24 +5735,24 @@ export default function App() {
 
       <div className="md:flex md:min-h-screen">
         {/* Desktop Sidebar - hidden on mobile */}
-        <aside className="hidden md:flex md:flex-col md:w-64 md:fixed md:inset-y-0 md:left-0 bg-revis-black border-r border-revis-dark-gray z-20">
-          <div className="p-6 border-b border-revis-dark-gray">
+        <aside className="hidden md:flex md:flex-col md:w-64 md:fixed md:inset-y-0 md:left-0 bg-[--color-bg] border-r border-[--color-border] z-20">
+          <div className="p-6 border-b border-[--color-border]">
             <h1 className="text-2xl font-bold tracking-tight">
-              <span className="text-revis-gray">Revis</span>
-              <span className="text-revis-green">Auto</span>
+              <span className="text-[--color-revis-gray]">Revis</span>
+              <span className="text-[#34a06a]">Auto</span>
             </h1>
           </div>
           <nav className="flex-1 flex flex-col gap-1 p-4">
             <button
               onClick={() => { setSelectedVehicle(null); setActiveTab('garage'); }}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'garage' ? 'bg-revis-green text-black' : 'text-revis-gray hover:bg-revis-dark-gray hover:text-revis-heading'}`}
+              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'garage' ? 'bg-[#34a06a] text-black' : 'text-[--color-revis-gray] hover:glass hover:text-[--color-heading] font-display'}`}
             >
               <Warehouse className="w-5 h-5 flex-shrink-0" />
               {t('garage')}
             </button>
             <button
               onClick={() => setActiveTab('advisor')}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'advisor' ? 'bg-revis-green text-black' : 'text-revis-gray hover:bg-revis-dark-gray hover:text-revis-heading'}`}
+              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'advisor' ? 'bg-[#34a06a] text-black' : 'text-[--color-revis-gray] hover:glass hover:text-[--color-heading] font-display'}`}
             >
               <div className="relative flex-shrink-0 w-5 h-5">
                 <Shield className="w-5 h-5" />
@@ -4977,21 +5762,21 @@ export default function App() {
             </button>
             <button
               onClick={() => setActiveTab('menu')}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'menu' ? 'bg-revis-green text-black' : 'text-revis-gray hover:bg-revis-dark-gray hover:text-revis-heading'}`}
+              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'menu' ? 'bg-[#34a06a] text-black' : 'text-[--color-revis-gray] hover:glass hover:text-[--color-heading] font-display'}`}
             >
               <Menu className="w-5 h-5 flex-shrink-0" />
-              Menu
+              {t('menu')}
             </button>
             <button
               onClick={() => setActiveTab('preferences')}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'preferences' ? 'bg-revis-green text-black' : 'text-revis-gray hover:bg-revis-dark-gray hover:text-revis-heading'}`}
+              className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-sm transition-colors ${activeTab === 'preferences' ? 'bg-[#34a06a] text-black' : 'text-[--color-revis-gray] hover:glass hover:text-[--color-heading] font-display'}`}
             >
               <Settings className="w-5 h-5 flex-shrink-0" />
-              Preferências
+              {t('preferences')}
             </button>
           </nav>
-          <div className="p-4 border-t border-revis-dark-gray">
-            <p className="text-[10px] text-revis-gray text-center">{t('appShellTagline')}</p>
+          <div className="p-4 border-t border-[--color-border]">
+            <p className="text-[10px] text-[--color-revis-gray] text-center">{t('appShellTagline')}</p>
           </div>
         </aside>
 
@@ -5007,41 +5792,41 @@ export default function App() {
       </div>
 
       {/* Mobile Bottom Navigation - hidden on desktop */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-revis-black/95 backdrop-blur-lg border-t border-revis-dark-gray pb-safe z-20">
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-black/95 backdrop-blur-lg border-t border-[--color-border] pb-safe z-20">
         <div className="flex justify-around items-center h-16">
           <button
             onClick={() => {
               setSelectedVehicle(null);
               setActiveTab('garage');
             }}
-            className={`flex flex-col items-center gap-1 w-full h-full justify-center ${activeTab === 'garage' ? 'text-revis-green' : 'text-revis-gray'}`}
+            className={`flex flex-col items-center gap-1 flex-1 min-w-0 h-full justify-center ${activeTab === 'garage' ? 'text-[#34a06a]' : 'text-[--color-revis-gray]'}`}
           >
             <Warehouse className="w-6 h-6" />
-            <span className="text-[10px] font-medium">{t('garage')}</span>
+            <span className="text-[10px] font-medium max-w-full truncate px-0.5">{t('garage')}</span>
           </button>
           <button
             onClick={() => setActiveTab('advisor')}
-            className={`flex flex-col items-center gap-1 w-full h-full justify-center ${activeTab === 'advisor' ? 'text-revis-green' : 'text-revis-gray'}`}
+            className={`flex flex-col items-center gap-1 flex-1 min-w-0 h-full justify-center ${activeTab === 'advisor' ? 'text-[#34a06a]' : 'text-[--color-revis-gray]'}`}
           >
             <div className="relative">
               <Shield className={`w-6 h-6 ${activeTab === 'advisor' ? 'fill-current' : ''}`} />
               <Wrench className={`w-3 h-3 absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 ${activeTab === 'advisor' ? 'fill-black' : 'fill-current'}`} />
             </div>
-            <span className="text-[10px] font-medium">{t('advisor')}</span>
+            <span className="text-[10px] font-medium max-w-full truncate px-0.5">{t('advisor')}</span>
           </button>
           <button
             onClick={() => setActiveTab('menu')}
-            className={`flex flex-col items-center gap-1 w-full h-full justify-center ${activeTab === 'menu' ? 'text-revis-green' : 'text-revis-gray'}`}
+            className={`flex flex-col items-center gap-1 flex-1 min-w-0 h-full justify-center ${activeTab === 'menu' ? 'text-[#34a06a]' : 'text-[--color-revis-gray]'}`}
           >
             <Menu className="w-6 h-6" />
-            <span className="text-[10px] font-medium">{t('menu')}</span>
+            <span className="text-[10px] font-medium max-w-full truncate px-0.5">{t('menu')}</span>
           </button>
           <button
             onClick={() => setActiveTab('preferences')}
-            className={`flex flex-col items-center gap-1 w-full h-full justify-center ${activeTab === 'preferences' ? 'text-revis-green' : 'text-revis-gray'}`}
+            className={`flex flex-col items-center gap-1 flex-1 min-w-0 h-full justify-center ${activeTab === 'preferences' ? 'text-[#34a06a]' : 'text-[--color-revis-gray]'}`}
           >
             <Settings className="w-6 h-6" />
-            <span className="text-[10px] font-medium">{t('preferences')}</span>
+            <span className="text-[10px] font-medium max-w-full truncate px-0.5">{t('preferences')}</span>
           </button>
         </div>
       </nav>
@@ -5059,23 +5844,28 @@ export default function App() {
           onClick={() => setShowDrGraxaManualModal(false)}
         >
           <div
-            className="w-full md:max-w-lg max-h-[92dvh] overflow-y-auto rounded-t-3xl md:rounded-3xl bg-revis-dark-gray border border-revis-gray/30 shadow-2xl p-5 md:p-6 animate-in slide-in-from-bottom md:slide-in-from-bottom-0 md:zoom-in-95 duration-300"
+            className="w-full md:max-w-lg max-h-[92dvh] overflow-y-auto rounded-t-3xl md:rounded-3xl border border-[--color-border] shadow-2xl p-5 md:p-6"
+            style={
+              theme === 'light'
+                ? { background: 'rgba(255,255,255,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)' }
+                : { background: 'rgba(20,22,24,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)' }
+            }
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex justify-between items-start gap-3 mb-3">
-              <h2 id="dr-graxa-manual-title" className="text-base md:text-lg font-bold text-revis-heading leading-snug">
+              <h2 id="dr-graxa-manual-title" className="text-base md:text-lg font-bold text-[--color-heading] font-display leading-snug">
                 {t('drGraxaOnboardingTitle')}
               </h2>
               <button
                 type="button"
                 onClick={() => setShowDrGraxaManualModal(false)}
-                className="text-revis-gray hover:text-revis-heading p-1 shrink-0 rounded-lg hover:bg-revis-black/40"
+                className="text-[--color-revis-gray] hover:text-[--color-heading] font-display p-1 shrink-0 rounded-lg hover:bg-white/10"
                 aria-label={t('closeButton')}
               >
                 <X className="w-6 h-6" />
               </button>
             </div>
-            <p className="text-sm text-revis-gray leading-relaxed mb-5">{t('drGraxaOnboardingSubtitle')}</p>
+            <p className="text-sm text-[--color-revis-gray] leading-relaxed mb-5">{t('drGraxaOnboardingSubtitle')}</p>
             <ul className="space-y-3 mb-4">
               {(
                 [
@@ -5087,17 +5877,23 @@ export default function App() {
               ).map(([IconC, txt], idx) => (
                 <li
                   key={idx}
-                  className="flex gap-3 rounded-2xl bg-revis-black/45 border border-revis-gray/15 p-3.5 items-start"
+                  className="flex gap-3 rounded-2xl border border-[--color-border] p-3.5 items-start"
+                  style={{ background: theme === 'light' ? 'rgba(0,0,0,0.035)' : 'rgba(0,0,0,0.45)' }}
                 >
-                  <span className="flex-shrink-0 w-10 h-10 rounded-xl bg-revis-green/15 flex items-center justify-center mt-0.5">
-                    <IconC className="w-[18px] h-[18px] text-revis-green" aria-hidden />
+                  <span className="flex-shrink-0 w-10 h-10 rounded-xl bg-[#34a06a]/15 flex items-center justify-center mt-0.5">
+                    <IconC className="w-[18px] h-[18px] text-[#34a06a]" aria-hidden />
                   </span>
-                  <p className="text-xs text-revis-light-gray leading-relaxed pt-1">{txt}</p>
+                  <p className="text-xs text-[--color-text] leading-relaxed pt-1">{txt}</p>
                 </li>
               ))}
             </ul>
             <div
-              className="rounded-xl p-3.5 mb-4 text-xs leading-relaxed border bg-amber-500/10 border-amber-500/20 text-amber-900 dark:bg-yellow-500/10 dark:border-yellow-500/20 dark:text-yellow-100"
+              className="rounded-xl p-3.5 mb-4 text-xs leading-relaxed border"
+              style={
+                theme === 'light'
+                  ? { background: 'rgba(217,119,6,0.08)', borderColor: 'rgba(217,119,6,0.25)', color: '#78350f' }
+                  : { background: 'rgba(234,179,8,0.10)', borderColor: 'rgba(234,179,8,0.20)', color: '#fef9c3' }
+              }
               role="note"
             >
               {t('drGraxaMiniManualLegalDisclaimer')}
@@ -5115,7 +5911,7 @@ export default function App() {
                 setChatMessages([]);
                 setAiPrompt('');
               }}
-              className="w-full py-4 rounded-2xl bg-revis-green text-black font-bold text-base shadow-lg shadow-revis-green/25 hover:bg-opacity-90 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+              className="w-full py-4 rounded-2xl bg-[#34a06a] text-black font-bold text-base shadow-lg shadow-revis-green/25 hover:bg-opacity-90 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
             >
               {t('drGraxaOnboardingAck')}
             </button>
@@ -5123,13 +5919,97 @@ export default function App() {
         </div>
       )}
 
+      {/* Lixeira de conversas do Dr. Graxa */}
+      {showChatTrash && (
+        <div
+          className="fixed inset-0 z-[60] flex items-end md:items-center justify-center md:p-4 bg-black/70 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setShowChatTrash(false)}
+        >
+          <div
+            className="w-full md:max-w-lg max-h-[85vh] overflow-y-auto rounded-t-3xl md:rounded-3xl border border-[--color-border] shadow-2xl p-5 md:p-6"
+            style={
+              theme === 'light'
+                ? { background: 'rgba(255,255,255,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)' }
+                : { background: 'rgba(20,22,24,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)' }
+            }
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex justify-between items-start gap-3 mb-1">
+              <h2 className="text-base md:text-lg font-bold text-[--color-heading] font-display leading-snug flex items-center gap-2">
+                <Archive className="w-5 h-5 text-[#34a06a]" />
+                {t('chatTrashTitle')}
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowChatTrash(false)}
+                className="text-[--color-revis-gray] hover:text-[--color-heading] font-display p-1 shrink-0 rounded-lg hover:bg-white/10"
+                aria-label={t('closeButton')}
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+            <p className="text-xs text-[--color-revis-gray] leading-relaxed mb-5">{t('chatTrashSubtitle')}</p>
+
+            {chatTrashLoading ? (
+              <p className="text-sm text-[--color-revis-gray] text-center py-8">{t('loading')}</p>
+            ) : chatTrashSessions.length === 0 ? (
+              <div className="text-center py-10 text-[--color-revis-gray]">
+                <Archive className="w-12 h-12 mx-auto mb-3 opacity-20" />
+                <p className="text-sm">{t('chatTrashEmpty')}</p>
+              </div>
+            ) : (
+              <ul className="space-y-2.5">
+                {chatTrashSessions.map(session => {
+                  const displayTitle = session.title?.trim() || t('newChatSessionTitle');
+                  const daysLeft = session.days_until_permanent_deletion ?? 0;
+                  return (
+                    <li
+                      key={session.id}
+                      className="rounded-2xl border border-[--color-border] p-3.5"
+                      style={{ background: theme === 'light' ? 'rgba(0,0,0,0.03)' : 'rgba(0,0,0,0.35)' }}
+                    >
+                      <p className="text-sm font-medium text-[--color-heading] font-display line-clamp-2 mb-1">{displayTitle}</p>
+                      <p className="text-[11px] text-[--color-revis-gray] mb-3">
+                        {daysLeft > 0
+                          ? t('chatTrashDaysLeft').replace('{days}', String(daysLeft))
+                          : t('chatTrashExpiringSoon')}
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void restoreChatSession(session.id)}
+                          className="flex-1 py-2 rounded-lg bg-[#34a06a]/15 text-[#34a06a] text-xs font-medium hover:bg-[#34a06a]/25 transition-colors flex items-center justify-center gap-1.5"
+                        >
+                          <History className="w-3.5 h-3.5" />
+                          {t('chatTrashRestore')}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void permanentlyDeleteChatSession(session.id)}
+                          className="flex-1 py-2 rounded-lg bg-[#e0473f]/10 text-[#e0473f] text-xs font-medium hover:bg-[#e0473f]/20 transition-colors flex items-center justify-center gap-1.5"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          {t('chatTrashDeleteForever')}
+                        </button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Vehicle History Modal */}
       {showVehicleHistory && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
+        <div className="fixed inset-0 z-50 overflow-y-auto" style={{ background: theme === 'light' ? '#eef1f0' : '#000000' }}>
           <div className="p-4">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">{t('vehicleHistory')}</h2>
-              <button onClick={() => setShowVehicleHistory(false)} className="text-revis-gray p-2">
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">{t('vehicleHistory')}</h2>
+              <button onClick={() => setShowVehicleHistory(false)} className="text-[--color-revis-gray] p-2">
                 <X className="w-6 h-6" />
               </button>
             </div>
@@ -5138,18 +6018,18 @@ export default function App() {
               {archivedVehicles.map(vehicle => (
                 <div 
                   key={vehicle.id} 
-                  className="bg-revis-dark-gray rounded-xl p-4 border border-revis-gray/10 flex items-center gap-4"
+                  className="glass rounded-xl p-4 border border-[--color-border] flex items-center gap-4"
                 >
-                  <div className="p-3 bg-revis-black/30 rounded-full flex-shrink-0 opacity-50">
-                    {vehicle.type === 'Carro' && <Car className="w-5 h-5 text-revis-gray" />}
-                    {vehicle.type === 'Moto' && <Bike className="w-5 h-5 text-revis-gray" />}
-                    {vehicle.type === 'Bike' && <Zap className="w-5 h-5 text-revis-gray" />}
+                  <div className="p-3 bg-black/30 rounded-full flex-shrink-0 opacity-50">
+                    {vehicle.type === 'Carro' && <Car className="w-5 h-5 text-[--color-revis-gray]" />}
+                    {vehicle.type === 'Moto' && <Bike className="w-5 h-5 text-[--color-revis-gray]" />}
+                    {vehicle.type === 'Bike' && <Zap className="w-5 h-5 text-[--color-revis-gray]" />}
                   </div>
                   
                   <div className="flex-1 min-w-0">
-                    <h3 className="font-bold text-revis-heading text-base truncate">{vehicle.brand} {vehicle.model} ({vehicle.year})</h3>
-                    <p className="text-xs text-revis-gray truncate">
-                      Excluído em: {vehicle.deleted_at ? formatAppDate(vehicle.deleted_at, dateFormat) : 'Data desconhecida'}
+                    <h3 className="font-bold text-[--color-heading] font-display text-base truncate">{vehicle.brand} {vehicle.model} ({vehicle.year})</h3>
+                    <p className="text-xs text-[--color-revis-gray] truncate">
+                      {t('archivedDeletedAtLabel')}: {vehicle.deleted_at ? formatAppDate(vehicle.deleted_at, dateFormat) : t('unknownDateLabel')}
                     </p>
                   </div>
 
@@ -5158,10 +6038,11 @@ export default function App() {
                       setSelectedVehicle(vehicle);
                       setExpandedCards({ mileage: false, services: false, financial: false });
                       setShowVehicleHistory(false);
+                      setActiveTab('garage');
                       fetchLogs(vehicle.id);
                       fetchFinancialRecords(vehicle.id);
                     }}
-                    className="text-xs text-revis-green font-medium whitespace-nowrap hover:underline"
+                    className="text-xs text-[#34a06a] font-medium whitespace-nowrap hover:underline"
                   >
                     {t('viewDetailsWithArrow')}
                   </button>
@@ -5169,7 +6050,7 @@ export default function App() {
               ))}
               
               {archivedVehicles.length === 0 && (
-                <div className="text-center py-10 text-revis-gray">
+                <div className="text-center py-10 text-[--color-revis-gray]">
                   <Archive className="w-12 h-12 mx-auto mb-3 opacity-20" />
                   <p>{t('noVehiclesArchived')}</p>
                 </div>
@@ -5182,25 +6063,25 @@ export default function App() {
       {/* Delete Vehicle Confirmation Modal */}
       {showDeleteVehicleModal && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 w-full max-w-sm border border-revis-gray/20 shadow-xl">
-            <h3 className="text-xl font-bold text-revis-heading mb-6 text-center">{t('deleteVehicleTitle')}</h3>
+          <div className="glass rounded-2xl p-6 w-full max-w-sm border border-[--color-border] shadow-xl">
+            <h3 className="text-xl font-bold text-[--color-heading] font-display mb-6 text-center">{t('deleteVehicleTitle')}</h3>
             
             <div className="flex gap-3 mb-6">
               <button 
                 onClick={confirmArchiveVehicle}
-                className="flex-1 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
               <button 
                 onClick={() => setShowDeleteVehicleModal(false)}
-                className="flex-1 bg-revis-alert-critical text-white font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-revis-alert-critical text-[--color-heading] font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('no')}
               </button>
             </div>
             
-            <p className="text-[10px] text-revis-gray text-center leading-relaxed">
+            <p className="text-[10px] text-[--color-revis-gray] text-center leading-relaxed">
               {t('deleteVehicleBackupNote')}
             </p>
           </div>
@@ -5210,13 +6091,13 @@ export default function App() {
       {/* Delete Chat Confirmation Modal */}
       {showDeleteChatModal && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 w-full max-w-sm border border-revis-gray/20 shadow-xl">
-            <h3 className="text-xl font-bold text-revis-heading mb-6 text-center">{t('deleteChatTitle')}</h3>
+          <div className="glass rounded-2xl p-6 w-full max-w-sm border border-[--color-border] shadow-xl">
+            <h3 className="text-xl font-bold text-[--color-heading] font-display mb-6 text-center">{t('deleteChatTitle')}</h3>
             
             <div className="flex gap-3 mb-6">
               <button 
                 onClick={confirmDeleteChatSession}
-                className="flex-1 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -5225,13 +6106,13 @@ export default function App() {
                   setShowDeleteChatModal(false);
                   setChatSessionToDelete(null);
                 }}
-                className="flex-1 bg-revis-alert-critical text-white font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-revis-alert-critical text-[--color-heading] font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('no')}
               </button>
             </div>
             
-            <p className="text-[10px] text-revis-gray text-center leading-relaxed">
+            <p className="text-[10px] text-[--color-revis-gray] text-center leading-relaxed">
               {t('deleteChatFootnote')}
             </p>
           </div>
@@ -5241,13 +6122,13 @@ export default function App() {
       {/* Preferences Save Confirmation Modal */}
       {showPreferencesSaveConfirmation && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20">
-            <h3 className="text-xl font-bold text-revis-heading mb-2">{t('confirmChanges')}</h3>
-            <p className="text-revis-gray mb-6 text-sm">{t('confirmChangesMsg')}</p>
+          <div className="glass rounded-2xl p-6 max-w-sm w-full border border-[--color-border]">
+            <h3 className="text-xl font-bold text-[--color-heading] font-display mb-2">{t('confirmChanges')}</h3>
+            <p className="text-[--color-revis-gray] mb-6 text-sm">{t('confirmChangesMsg')}</p>
             <div className="flex gap-3">
               <button 
                 onClick={() => setShowPreferencesSaveConfirmation(false)}
-                className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/10 transition-colors"
+                className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/5 transition-colors"
               >
                 {t('no')}
               </button>
@@ -5261,7 +6142,7 @@ export default function App() {
                   setShowPreferencesSaveConfirmation(false);
                   setActiveTab('garage');
                 }}
-                className="flex-1 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -5273,13 +6154,13 @@ export default function App() {
       {/* Preferences Cancel Confirmation Modal */}
       {showPreferencesCancelConfirmation && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20">
-            <h3 className="text-xl font-bold text-revis-heading mb-2">{t('cancelChanges')}</h3>
-            <p className="text-revis-gray mb-6 text-sm">{t('cancelChangesMsg')}</p>
+          <div className="glass rounded-2xl p-6 max-w-sm w-full border border-[--color-border]">
+            <h3 className="text-xl font-bold text-[--color-heading] font-display mb-2">{t('cancelChanges')}</h3>
+            <p className="text-[--color-revis-gray] mb-6 text-sm">{t('cancelChangesMsg')}</p>
             <div className="flex gap-3">
               <button 
                 onClick={() => setShowPreferencesCancelConfirmation(false)}
-                className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/10 transition-colors"
+                className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/5 transition-colors"
               >
                 {t('no')}
               </button>
@@ -5300,7 +6181,7 @@ export default function App() {
                   setShowPreferencesCancelConfirmation(false);
                   setActiveTab('garage');
                 }}
-                className="flex-1 bg-revis-alert-critical text-white font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-revis-alert-critical text-[--color-heading] font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -5311,67 +6192,67 @@ export default function App() {
 
       {/* Profile Edit Modal */}
       {showProfileEdit && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
+        <div className="fixed inset-0 z-50 overflow-y-auto" style={{ background: theme === 'light' ? '#eef1f0' : '#000000' }}>
           <div className="p-4">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">{t('profileData')}</h2>
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">{t('profileData')}</h2>
             </div>
             
             <form onSubmit={handleUpdateProfile} className="space-y-6">
               {/* Read-only fields */}
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('name')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('name')}</label>
                 <input 
                   readOnly
-                  className="w-full bg-revis-dark-gray/50 border border-transparent rounded-xl p-4 text-revis-gray outline-none cursor-not-allowed"
+                  className="w-full glass opacity-70 border border-transparent rounded-xl p-4 text-[--color-revis-gray] outline-none cursor-not-allowed"
                   value={user?.name || ''}
                 />
               </div>
               
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('birthDate')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('birthDate')}</label>
                 <input 
                   readOnly
-                  className="w-full bg-revis-dark-gray/50 border border-transparent rounded-xl p-4 text-revis-gray outline-none cursor-not-allowed"
+                  className="w-full glass opacity-70 border border-transparent rounded-xl p-4 text-[--color-revis-gray] outline-none cursor-not-allowed"
                   value={user?.birth_date ? formatAppDate(user.birth_date, dateFormat) : ''}
                 />
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('country')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('country')}</label>
                 <input 
                   readOnly
-                  className="w-full bg-revis-dark-gray/50 border border-transparent rounded-xl p-4 text-revis-gray outline-none cursor-not-allowed"
-                  value={user?.country || ''}
+                  className="w-full glass opacity-70 border border-transparent rounded-xl p-4 text-[--color-revis-gray] outline-none cursor-not-allowed"
+                  value={user?.country ? countryLabel(user.country) : ''}
                 />
               </div>
 
               {/* Editable fields */}
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('nickname')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('nickname')}</label>
                 <input 
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={profileForm.nickname}
                   onChange={e => setProfileForm({...profileForm, nickname: e.target.value})}
                 />
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('email')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('email')}</label>
                 <input 
                   type="email"
                   required
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={profileForm.email}
                   onChange={e => setProfileForm({...profileForm, email: e.target.value})}
                 />
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('phone')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('phone')}</label>
                 <input 
                   required
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={profileForm.phone}
                   onChange={e => {
                     let val = e.target.value.replace(/\D/g, '');
@@ -5384,11 +6265,11 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('zipCode')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('zipCode')}</label>
                 <input 
                   required
                   maxLength={9}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={profileForm.zip_code}
                   onChange={e => {
                     const val = e.target.value.replace(/\D/g, '').replace(/^(\d{5})(\d)/, '$1-$2');
@@ -5400,18 +6281,18 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">{t('city')}</label>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('city')}</label>
                   <input 
                     readOnly
-                    className="w-full bg-revis-dark-gray/50 border border-transparent rounded-xl p-4 text-revis-gray outline-none cursor-not-allowed"
+                    className="w-full glass opacity-70 border border-transparent rounded-xl p-4 text-[--color-revis-gray] outline-none cursor-not-allowed"
                     value={profileForm.city}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">{t('state')}</label>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('state')}</label>
                   <input 
                     readOnly
-                    className="w-full bg-revis-dark-gray/50 border border-transparent rounded-xl p-4 text-revis-gray outline-none cursor-not-allowed"
+                    className="w-full glass opacity-70 border border-transparent rounded-xl p-4 text-[--color-revis-gray] outline-none cursor-not-allowed"
                     value={profileForm.state}
                   />
                 </div>
@@ -5421,13 +6302,13 @@ export default function App() {
                 <button 
                   type="button" 
                   onClick={handleCancelProfile}
-                  className="w-full bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-4 rounded-xl hover:bg-revis-gray/20 transition-colors"
+                  className="w-full glass border border-[--color-border] text-[--color-text] font-bold py-4 rounded-xl hover:bg-white/8 transition-colors"
                 >
                   {t('cancel')}
                 </button>
                 <button 
                   type="submit" 
-                  className="w-full bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors"
+                  className="w-full bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors"
                 >
                   {t('save')}
                 </button>
@@ -5440,19 +6321,19 @@ export default function App() {
       {/* Save Confirmation Modal */}
       {showSaveConfirmation && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20">
-            <h3 className="text-xl font-bold text-revis-heading mb-2">{t('confirmChanges')}</h3>
-            <p className="text-revis-gray mb-6 text-sm">{t('confirmChangesMsg')}</p>
+          <div className="glass rounded-2xl p-6 max-w-sm w-full border border-[--color-border]">
+            <h3 className="text-xl font-bold text-[--color-heading] font-display mb-2">{t('confirmChanges')}</h3>
+            <p className="text-[--color-revis-gray] mb-6 text-sm">{t('confirmChangesMsg')}</p>
             <div className="flex gap-3">
               <button 
                 onClick={() => setShowSaveConfirmation(false)}
-                className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/10 transition-colors"
+                className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/5 transition-colors"
               >
                 {t('no')}
               </button>
               <button 
                 onClick={confirmSaveProfile}
-                className="flex-1 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -5464,19 +6345,19 @@ export default function App() {
       {/* Cancel Confirmation Modal */}
       {showCancelConfirmation && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20">
-            <h3 className="text-xl font-bold text-revis-heading mb-2">{t('cancelChanges')}</h3>
-            <p className="text-revis-gray mb-6 text-sm">{t('cancelChangesMsg')}</p>
+          <div className="glass rounded-2xl p-6 max-w-sm w-full border border-[--color-border]">
+            <h3 className="text-xl font-bold text-[--color-heading] font-display mb-2">{t('cancelChanges')}</h3>
+            <p className="text-[--color-revis-gray] mb-6 text-sm">{t('cancelChangesMsg')}</p>
             <div className="flex gap-3">
               <button 
                 onClick={() => setShowCancelConfirmation(false)}
-                className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/10 transition-colors"
+                className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/5 transition-colors"
               >
                 {t('no')}
               </button>
               <button 
                 onClick={confirmCancelProfile}
-                className="flex-1 bg-revis-alert-critical text-white font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-revis-alert-critical text-[--color-heading] font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -5491,58 +6372,58 @@ export default function App() {
 
       {/* Terms Modal (Logged In) */}
       {showTermsModal && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
+        <div className="fixed inset-0 z-50 overflow-y-auto" style={{ background: theme === 'light' ? '#eef1f0' : '#000000' }}>
           <div className="p-4 h-full flex flex-col">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">{t('terms')}</h2>
-              <button onClick={() => { setShowTermsModal(false); setActiveTab('menu'); }} className="text-revis-green font-bold text-sm flex items-center gap-1 p-2">
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">{t('terms')}</h2>
+              <button onClick={() => { setShowTermsModal(false); setActiveTab('menu'); }} className="text-[#34a06a] font-bold text-sm flex items-center gap-1 p-2">
                 &lt; {t('back')}
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto bg-revis-dark-gray rounded-xl p-4 text-xs text-revis-light-gray space-y-4">
-              <h3 className="font-bold text-revis-heading mb-2 text-sm">TERMOS E CONDIÇÕES DE USO – PLATAFORMA REVISAUTO</h3>
-              <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
+            <div className="flex-1 overflow-y-auto glass rounded-xl p-4 text-xs text-[--color-text] space-y-4">
+              <h3 className="font-bold text-[--color-heading] font-display mb-2 text-sm">TERMOS E CONDIÇÕES DE USO – PLATAFORMA REVISAUTO</h3>
+              <p className="text-[10px] text-[--color-revis-gray] mb-4">{t('legalLastUpdated')}<br/>{t('legalUpdatesNotice')}</p>
               
               <div className="bg-revis-alert-medium/10 border border-revis-alert-medium p-3 rounded-lg mb-4">
-                <p className="text-revis-alert-medium font-bold text-[10px]">AVISO DE MAIORIDADE</p>
+                <p className="text-[#ffcc00] font-bold text-[10px]">{t('majorityWarningTitle')}</p>
                 <p className="text-[10px] mt-1">O RevisAuto é uma plataforma destinada exclusivamente a usuários maiores de 18 (dezoito) anos. Ao acessar ou utilizar este aplicativo, você declara possuir a idade mínima exigida e plena capacidade civil, compreendendo que a gestão e condução de veículos automotores e elétricos no Brasil requerem maioridade e habilitação legal específica.</p>
               </div>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">1. CADASTRO E SEGURANÇA DE DADOS (CONFORMIDADE LGPD)</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">1. CADASTRO E SEGURANÇA DE DADOS (CONFORMIDADE LGPD)</h4>
               <p>1.1. Elegibilidade: O Usuário declara ser maior de 18 anos e ser o proprietário ou possuidor legítimo do veículo cadastrado.</p>
               <p>1.2. Veracidade das Informações: O Usuário é o único responsável pela precisão e atualização dos dados inseridos (quilometragem, datas de manutenção, histórico de reparos).</p>
-              <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta. O aplicativo oferece suporte à autenticação biométrica (como Face ID ou Touch ID), cuja segurança é gerida localmente pelo sistema operacional do dispositivo.</p>
+              <p>1.3. Confidencialidade: As credenciais de acesso são pessoais e intransferíveis. O Usuário compromete-se a notificar a administração do RevisAuto imediatamente sobre qualquer uso não autorizado de sua conta.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">2. COMUNIDADE E REDE SOCIAL (DIRETRIZES DE CONDUTA)</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">2. COMUNIDADE E REDE SOCIAL (DIRETRIZES DE CONDUTA)</h4>
               <p>2.1. Conteúdo Gerado pelo Usuário (UGC): O Usuário concede ao RevisAuto uma licença gratuita e global para exibir conteúdos postados em áreas comuns do app.</p>
               <p>2.2. Proibições: É proibida a publicação de conteúdo difamatório, obsceno, abusivo, ilegal ou propaganda não autorizada (SPAM).</p>
               <p>2.3. Moderação: O RevisAuto reserva-se o direito de remover conteúdos e banir usuários que violem estas diretrizes.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">3. PROPRIEDADE INTELECTUAL E PROTEÇÃO CONTRA PLÁGIO</h4>
-              <p>3.1. Propriedade e Patenteamento: Todo o código-fonte, interface gráfica, algoritmos de IA, identidade visual e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos por registro de software e patentes conforme aplicável.</p>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">3. PROPRIEDADE INTELECTUAL E PROTEÇÃO CONTRA PLÁGIO</h4>
+              <p>3.1. Propriedade Intelectual: Todo o código-fonte, interface gráfica, prompts e integrações de Inteligência Artificial, identidade visual e a marca RevisAuto são de propriedade exclusiva da desenvolvedora, protegidos pela legislação de direitos autorais e de propriedade intelectual aplicável, incluindo o registro da marca RevisAuto junto ao INPI.</p>
               <p>3.2. Proibição de Plágio: É terminantemente proibida a reprodução total ou parcial da lógica ou design da plataforma.</p>
               <p>3.3. Procedimentos Judiciais: A prática de plágio sujeitará o infrator a procedimentos judiciais nas esferas cível e criminal, incluindo indenizações por danos materiais e lucros cessantes.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">4. PROTOCOLOS DE SEGURANÇA E PREVENÇÃO A FRAUDES</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">4. PROTOCOLOS DE SEGURANÇA E PREVENÇÃO A FRAUDES</h4>
               <p>4.1. Cuidado com Credenciais: O RevisAuto jamais solicitará sua senha de acesso por telefone, e-mail, SMS ou redes sociais. O compartilhamento de senhas com terceiros é de inteira responsabilidade do Usuário.</p>
               <p>4.2. Canais Oficiais de Cobrança: Todas as transações financeiras e cobranças de assinaturas de planos são processadas exclusivamente através de plataformas verificadas, notadamente pelo sistema integrado do Mercado Pago ou pelas lojas oficiais (App Store e Google Play).</p>
               <p>4.3. Alertas de Golpes: O RevisAuto não realiza cobranças nem solicita pagamentos via WhatsApp, ligações telefônicas, SMS ou links diretos enviados por e-mail.</p>
               <p>4.4. Isenção de Responsabilidade por Engenharia Social: O RevisAuto não se responsabiliza por prejuízos financeiros decorrentes de golpes de terceiros, phishing ou transferências realizadas pelo usuário para contas não oficiais.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">5. ASSINATURAS E PAGAMENTOS</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">5. ASSINATURAS E PAGAMENTOS</h4>
               <p>5.1. Serviços Premium: O RevisAuto oferece planos de assinatura (como Plus e Premium) para desbloqueio de limites de veículos e maior interação com a inteligência artificial. Estas funcionalidades estão sujeitas a termos de recorrência apresentados no momento da contratação.</p>
               <p>5.2. Reajustes: Alterações de valores serão comunicadas com 30 (trinta) dias de antecedência.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">6. DISPONIBILIDADE E MODIFICAÇÕES</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">6. DISPONIBILIDADE E MODIFICAÇÕES</h4>
               <p>6.1. Interrupções de Serviço: O serviço pode sofrer instabilidades técnicas devido a manutenções ou fatores externos em nossos provedores de nuvem.</p>
               <p>6.2. Alteração dos Termos: A continuidade do uso do app após atualizações constitui aceitação dos novos termos.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">7. NATUREZA DO SERVIÇO E ISENÇÃO DE RESPONSABILIDADE</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">7. NATUREZA DO SERVIÇO E ISENÇÃO DE RESPONSABILIDADE</h4>
               <p>7.1. Consultoria via IA (Dr. Graxa): O Usuário reconhece que o assistente virtual &quot;Dr. Graxa&quot; fornece recomendações geradas por Inteligência Artificial com caráter meramente informativo e consultivo.</p>
               <p>7.2. Responsabilidade Técnica: A plataforma, incluindo sua inteligência artificial, não substitui o manual oficial do fabricante, laudos técnicos ou a avaliação presencial de um profissional mecânico qualificado. O RevisAuto não se responsabiliza por danos físicos ou materiais decorrentes da aplicação de sugestões geradas no aplicativo.</p>
               <p>7.3. Dicas de Produtos: A compatibilidade de produtos químicos ou peças automotivas é de inteira responsabilidade do Usuário.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">8. FORO E LEGISLAÇÃO APLICÁVEL</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">8. FORO E LEGISLAÇÃO APLICÁVEL</h4>
               <p>8.1. Regido pelas leis da República Federativa do Brasil (Marco Civil da Internet e LGPD).</p>
               <p>8.2. Eleito o Foro da Comarca de Vila Velha, Estado do Espírito Santo.</p>
             </div>
@@ -5552,81 +6433,97 @@ export default function App() {
 
       {/* Privacy Modal (Logged In) */}
       {showPrivacyModal && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
+        <div className="fixed inset-0 z-50 overflow-y-auto" style={{ background: theme === 'light' ? '#eef1f0' : '#000000' }}>
           <div className="p-4 h-full flex flex-col">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">{t('privacy')}</h2>
-              <button onClick={() => { setShowPrivacyModal(false); setActiveTab('menu'); }} className="text-revis-green font-bold text-sm flex items-center gap-1 p-2">
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">{t('privacy')}</h2>
+              <button onClick={() => { setShowPrivacyModal(false); setActiveTab('menu'); }} className="text-[#34a06a] font-bold text-sm flex items-center gap-1 p-2">
                 &lt; {t('back')}
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto bg-revis-dark-gray rounded-xl p-4 text-xs text-revis-light-gray space-y-4">
-              <h3 className="font-bold text-revis-heading mb-2 text-sm">POLÍTICA DE PRIVACIDADE – REVISAUTO</h3>
-              <p className="text-[10px] text-revis-gray mb-4">Última atualização: 20 de maio de 2026.<br/>Novas atualizações serão notificadas.</p>
+            <div className="flex-1 overflow-y-auto glass rounded-xl p-4 text-xs text-[--color-text] space-y-4">
+              <h3 className="font-bold text-[--color-heading] font-display mb-2 text-sm">POLÍTICA DE PRIVACIDADE – REVISAUTO</h3>
+              <p className="text-[10px] text-[--color-revis-gray] mb-4">{t('legalLastUpdated')}<br/>{t('legalUpdatesNotice')}</p>
               
               <p>A plataforma RevisAuto tem o compromisso de proteger a privacidade e os dados pessoais de seus usuários. Esta Política descreve como coletamos, usamos, armazenamos e protegemos suas informações, em total conformidade com a Lei Geral de Proteção de Dados (Lei nº 13.709/2018 - LGPD).</p>
               
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">1. DADOS COLETADOS</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">1. DADOS COLETADOS</h4>
               <p>Para o funcionamento adequado do aplicativo, coletamos os seguintes dados:</p>
               <ul className="list-disc pl-4 space-y-1">
-                <li>Informações de Cadastro: Nome e e-mail para verificação de conta e suporte.</li>
-                <li>Informações do Veículo: Marca, modelo, ano, quilometragem e histórico de serviços inseridos por você.</li>
-                <li>Interações com a IA: O conteúdo das mensagens, perguntas e fotos enviadas ao assistente virtual (Dr. Graxa).</li>
-                <li>Dados de Autenticação Biométrica: Para maior comodidade, o app utiliza a autenticação local do seu dispositivo (Face ID ou Touch ID). Aviso importante: O RevisAuto NÃO coleta, transfere ou armazena os seus dados biométricos (impressão digital ou mapeamento facial) em nossos servidores. O reconhecimento é feito exclusivamente de forma criptografada pelo hardware do seu próprio celular.</li>
+                <li>Informações de Cadastro: Nome completo, e-mail, apelido, data de nascimento, país, celular, CEP, cidade e estado.</li>
+                <li>Informações do Veículo: Placa, marca, modelo, ano, cor, quilometragem, RENAVAM e chassi (quando informados ou extraídos automaticamente do CRLV), além do histórico de abastecimentos, manutenções e impostos, taxas e multas registrados por você.</li>
+                <li>Documentos e Comprovantes: Fotos e arquivos anexados aos lançamentos de abastecimento, manutenção e impostos/multas, além do documento do veículo (CRLV) enviado para preenchimento automático do cadastro.</li>
+                <li>Interações com a IA: O conteúdo das mensagens e fotos enviadas ao assistente virtual (Dr. Graxa).</li>
               </ul>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">2. FINALIDADE DO TRATAMENTO DE DADOS</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">2. FINALIDADE DO TRATAMENTO DE DADOS</h4>
               <p>Os dados coletados são utilizados exclusivamente para:</p>
               <ul className="list-disc pl-4 space-y-1">
                 <li>Gerenciar sua garagem virtual e histórico automotivo.</li>
-                <li>Personalizar as respostas e diagnósticos da Inteligência Artificial.</li>
+                <li>Personalizar as respostas e diagnósticos da Inteligência Artificial, inclusive a leitura automática do CRLV.</li>
                 <li>Processar as validações de pagamento das assinaturas escolhidas pelo usuário.</li>
                 <li>Garantir a segurança da conta e prevenir acessos fraudulentos.</li>
               </ul>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS E INFRAESTRUTURA</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">3. COMPARTILHAMENTO DE DADOS E INFRAESTRUTURA</h4>
               <p>3.1. Não Comercialização: O RevisAuto não vende seus dados pessoais a terceiros para fins publicitários.</p>
-              <p>3.2. Parceiros Técnicos e Nuvem: Seus dados cadastrais e o histórico de veículos são armazenados de forma criptografada em nosso parceiro de nuvem, o Supabase.</p>
-              <p>3.3. Inteligência Artificial: Para o funcionamento do assistente &quot;Dr. Graxa&quot;, as mensagens enviadas são processadas através da API da OpenAI. O processamento é feito de maneira segura, e os seus dados não são utilizados para treinar modelos públicos de IA.</p>
+              <p>3.2. Parceiros Técnicos e Nuvem: Seus dados cadastrais e o histórico de veículos são armazenados de forma criptografada em nosso parceiro de nuvem, o Supabase. O aplicativo é hospedado na infraestrutura da Cloudflare, que processa as requisições e o envio de arquivos antes de chegarem ao armazenamento.</p>
+              <p>3.3. Inteligência Artificial: Para o funcionamento do assistente &quot;Dr. Graxa&quot; e para a leitura automática do CRLV, as mensagens e documentos enviados são processados através da API do Gemini (Google). O processamento é feito de maneira segura, e os seus dados não são utilizados para treinar modelos públicos de IA.</p>
               <p>3.4. Processamento de Pagamentos: Transações financeiras (Planos Plus e Premium) são geridas e processadas pelo Mercado Pago. O RevisAuto não armazena os dados completos de seu cartão de crédito em seus servidores.</p>
               <p>3.5. Ordens Judiciais: Poderemos compartilhar dados caso sejamos obrigados por lei ou decisão judicial, conforme o Marco Civil da Internet.</p>
+              <p>3.6. Transferência Internacional de Dados: Nossos parceiros de nuvem e de inteligência artificial (Supabase, Cloudflare e Google) podem processar ou armazenar dados em servidores localizados fora do Brasil. Esse tratamento segue o disposto no art. 33 da LGPD, com garantias contratuais de proteção equivalente à legislação brasileira.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">4. SEGURANÇA DA INFORMAÇÃO</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">4. SEGURANÇA DA INFORMAÇÃO</h4>
               <p>4.1. Criptografia: Utilizamos protocolos de criptografia de ponta a ponta (SSL/TLS) para o tráfego de informações entre o seu dispositivo e nossa nuvem.</p>
               <p>4.2. Proteção: Nossos bancos de dados contam com rigorosos controles de acesso baseados em políticas de segurança modernas.</p>
               <p>4.3. Responsabilidade do Usuário: Mantenha suas credenciais seguras e desconfie de abordagens externas solicitando dados em nome do RevisAuto.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">5. SEUS DIREITOS (LGPD)</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">5. SEUS DIREITOS (LGPD)</h4>
               <p>Como titular dos dados, você tem o direito de:</p>
               <ul className="list-disc pl-4 space-y-1">
                 <li>Confirmar a existência de tratamento de seus dados.</li>
                 <li>Acessar e corrigir dados incompletos ou desatualizados a qualquer momento no perfil do app.</li>
+                <li>Solicitar a portabilidade dos seus dados a outro fornecedor de serviço.</li>
+                <li>Solicitar a anonimização, o bloqueio ou a eliminação de dados desnecessários, excessivos ou tratados em desconformidade com a LGPD.</li>
+                <li>Obter informação sobre as entidades com as quais o RevisAuto compartilha seus dados (ver seção 3).</li>
+                <li>Revogar seu consentimento a qualquer momento e se opor a um tratamento realizado sem consentimento, quando exigido por lei.</li>
                 <li>Exclusão (Direito ao Esquecimento): Solicitar a eliminação definitiva e irrevogável de todos os seus dados cadastrais, histórico de veículos e conversas dos nossos servidores, utilizando o botão específico de exclusão de conta dentro das configurações do próprio aplicativo.</li>
               </ul>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">6. TECNOLOGIAS DE RASTREIO E SESSÃO</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">6. TECNOLOGIAS DE RASTREIO E SESSÃO</h4>
               <p>Utilizamos identificadores seguros e tokens de sessão (access tokens) do seu dispositivo móvel exclusivamente para manter o aplicativo logado e funcional durante o uso, melhorando a fluidez da sua experiência.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">7. RETENÇÃO DE DADOS</h4>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">7. RETENÇÃO DE DADOS</h4>
               <p>Mantemos seus dados ativos apenas enquanto a sua conta existir para cumprir as finalidades desta política. Caso opte por deletar a conta, os dados serão expurgados dos nossos servidores primários, ressalvada a guarda necessária para o cumprimento de obrigações legais impostas pelo Marco Civil da Internet.</p>
 
-              <h4 className="font-bold text-revis-heading mt-4 text-sm">8. CONTATO E ENCARREGADO DE DADOS (DPO)</h4>
-              <p>Para exercer seus direitos, relatar vulnerabilidades ou tirar dúvidas sobre sua privacidade, entre em contato através do e-mail oficial: suporte@revisautoapp.com.br.</p>
+              <h4 className="font-bold text-[--color-heading] font-display mt-4 text-sm">8. CONTATO E ENCARREGADO DE DADOS (DPO)</h4>
+              <p>Para exercer seus direitos, relatar vulnerabilidades ou tirar dúvidas sobre sua privacidade, entre em contato através do e-mail oficial: dev@revisautoapp.com.br.</p>
             </div>
           </div>
         </div>
       )}
 
       {showAddVehicle && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
-          <div className="p-4 pb-24">
+        <div
+          className="fixed inset-0 z-50 flex items-end md:items-center justify-center bg-black/70 backdrop-blur-sm p-0 md:p-4 animate-in fade-in duration-200"
+          onClick={(e) => { if (e.target === e.currentTarget) handleCancelAddVehicle(); }}
+        >
+          <div
+            className="w-full md:max-w-lg md:mx-auto rounded-t-2xl md:rounded-2xl max-h-[88vh] overflow-y-auto"
+            style={
+              theme === 'light'
+                ? { background: 'rgba(255,255,255,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(0,0,0,0.10)', boxShadow: '0 16px 40px rgba(0,0,0,0.18)' }
+                : { background: 'rgba(20,22,24,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(255,255,255,0.13)', boxShadow: '0 16px 40px rgba(0,0,0,0.55)' }
+            }
+          >
+          <div className="p-5">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">{t('newVehicleTitle')}</h2>
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">{t('newVehicleTitle')}</h2>
             </div>
             
             <form onSubmit={handleAddVehicle} className="space-y-6">
               <div>
-                <label className="block text-sm text-revis-gray mb-2">{t('vehicleType')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-2">{t('vehicleType')}</label>
                 <div className="grid grid-cols-3 gap-3">
                   {['Carro', 'Moto', 'Bike'].map((type) => (
                     <button
@@ -5639,41 +6536,89 @@ export default function App() {
                       }}
                       className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${
                         newVehicle.type === type 
-                          ? 'bg-revis-green/10 border-revis-green text-revis-green' 
-                          : 'bg-revis-dark-gray border-transparent text-revis-gray'
+                          ? 'bg-[#34a06a]/10 border-[#34a06a] text-[#34a06a]' 
+                          : 'glass border-transparent text-[--color-revis-gray]'
                       }`}
                     >
                       {type === 'Carro' && <Car className="w-6 h-6" />}
                       {type === 'Moto' && <Bike className="w-6 h-6" />}
                       {type === 'Bike' && <Zap className="w-6 h-6" />}
-                      <span className="text-xs font-medium">{type === 'Bike' ? t('eBikeTypeLabel') : type}</span>
+                      <span className="text-xs font-medium">{vehicleTypeLabel(type)}</span>
                     </button>
                   ))}
                 </div>
               </div>
 
+              {/* Importar dados do CRLV */}
+              <div className="rounded-xl border border-dashed border-[--color-border] p-4">
+                <label
+                  htmlFor="crlv-upload-input"
+                  className={`flex items-center justify-center gap-2 text-sm font-medium py-2 rounded-lg cursor-pointer transition-colors ${
+                    isUploadingCrlv
+                      ? 'text-[--color-revis-gray] cursor-wait'
+                      : 'text-[#34a06a] hover:bg-[#34a06a]/10'
+                  }`}
+                >
+                  {isUploadingCrlv ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      {t('crlvUploading')}
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-4 h-4" />
+                      {newVehicle.document_path ? t('crlvReplaceButton') : t('crlvImportButton')}
+                    </>
+                  )}
+                </label>
+                <input
+                  id="crlv-upload-input"
+                  type="file"
+                  accept="application/pdf"
+                  className="hidden"
+                  disabled={isUploadingCrlv}
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) void handleCrlvUpload(file);
+                    e.target.value = '';
+                  }}
+                />
+                <p className="text-[11px] text-[--color-revis-gray] text-center mt-1">{t('crlvImportHint')}</p>
+
+                {crlvWarnings.length > 0 && (
+                  <div className="mt-3 rounded-lg bg-[#ff8a3d]/10 border border-[#ff8a3d]/25 p-3">
+                    <p className="text-xs font-medium text-[#ff8a3d] mb-1">{t('crlvWarningsTitle')}</p>
+                    <ul className="text-xs text-[--color-revis-gray] list-disc list-inside space-y-0.5">
+                      {crlvWarnings.map((w, i) => <li key={i}>{w}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('plateLabel')}*</label>
+                <input
+                  required
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors uppercase tracking-wider"
+                  placeholder="ABC1D23"
+                  maxLength={8}
+                  value={newVehicle.plate || ''}
+                  onChange={e => {
+                    const val = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+                    setNewVehicle({ ...newVehicle, plate: val });
+                  }}
+                />
+              </div>
+
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">{t('brand')}</label>
-                  <select 
-                    required
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none appearance-none"
-                    value={newVehicle.brand === 'Outra' ? 'Outra' : (newVehicle.brand || '')}
-                    onChange={e => {
-                      const val = e.target.value;
-                      setNewVehicle({...newVehicle, brand: val, model: ''});
-                      if (val !== 'Outra') setCustomBrand('');
-                      setCustomModel('');
-                    }}
-                  >
-                    <option value="">{t('selectPlaceholder')}</option>
-                    {getBrandList().map(b => <option key={b} value={b}>{b}</option>)}
-                  </select>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('brand')}</label>
+                  <CustomSelect required value={newVehicle.brand==='Outra'?'Outra':(newVehicle.brand||'')} onChange={v=>{const val=v;setNewVehicle({...newVehicle,brand:val,model:''});if(val!=='Outra')setCustomBrand('');setCustomModel('');}} options={[{value:'',label:t('selectPlaceholder')},...getBrandList().map(b=>({value:b,label:optionLabel(b)}))]} />
                   
                   {newVehicle.brand === 'Outra' && (
                     <input 
                       required
-                      className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors mt-2"
+                      className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors mt-2"
                       placeholder={t('vehicleBrandPlaceholder')}
                       value={customBrand}
                       onChange={e => {
@@ -5685,27 +6630,14 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">{t('model')}</label>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('model')}</label>
                   {newVehicle.brand && newVehicle.brand !== 'Outra' && getModelList().length > 0 ? (
                     <>
-                      <select 
-                        required
-                        className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none appearance-none"
-                        value={newVehicle.model === 'Outro' ? 'Outro' : (newVehicle.model || '')}
-                        onChange={e => {
-                          const val = e.target.value;
-                          setNewVehicle({...newVehicle, model: val});
-                          if (val !== 'Outro') setCustomModel('');
-                        }}
-                      >
-                        <option value="">{t('selectPlaceholder')}</option>
-                        {getModelList().map(m => <option key={m} value={m}>{m}</option>)}
-                        <option value="Outro">Outro</option>
-                      </select>
+                      <CustomSelect required value={newVehicle.model==='Outro'?'Outro':(newVehicle.model||'')} onChange={v=>{const val=v;setNewVehicle({...newVehicle,model:val});if(val!=='Outro')setCustomModel('');}} options={[{value:'',label:t('selectPlaceholder')},...getModelList().map(m=>({value:m,label:optionLabel(m)})),{value:'Outro',label:t('optionOther')}]} />
                       {newVehicle.model === 'Outro' && (
                         <input 
                           required
-                          className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors mt-2"
+                          className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors mt-2"
                           placeholder={t('vehicleModelPlaceholder')}
                           value={customModel}
                           onChange={e => {
@@ -5719,7 +6651,7 @@ export default function App() {
                     <input 
                       required
                       disabled={!newVehicle.brand}
-                      className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                       placeholder={!newVehicle.brand ? t('vehicleModelSelectBrandFirst') : t('vehicleModelPlaceholder')}
                       value={newVehicle.brand === 'Outra' ? customModel : (newVehicle.model || '')}
                       onChange={e => {
@@ -5737,7 +6669,7 @@ export default function App() {
                 {/* Premium Fields */}
                 <div>
                   <div className="flex items-center gap-2 mb-1">
-                    <label className="block text-sm text-revis-gray">{t('nickname')}</label>
+                    <label className="block text-sm text-[--color-revis-gray]">{t('vehicleNicknameLabel')}</label>
                     {!isPlusOrPremium(user?.plan) && (
                       <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/20 px-2 py-0.5 text-xs font-semibold text-amber-300">
                         <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" className="-my-px" />
@@ -5753,12 +6685,12 @@ export default function App() {
                     }}
                   >
                     <input
-                      className={`w-full bg-revis-dark-gray border border-transparent rounded-xl p-4 outline-none transition-colors ${
+                      className={`w-full glass border border-transparent rounded-xl p-4 outline-none transition-colors ${
                         isPlusOrPremium(user?.plan)
-                          ? 'focus:border-revis-green text-revis-light-gray'
-                          : 'text-revis-gray cursor-not-allowed opacity-60'
+                          ? 'focus:border-[#34a06a] text-[--color-text]'
+                          : 'text-[--color-revis-gray] cursor-not-allowed opacity-60'
                       }`}
-                      placeholder={isPlusOrPremium(user?.plan) ? t('vehicleNicknamePremiumExample') : t('vehicleNicknamePremiumOnly')}
+                      placeholder={isPlusOrPremium(user?.plan) ? t('vehicleNicknamePlaceholder') : t('vehicleNicknamePremiumOnly')}
                       maxLength={12}
                       disabled={!isPlusOrPremium(user?.plan)}
                       value={newVehicle.nickname || ''}
@@ -5772,7 +6704,7 @@ export default function App() {
 
                 <div>
                   <div className="flex items-center gap-2 mb-1">
-                    <label className="block text-sm text-revis-gray">{t('color')}</label>
+                    <label className="block text-sm text-[--color-revis-gray]">{t('color')}</label>
                     {!isPlusOrPremium(user?.plan) && (
                       <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/20 px-2 py-0.5 text-xs font-semibold text-amber-300">
                         <PremiumCrown tooltip={t('premiumCrownTooltip')} decorative size="xs" className="-my-px" />
@@ -5787,28 +6719,11 @@ export default function App() {
                       }
                     }}
                   >
-                    <select
-                      className={`w-full bg-revis-dark-gray border border-transparent rounded-xl p-4 outline-none appearance-none transition-colors ${
-                        isPlusOrPremium(user?.plan)
-                          ? 'focus:border-revis-green text-revis-light-gray'
-                          : 'text-revis-gray cursor-not-allowed opacity-60'
-                      }`}
-                      disabled={!isPlusOrPremium(user?.plan)}
-                      value={newVehicle.color || ''}
-                      onChange={e => {
-                        const val = e.target.value;
-                        setNewVehicle({...newVehicle, color: val});
-                        if (val !== 'Customizado') setCustomColor('');
-                        if (val !== 'Outra') setOtherColor('');
-                      }}
-                    >
-                      <option value="">{isPlusOrPremium(user?.plan) ? t('selectPlaceholder') : t('vehicleNicknamePremiumOnly')}</option>
-                      {isPlusOrPremium(user?.plan) && VEHICLE_COLORS.map(c => <option key={c} value={c}>{c}</option>)}
-                    </select>
+                    <CustomSelect disabled={!isPlusOrPremium(user?.plan)} value={newVehicle.color||''} onChange={v=>{const val=v;setNewVehicle({...newVehicle,color:val});if(val!=='Customizado')setCustomColor('');if(val!=='Outra')setOtherColor('');}} options={[{value:'',label:isPlusOrPremium(user?.plan)?t('selectPlaceholder'):t('vehicleNicknamePremiumOnly')},...(VEHICLE_COLORS||[]).map((c:string)=>({value:c,label:optionLabel(c)}))]} />
 
                     {isPlusOrPremium(user?.plan) && newVehicle.color === 'Customizado' && (
                       <input
-                        className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors mt-2"
+                        className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors mt-2"
                         placeholder={t('vehicleCustomColorPlaceholder')}
                         maxLength={30}
                         value={customColor}
@@ -5821,7 +6736,7 @@ export default function App() {
 
                     {isPlusOrPremium(user?.plan) && newVehicle.color === 'Outra' && (
                       <input
-                        className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors mt-2"
+                        className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors mt-2"
                         placeholder={t('vehicleColorPlaceholder')}
                         maxLength={10}
                         value={otherColor}
@@ -5837,23 +6752,14 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">{t('year')}</label>
-                  <select 
-                    required
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none appearance-none"
-                    value={newVehicle.year || ''}
-                    onChange={e => setNewVehicle({...newVehicle, year: parseInt(e.target.value)})}
-                  >
-                    {Array.from({length: new Date().getFullYear() - 1950 + 1}, (_, i) => new Date().getFullYear() - i).map(y => (
-                      <option key={y} value={y}>{y}</option>
-                    ))}
-                  </select>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('year')}</label>
+                  <CustomSelect required value={newVehicle.year?.toString()||''} onChange={v=>setNewVehicle({...newVehicle,year:parseInt(v)})} options={Array.from({length:new Date().getFullYear()-1950+1},(_,i)=>new Date().getFullYear()-i).map(y=>({value:y.toString(),label:y.toString()}))} />
                 </div>
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">{t('currentKmLabel')}</label>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('currentKmLabel')}</label>
                   <input 
                     required
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                    className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                     value={mileageInput}
                     placeholder={t('mileagePlaceholderZero')}
                     onChange={e => {
@@ -5867,12 +6773,12 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('lastGeneralRevision')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('lastGeneralRevision')}</label>
                 <LocalizedDateInput
                   required
                   dateFormat={dateFormat}
                   locale={getLocaleFromLanguage(language)}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newVehicle.last_service_date || ''}
                   onChange={iso => setNewVehicle({ ...newVehicle, last_service_date: iso })}
                 />
@@ -5883,28 +6789,40 @@ export default function App() {
                   type="button" 
                   onClick={handleCancelAddVehicle}
                   disabled={isSubmittingVehicle}
-                  className="flex-1 bg-revis-dark-gray text-revis-heading font-bold py-4 rounded-xl hover:bg-revis-gray/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex-1 glass text-[--color-heading] font-display font-bold py-4 rounded-xl hover:bg-white/8 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {t('cancel')}
                 </button>
                 <button 
                   type="submit" 
                   disabled={isSubmittingVehicle}
-                  className="flex-1 bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex-1 bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {isSubmittingVehicle ? t('saving') : t('addButton')}
                 </button>
               </div>
             </form>
           </div>
+          </div>
         </div>
       )}
 
       {showAddLog && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
-          <div className="p-4">
+        <div
+          className="fixed inset-0 z-50 flex items-end md:items-center justify-center bg-black/70 backdrop-blur-sm p-0 md:p-4 animate-in fade-in duration-200"
+          onClick={(e) => { if (e.target === e.currentTarget) closeLogModal(); }}
+        >
+          <div
+            className="w-full md:max-w-lg md:mx-auto rounded-t-2xl md:rounded-2xl max-h-[88vh] overflow-y-auto"
+            style={
+              theme === 'light'
+                ? { background: 'rgba(255,255,255,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(0,0,0,0.10)', boxShadow: '0 16px 40px rgba(0,0,0,0.18)' }
+                : { background: 'rgba(20,22,24,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(255,255,255,0.13)', boxShadow: '0 16px 40px rgba(0,0,0,0.55)' }
+            }
+          >
+          <div className="p-5">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">
                 {editingMaintenanceLogId !== null ? t('editMaintenanceTitle') : t('newMaintenanceTitle')}
               </h2>
               <div className="flex items-center gap-1">
@@ -5914,12 +6832,12 @@ export default function App() {
                     onClick={handleDeleteLog}
                     disabled={isDeletingRecord || isSubmittingLog}
                     aria-label={t('deleteRecord')}
-                    className="text-revis-alert-critical hover:bg-revis-alert-critical/10 p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="text-[#e0473f] hover:bg-revis-alert-critical/10 p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Trash2 className="w-5 h-5" />
                   </button>
                 )}
-                <button onClick={closeLogModal} className="text-revis-gray p-2">
+                <button onClick={closeLogModal} className="text-[--color-revis-gray] p-2">
                   {t('cancel')}
                 </button>
               </div>
@@ -5927,21 +6845,21 @@ export default function App() {
             
             <form onSubmit={handleAddLog} className="space-y-6">
               <div>
-                <label className="block text-sm text-revis-gray mb-1">Descrição</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('descriptionLabel')}</label>
                 <input 
                   required
                   placeholder={t('logDescriptionPlaceholder')}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newLog.description || ''}
                   onChange={e => setNewLog({...newLog, description: e.target.value})}
                 />
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">Responsável</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('responsible')}</label>
                 <input 
                   placeholder={t('logProviderPlaceholder')}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newLog.provider || ''}
                   onChange={e => setNewLog({...newLog, provider: e.target.value})}
                 />
@@ -5949,35 +6867,70 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">{t('date')}</label>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('date')}</label>
                   <LocalizedDateInput
                     required
                     dateFormat={dateFormat}
                     locale={getLocaleFromLanguage(language)}
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                    className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                     value={newLog.date || ''}
                     onChange={iso => setNewLog({ ...newLog, date: iso })}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">
                     {t('value')} ({getCurrencySymbol(currency, getLocaleFromLanguage(language))})
                   </label>
                   <input
                     type="number"
                     step="0.01"
                     required
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                    className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                     value={newLog.cost ?? ''}
                     onChange={e => setNewLog({...newLog, cost: parseFloat(e.target.value)})}
                   />
                 </div>
               </div>
 
+              <div>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('notesLabel')}</label>
+                <textarea
+                  maxLength={200}
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors resize-none h-24"
+                  value={newLog.notes || ''}
+                  onChange={e => setNewLog({...newLog, notes: e.target.value})}
+                  placeholder={t('maintenanceNotesPlaceholder')}
+                />
+                <div className="flex items-center justify-between mt-1">
+                  <label
+                    htmlFor="maintenance-attachment-input"
+                    className={`text-xs font-medium flex items-center gap-1.5 cursor-pointer transition-colors ${
+                      newLog.attachment_path ? 'text-[#34a06a]' : 'text-[--color-revis-gray] hover:text-[#34a06a]'
+                    }`}
+                  >
+                    {isUploadingAttachment ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Paperclip className="w-3.5 h-3.5" />}
+                    {newLog.attachment_path ? t('attachmentAdded') : t('attachmentAddButton')}
+                  </label>
+                  <span className="text-xs text-[--color-revis-gray]">{(newLog.notes?.length || 0)}/200</span>
+                </div>
+                <input
+                  id="maintenance-attachment-input"
+                  type="file"
+                  accept="application/pdf,image/jpeg,image/png,image/webp"
+                  className="hidden"
+                  disabled={isUploadingAttachment}
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) void handleRecordAttachmentUpload(file, 'maintenance', path => setNewLog(prev => ({ ...prev, attachment_path: path })));
+                    e.target.value = '';
+                  }}
+                />
+              </div>
+
               <button
                 type="submit"
                 disabled={isSubmittingLog || isDeletingRecord}
-                className="w-full bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors mt-8 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="w-full bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors mt-8 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSubmittingLog
                   ? t('saving')
@@ -5987,16 +6940,28 @@ export default function App() {
               </button>
             </form>
           </div>
+          </div>
         </div>
       )}
 
       {/* Add/Edit Financial Record Modal */}
       {showAddFinancial && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
-          <div className="p-4">
+        <div
+          className="fixed inset-0 z-50 flex items-end md:items-center justify-center bg-black/70 backdrop-blur-sm p-0 md:p-4 animate-in fade-in duration-200"
+          onClick={(e) => { if (e.target === e.currentTarget) closeFinancialModal(); }}
+        >
+          <div
+            className="w-full md:max-w-lg md:mx-auto rounded-t-2xl md:rounded-2xl max-h-[88vh] overflow-y-auto"
+            style={
+              theme === 'light'
+                ? { background: 'rgba(255,255,255,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(0,0,0,0.10)', boxShadow: '0 16px 40px rgba(0,0,0,0.18)' }
+                : { background: 'rgba(20,22,24,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(255,255,255,0.13)', boxShadow: '0 16px 40px rgba(0,0,0,0.55)' }
+            }
+          >
+          <div className="p-5">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">
-                {editingFinancialRecordId !== null ? t('editFinancialTitle') : 'Novo Registro Financeiro'}
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">
+                {editingFinancialRecordId !== null ? t('editFinancialTitle') : t('newFinancialTitle')}
               </h2>
               <div className="flex items-center gap-1">
                 {editingFinancialRecordId !== null && (
@@ -6005,12 +6970,12 @@ export default function App() {
                     onClick={handleDeleteFinancial}
                     disabled={isDeletingRecord || isSubmittingFinancial}
                     aria-label={t('deleteRecord')}
-                    className="text-revis-alert-critical hover:bg-revis-alert-critical/10 p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="text-[#e0473f] hover:bg-revis-alert-critical/10 p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Trash2 className="w-5 h-5" />
                   </button>
                 )}
-                <button onClick={closeFinancialModal} className="text-revis-gray p-2">
+                <button onClick={closeFinancialModal} className="text-[--color-revis-gray] p-2">
                   {t('cancel')}
                 </button>
               </div>
@@ -6018,7 +6983,7 @@ export default function App() {
             
             <form onSubmit={handleAddFinancial} className="space-y-6">
               <div>
-                <label className="block text-sm text-revis-gray mb-2">Tipo</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-2">{t('typeLabel')}</label>
                 <div className="grid grid-cols-3 gap-3">
                   {['Imposto', 'Multa', 'Taxa'].map((type) => (
                     <button
@@ -6028,21 +6993,21 @@ export default function App() {
                       onClick={() => setNewFinancial({...newFinancial, type: type as any})}
                       className={`p-3 rounded-xl border flex items-center justify-center transition-colors ${
                         newFinancial.type === type 
-                          ? 'bg-revis-green/10 border-revis-green text-revis-green' 
-                          : 'bg-revis-dark-gray border-transparent text-revis-gray'
+                          ? 'bg-[#34a06a]/10 border-[#34a06a] text-[#34a06a]' 
+                          : 'glass border-transparent text-[--color-revis-gray]'
                       }`}
                     >
-                      <span className="text-sm font-medium">{type}</span>
+                      <span className="text-sm font-medium">{financialTypeLabel(type)}</span>
                     </button>
                   ))}
                 </div>
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">Descrição</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('descriptionLabel')}</label>
                 <input 
                   required
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newFinancial.description || ''}
                   onChange={e => setNewFinancial({...newFinancial, description: e.target.value})}
                   placeholder={t('financialDescPlaceholder')}
@@ -6051,25 +7016,25 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">Vencimento</label>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('dueDateLabel')}</label>
                   <LocalizedDateInput
                     required
                     dateFormat={dateFormat}
                     locale={getLocaleFromLanguage(language)}
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                    className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                     value={newFinancial.due_date || ''}
                     onChange={iso => setNewFinancial({ ...newFinancial, due_date: iso })}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">
                     {t('value')} ({getCurrencySymbol(currency, getLocaleFromLanguage(language))})
                   </label>
                   <input
                     type="number"
                     step="0.01"
                     required
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                    className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                     value={newFinancial.value ?? ''}
                     onChange={e => setNewFinancial({...newFinancial, value: parseFloat(e.target.value)})}
                   />
@@ -6077,7 +7042,7 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-2">Situação</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-2">{t('statusLabel')}</label>
                 <div className="grid grid-cols-3 gap-3">
                   {['Pago', 'Em aberto', 'Atrasado'].map((status) => (
                     <button
@@ -6087,11 +7052,11 @@ export default function App() {
                       onClick={() => setNewFinancial({...newFinancial, status: status as any})}
                       className={`p-3 rounded-xl border flex items-center justify-center transition-colors ${
                         newFinancial.status === status 
-                          ? status === 'Pago' ? 'bg-revis-green/10 border-revis-green text-revis-green' : status === 'Atrasado' ? 'bg-revis-alert-critical/10 border-revis-alert-critical text-revis-alert-critical' : 'bg-revis-alert-medium/10 border-revis-alert-medium text-revis-alert-medium'
-                          : 'bg-revis-dark-gray border-transparent text-revis-gray'
+                          ? status === 'Pago' ? 'bg-[#34a06a]/10 border-[#34a06a] text-[#34a06a]' : status === 'Atrasado' ? 'bg-revis-alert-critical/10 border-revis-alert-critical text-[#e0473f]' : 'bg-revis-alert-medium/10 border-revis-alert-medium text-[#ffcc00]'
+                          : 'glass border-transparent text-[--color-revis-gray]'
                       }`}
                     >
-                      <span className="text-sm font-medium">{status}</span>
+                      <span className="text-sm font-medium">{financialStatusLabel(status)}</span>
                     </button>
                   ))}
                 </div>
@@ -6099,12 +7064,12 @@ export default function App() {
 
               {newFinancial.status === 'Pago' && (
                 <div>
-                  <label className="block text-sm text-revis-gray mb-1">Data de Pagamento</label>
+                  <label className="block text-sm text-[--color-revis-gray] mb-1">{t('paymentDateLabel')}</label>
                   <LocalizedDateInput
                     required
                     dateFormat={dateFormat}
                     locale={getLocaleFromLanguage(language)}
-                    className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                    className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                     value={newFinancial.payment_date || ''}
                     onChange={iso => setNewFinancial({ ...newFinancial, payment_date: iso })}
                   />
@@ -6112,23 +7077,44 @@ export default function App() {
               )}
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">Observações (Opcional)</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('notesLabel')}</label>
                 <textarea 
                   maxLength={200}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors resize-none h-24"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors resize-none h-24"
                   value={newFinancial.notes || ''}
                   onChange={e => setNewFinancial({...newFinancial, notes: e.target.value})}
                   placeholder={t('financialNotesPlaceholder')}
                 />
-                <div className="text-right text-xs text-revis-gray mt-1">
-                  {(newFinancial.notes?.length || 0)}/200
+                <div className="flex items-center justify-between mt-1">
+                  <label
+                    htmlFor="financial-attachment-input"
+                    className={`text-xs font-medium flex items-center gap-1.5 cursor-pointer transition-colors ${
+                      newFinancial.attachment_path ? 'text-[#34a06a]' : 'text-[--color-revis-gray] hover:text-[#34a06a]'
+                    }`}
+                  >
+                    {isUploadingAttachment ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Paperclip className="w-3.5 h-3.5" />}
+                    {newFinancial.attachment_path ? t('attachmentAdded') : t('attachmentAddButton')}
+                  </label>
+                  <span className="text-xs text-[--color-revis-gray]">{(newFinancial.notes?.length || 0)}/200</span>
                 </div>
+                <input
+                  id="financial-attachment-input"
+                  type="file"
+                  accept="application/pdf,image/jpeg,image/png,image/webp"
+                  className="hidden"
+                  disabled={isUploadingAttachment}
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) void handleRecordAttachmentUpload(file, 'financial', path => setNewFinancial(prev => ({ ...prev, attachment_path: path })));
+                    e.target.value = '';
+                  }}
+                />
               </div>
 
               <button
                 type="submit"
                 disabled={isSubmittingFinancial || isDeletingRecord}
-                className="w-full bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors mt-8 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="w-full bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors mt-8 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSubmittingFinancial
                   ? t('saving')
@@ -6138,13 +7124,25 @@ export default function App() {
               </button>
             </form>
           </div>
+          </div>
         </div>
       )}
       {showAddMileage && (
-        <div className="fixed inset-0 bg-revis-black z-50 overflow-y-auto animate-in slide-in-from-bottom duration-300">
-          <div className="p-4">
+        <div
+          className="fixed inset-0 z-50 flex items-end md:items-center justify-center bg-black/70 backdrop-blur-sm p-0 md:p-4 animate-in fade-in duration-200"
+          onClick={(e) => { if (e.target === e.currentTarget) closeMileageModal(); }}
+        >
+          <div
+            className="w-full md:max-w-lg md:mx-auto rounded-t-2xl md:rounded-2xl max-h-[88vh] overflow-y-auto"
+            style={
+              theme === 'light'
+                ? { background: 'rgba(255,255,255,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(0,0,0,0.10)', boxShadow: '0 16px 40px rgba(0,0,0,0.18)' }
+                : { background: 'rgba(20,22,24,0.96)', backdropFilter: 'blur(36px) saturate(195%)', WebkitBackdropFilter: 'blur(36px) saturate(195%)', border: '1px solid rgba(255,255,255,0.13)', boxShadow: '0 16px 40px rgba(0,0,0,0.55)' }
+            }
+          >
+          <div className="p-5">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-revis-heading">
+              <h2 className="text-2xl font-bold text-[--color-heading] font-display">
                 {editingMileageLogId ? t('editFuelingTitle') : t('newFuelingTitle')}
               </h2>
               <div className="flex items-center gap-1">
@@ -6154,12 +7152,12 @@ export default function App() {
                     onClick={handleDeleteMileage}
                     disabled={isDeletingRecord || isSubmittingMileage}
                     aria-label={t('deleteRecord')}
-                    className="text-revis-alert-critical hover:bg-revis-alert-critical/10 p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="text-[#e0473f] hover:bg-revis-alert-critical/10 p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Trash2 className="w-5 h-5" />
                   </button>
                 )}
-                <button onClick={closeMileageModal} className="text-revis-gray p-2">
+                <button onClick={closeMileageModal} className="text-[--color-revis-gray] p-2">
                   {t('cancel')}
                 </button>
               </div>
@@ -6167,25 +7165,25 @@ export default function App() {
 
             <form onSubmit={handleMileageSubmit} className="space-y-6">
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('date')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('date')}</label>
                 <LocalizedDateInput
                   required
                   dateFormat={dateFormat}
                   locale={getLocaleFromLanguage(language)}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newMileage.date || ''}
                   onChange={iso => setNewMileage({ ...newMileage, date: iso })}
                 />
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">
+                <label className="block text-sm text-[--color-revis-gray] mb-1">
                   {t('value')} ({getCurrencySymbol(currency, getLocaleFromLanguage(language))})
                 </label>
                 <input
                   inputMode="decimal"
                   placeholder={t('valuePlaceholderDecimal')}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newMileage.valor || ''}
                   onChange={e => {
                     const decSep = getLocaleDecimalSeparator(language);
@@ -6200,11 +7198,11 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('litersLabel')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('litersLabel')}</label>
                 <input
                   inputMode="decimal"
                   placeholder={t('litersPlaceholderDecimal')}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newMileage.litros || ''}
                   onChange={e => {
                     const decSep = getLocaleDecimalSeparator(language);
@@ -6218,12 +7216,12 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-sm text-revis-gray mb-1">{t('currentKmLabel')}</label>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('currentKmLabel')}</label>
                 <input
                   required
                   inputMode="numeric"
                   placeholder={t('mileagePlaceholderZero')}
-                  className="w-full bg-revis-dark-gray border border-transparent focus:border-revis-green rounded-xl p-4 text-revis-light-gray outline-none transition-colors"
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors"
                   value={newMileage.mileage || ''}
                   onChange={e => {
                     const val = e.target.value.replace(/\D/g, '');
@@ -6233,10 +7231,45 @@ export default function App() {
                 />
               </div>
 
+              <div>
+                <label className="block text-sm text-[--color-revis-gray] mb-1">{t('notesLabel')}</label>
+                <textarea
+                  maxLength={200}
+                  className="w-full glass border border-transparent focus:border-[#34a06a] rounded-xl p-4 text-[--color-text] outline-none transition-colors resize-none h-24"
+                  value={newMileage.notes || ''}
+                  onChange={e => setNewMileage({...newMileage, notes: e.target.value})}
+                  placeholder={t('mileageNotesPlaceholder')}
+                />
+                <div className="flex items-center justify-between mt-1">
+                  <label
+                    htmlFor="mileage-attachment-input"
+                    className={`text-xs font-medium flex items-center gap-1.5 cursor-pointer transition-colors ${
+                      newMileage.attachment_path ? 'text-[#34a06a]' : 'text-[--color-revis-gray] hover:text-[#34a06a]'
+                    }`}
+                  >
+                    {isUploadingAttachment ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Paperclip className="w-3.5 h-3.5" />}
+                    {newMileage.attachment_path ? t('attachmentAdded') : t('attachmentAddButton')}
+                  </label>
+                  <span className="text-xs text-[--color-revis-gray]">{(newMileage.notes?.length || 0)}/200</span>
+                </div>
+                <input
+                  id="mileage-attachment-input"
+                  type="file"
+                  accept="application/pdf,image/jpeg,image/png,image/webp"
+                  className="hidden"
+                  disabled={isUploadingAttachment}
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) void handleRecordAttachmentUpload(file, 'mileage', path => setNewMileage(prev => ({ ...prev, attachment_path: path })));
+                    e.target.value = '';
+                  }}
+                />
+              </div>
+
               <button
                 type="submit"
                 disabled={isSubmittingMileage || isDeletingRecord}
-                className="w-full bg-revis-green text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors mt-8 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="w-full bg-[#34a06a] text-black font-bold py-4 rounded-xl hover:bg-opacity-90 transition-colors mt-8 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSubmittingMileage
                   ? t('saving')
@@ -6245,6 +7278,7 @@ export default function App() {
                   : t('addButton')}
               </button>
             </form>
+          </div>
           </div>
         </div>
       )}
@@ -6256,11 +7290,11 @@ export default function App() {
           onClick={closeViewRecord}
         >
           <div
-            className="bg-revis-dark-gray rounded-2xl p-6 max-w-md w-full border border-revis-gray/20 shadow-xl"
+            className="glass rounded-2xl p-6 max-w-md w-full border border-[--color-border] shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex justify-between items-start mb-5">
-              <h3 className="text-xl font-bold text-revis-green">
+              <h3 className="text-xl font-bold text-[#34a06a]">
                 {viewingRecord.kind === 'mileage' && t('viewFuelingTitle')}
                 {viewingRecord.kind === 'maintenance' && t('viewMaintenanceTitle')}
                 {viewingRecord.kind === 'financial' && t('viewFinancialTitle')}
@@ -6269,7 +7303,7 @@ export default function App() {
                 type="button"
                 onClick={closeViewRecord}
                 aria-label={t('closeButton')}
-                className="text-revis-gray hover:text-revis-light-gray p-1 rounded-lg transition-colors"
+                className="text-[--color-revis-gray] hover:text-[--color-text] p-1 rounded-lg transition-colors"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -6279,6 +7313,9 @@ export default function App() {
               {viewingRecord.kind === 'mileage' && (() => {
                 // Recalcula o KM/L do registro selecionado a partir do histórico do veículo,
                 // respeitando a mesma regra cronológica usada na listagem.
+                const mileageNotes = typeof (viewingRecord.data as any)?.notes === 'string'
+                  ? (viewingRecord.data as any).notes
+                  : '';
                 const all = selectedVehicle?.mileage_history || [];
                 const sorted = [...all].sort((a, b) => {
                   const da = new Date(a.date).getTime();
@@ -6300,32 +7337,32 @@ export default function App() {
                 return (
                   <>
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('date')}</dt>
-                      <dd className="text-revis-light-gray">{formatAppDate(viewingRecord.data.date, dateFormat)}</dd>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('date')}</dt>
+                      <dd className="text-[--color-text]">{formatAppDate(viewingRecord.data.date, dateFormat)}</dd>
                     </div>
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('value')}</dt>
-                      <dd className="text-revis-green font-semibold">
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('value')}</dt>
+                      <dd className="text-[#34a06a] font-semibold">
                         {viewingRecord.data.valor !== null && viewingRecord.data.valor !== undefined
                           ? formatAppCurrency(Number(viewingRecord.data.valor), currency, language)
                           : '-'}
                       </dd>
                     </div>
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('litersLabel')}</dt>
-                      <dd className="text-revis-light-gray">
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('litersLabel')}</dt>
+                      <dd className="text-[--color-text]">
                         {viewingRecord.data.litros !== null && viewingRecord.data.litros !== undefined
                           ? `${formatDecimal(Number(viewingRecord.data.litros), language, 2)} ${t('litersShort')}`
                           : '-'}
                       </dd>
                     </div>
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('km')}</dt>
-                      <dd className="text-revis-light-gray font-semibold">{(viewingRecord.data.mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km</dd>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('km')}</dt>
+                      <dd className="text-[--color-text] font-semibold">{(viewingRecord.data.mileage || 0).toLocaleString(getLocaleFromLanguage(language))} km</dd>
                     </div>
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('fuelEfficiency')}</dt>
-                      <dd className={isInitial ? 'text-revis-gray' : 'text-revis-light-gray font-semibold'}>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('fuelEfficiency')}</dt>
+                      <dd className={isInitial ? 'text-[--color-revis-gray]' : 'text-[--color-text] font-semibold'}>
                         {isInitial
                           ? t('initialRecord')
                           : kmPerLiter !== null
@@ -6333,6 +7370,14 @@ export default function App() {
                           : '-'}
                       </dd>
                     </div>
+                    {mileageNotes && (
+                      <div>
+                        <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('notesLabel')}</dt>
+                        <dd className="text-[--color-text] whitespace-pre-wrap break-words">
+                          {mileageNotesLabel(mileageNotes)}
+                        </dd>
+                      </div>
+                    )}
                   </>
                 );
               })()}
@@ -6340,26 +7385,26 @@ export default function App() {
               {viewingRecord.kind === 'maintenance' && (
                 <>
                   <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('date')}</dt>
-                    <dd className="text-revis-light-gray">{formatAppDate(viewingRecord.data.date, dateFormat)}</dd>
+                    <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('date')}</dt>
+                    <dd className="text-[--color-text]">{formatAppDate(viewingRecord.data.date, dateFormat)}</dd>
                   </div>
                   {viewingRecord.data.type && (
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('typeLabel')}</dt>
-                      <dd className="text-revis-light-gray">{viewingRecord.data.type}</dd>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('typeLabel')}</dt>
+                      <dd className="text-[--color-text]">{maintenanceTypeLabel(viewingRecord.data.type)}</dd>
                     </div>
                   )}
                   <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('descriptionLabel')}</dt>
-                    <dd className="text-revis-light-gray whitespace-pre-wrap break-words">{viewingRecord.data.description || '-'}</dd>
+                    <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('descriptionLabel')}</dt>
+                    <dd className="text-[--color-text] whitespace-pre-wrap break-words">{viewingRecord.data.description || '-'}</dd>
                   </div>
                   <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('responsible')}</dt>
-                    <dd className="text-revis-light-gray break-words">{viewingRecord.data.provider || '-'}</dd>
+                    <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('responsible')}</dt>
+                    <dd className="text-[--color-text] break-words">{viewingRecord.data.provider || '-'}</dd>
                   </div>
                   <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('value')}</dt>
-                    <dd className="text-revis-green font-semibold">{formatAppCurrency(viewingRecord.data.cost, currency, language)}</dd>
+                    <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('value')}</dt>
+                    <dd className="text-[#34a06a] font-semibold">{formatAppCurrency(viewingRecord.data.cost, currency, language)}</dd>
                   </div>
                 </>
               )}
@@ -6367,45 +7412,45 @@ export default function App() {
               {viewingRecord.kind === 'financial' && (
                 <>
                   <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('typeLabel')}</dt>
-                    <dd className="text-revis-light-gray">{viewingRecord.data.type}</dd>
+                    <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('typeLabel')}</dt>
+                    <dd className="text-[--color-text]">{financialTypeLabel(viewingRecord.data.type)}</dd>
                   </div>
                   <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('descriptionLabel')}</dt>
-                    <dd className="text-revis-light-gray whitespace-pre-wrap break-words">{viewingRecord.data.description || '-'}</dd>
+                    <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('descriptionLabel')}</dt>
+                    <dd className="text-[--color-text] whitespace-pre-wrap break-words">{viewingRecord.data.description || '-'}</dd>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('dueDateLabel')}</dt>
-                      <dd className="text-revis-light-gray">{formatAppDate(viewingRecord.data.due_date, dateFormat)}</dd>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('dueDateLabel')}</dt>
+                      <dd className="text-[--color-text]">{formatAppDate(viewingRecord.data.due_date, dateFormat)}</dd>
                     </div>
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('statusLabel')}</dt>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('statusLabel')}</dt>
                       <dd className={`font-semibold ${
                         viewingRecord.data.status === 'Pago'
-                          ? 'text-revis-green'
+                          ? 'text-[#34a06a]'
                           : viewingRecord.data.status === 'Atrasado'
-                          ? 'text-revis-alert-critical'
-                          : 'text-revis-alert-medium'
+                          ? 'text-[#e0473f]'
+                          : 'text-[#ffcc00]'
                       }`}>
-                        {viewingRecord.data.status}
+                        {financialStatusLabel(viewingRecord.data.status)}
                       </dd>
                     </div>
                   </div>
                   <div>
-                    <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('value')}</dt>
-                    <dd className="text-revis-green font-semibold">{formatAppCurrency(viewingRecord.data.value, currency, language)}</dd>
+                    <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('value')}</dt>
+                    <dd className="text-[#34a06a] font-semibold">{formatAppCurrency(viewingRecord.data.value, currency, language)}</dd>
                   </div>
                   {viewingRecord.data.payment_date && (
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('paymentDateLabel')}</dt>
-                      <dd className="text-revis-light-gray">{formatAppDate(viewingRecord.data.payment_date, dateFormat)}</dd>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('paymentDateLabel')}</dt>
+                      <dd className="text-[--color-text]">{formatAppDate(viewingRecord.data.payment_date, dateFormat)}</dd>
                     </div>
                   )}
                   {viewingRecord.data.notes && (
                     <div>
-                      <dt className="text-xs text-revis-gray uppercase tracking-wider mb-1">{t('notesLabel')}</dt>
-                      <dd className="text-revis-light-gray whitespace-pre-wrap break-words">{viewingRecord.data.notes}</dd>
+                      <dt className="text-xs text-[--color-revis-gray] uppercase tracking-wider mb-1">{t('notesLabel')}</dt>
+                      <dd className="text-[--color-text] whitespace-pre-wrap break-words">{viewingRecord.data.notes}</dd>
                     </div>
                   )}
                 </>
@@ -6416,7 +7461,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={closeViewRecord}
-                className="w-full bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="w-full bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('closeButton')}
               </button>
@@ -6432,7 +7477,7 @@ export default function App() {
           onClick={closeSupportModal}
         >
           <div
-            className="bg-revis-dark-gray rounded-2xl p-6 max-w-md w-full border border-revis-gray/20 shadow-xl"
+            className="glass rounded-2xl p-6 max-w-md w-full border border-[--color-border] shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex justify-between items-start mb-5">
@@ -6442,12 +7487,12 @@ export default function App() {
                     type="button"
                     onClick={() => setSupportMethod(null)}
                     aria-label={t('back')}
-                    className="text-revis-gray hover:text-revis-light-gray p-1 rounded-lg transition-colors -ml-1"
+                    className="text-[--color-revis-gray] hover:text-[--color-text] p-1 rounded-lg transition-colors -ml-1"
                   >
                     <ArrowLeft className="w-5 h-5" />
                   </button>
                 )}
-                <h3 className="text-xl font-bold text-revis-green">
+                <h3 className="text-xl font-bold text-[#34a06a]">
                   {supportMethod === 'email'
                     ? t('supportEmailTitle')
                     : supportMethod === 'whatsapp'
@@ -6459,7 +7504,7 @@ export default function App() {
                 type="button"
                 onClick={closeSupportModal}
                 aria-label={t('closeButton')}
-                className="text-revis-gray hover:text-revis-light-gray p-1 rounded-lg transition-colors"
+                className="text-[--color-revis-gray] hover:text-[--color-text] p-1 rounded-lg transition-colors"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -6467,25 +7512,25 @@ export default function App() {
 
             {supportMethod === null && (
               <div className="space-y-5">
-                <p className="text-sm text-revis-light-gray">
+                <p className="text-sm text-[--color-text]">
                   {t('supportChooseMethod')}
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <button
                     type="button"
                     onClick={() => setSupportMethod('email')}
-                    className="flex flex-col items-center justify-center gap-2 p-5 rounded-xl border border-revis-gray/30 bg-revis-black/30 hover:bg-revis-gray/10 hover:border-revis-gray/60 transition-colors"
+                    className="flex flex-col items-center justify-center gap-2 p-5 rounded-xl border border-[--color-border] bg-black/30 hover:bg-white/5 hover:border-revis-gray/60 transition-colors"
                   >
-                    <Mail className="w-8 h-8 text-revis-light-gray" />
-                    <span className="font-medium text-revis-heading">{t('supportEmail')}</span>
+                    <Mail className="w-8 h-8 text-[--color-text]" />
+                    <span className="font-medium text-[--color-heading] font-display">{t('supportEmail')}</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => setSupportMethod('whatsapp')}
-                    className="flex flex-col items-center justify-center gap-2 p-5 rounded-xl border border-revis-gray/30 bg-revis-black/30 hover:bg-revis-gray/10 hover:border-revis-gray/60 transition-colors"
+                    className="flex flex-col items-center justify-center gap-2 p-5 rounded-xl border border-[--color-border] bg-black/30 hover:bg-white/5 hover:border-revis-gray/60 transition-colors"
                   >
                     <WhatsAppIcon className="w-8 h-8 text-[#25D366]" />
-                    <span className="font-medium text-revis-heading">{t('supportWhatsapp')}</span>
+                    <span className="font-medium text-[--color-heading] font-display">{t('supportWhatsapp')}</span>
                   </button>
                 </div>
               </div>
@@ -6493,12 +7538,12 @@ export default function App() {
 
             {supportMethod === 'email' && (
               <div className="space-y-5">
-                <p className="text-sm text-revis-light-gray">
+                <p className="text-sm text-[--color-text]">
                   {t('supportEmailDesc')}
                 </p>
                 <a
-                  href="mailto:suporte@revisautoapp.com.br"
-                  className="w-full inline-flex items-center justify-center gap-2 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                  href="mailto:dev@revisautoapp.com.br"
+                  className="w-full inline-flex items-center justify-center gap-2 bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
                 >
                   <Mail className="w-5 h-5" />
                   {t('supportEmailCta')}
@@ -6508,7 +7553,7 @@ export default function App() {
 
             {supportMethod === 'whatsapp' && (
               <div className="space-y-5">
-                <p className="text-sm text-revis-light-gray">
+                <p className="text-sm text-[--color-text]">
                   {t('supportWhatsappDesc')}
                 </p>
                 <a
@@ -6534,18 +7579,18 @@ export default function App() {
       {/* Cancel Add Vehicle Confirmation Modal */}
       {showCancelAddVehicleConfirmation && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20">
-            <h3 className="text-xl font-bold text-revis-heading mb-2">{t('confirmCancelAddVehicle')}</h3>
+          <div className="glass rounded-2xl p-6 max-w-sm w-full border border-[--color-border]">
+            <h3 className="text-xl font-bold text-[--color-heading] font-display mb-2">{t('confirmCancelAddVehicle')}</h3>
             <div className="flex gap-3 mt-6">
               <button 
                 onClick={() => setShowCancelAddVehicleConfirmation(false)}
-                className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/10 transition-colors"
+                className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/5 transition-colors"
               >
                 {t('no')}
               </button>
               <button 
                 onClick={handleConfirmCancelAddVehicle}
-                className="flex-1 bg-revis-alert-critical text-white font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-revis-alert-critical text-[--color-heading] font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -6557,18 +7602,18 @@ export default function App() {
       {/* Edit Confirmation Modal */}
       {showEditConfirmation && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20 shadow-xl">
-            <h3 className="text-lg font-bold text-revis-heading mb-2">{t('confirmChanges')}</h3>
+          <div className="glass rounded-2xl p-6 max-w-sm w-full border border-[--color-border] shadow-xl">
+            <h3 className="text-lg font-bold text-[--color-heading] font-display mb-2">{t('confirmChanges')}</h3>
             <div className="flex gap-3 mt-6">
               <button 
                 onClick={() => setShowEditConfirmation(false)}
-                className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/20 transition-colors"
+                className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/8 transition-colors"
               >
                 {t('no')}
               </button>
               <button 
                 onClick={handleConfirmSave}
-                className="flex-1 bg-revis-green text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-[#34a06a] text-black font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -6580,19 +7625,19 @@ export default function App() {
       {/* Cancel Edit Confirmation Modal */}
       {showCancelEditConfirmation && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-sm w-full border border-revis-gray/20 shadow-xl">
-            <h3 className="text-lg font-bold text-revis-heading mb-2">{t('cancelChanges')}</h3>
-            <p className="text-revis-gray text-sm">{t('cancelChangesMsg')}</p>
+          <div className="glass rounded-2xl p-6 max-w-sm w-full border border-[--color-border] shadow-xl">
+            <h3 className="text-lg font-bold text-[--color-heading] font-display mb-2">{t('cancelChanges')}</h3>
+            <p className="text-[--color-revis-gray] text-sm">{t('cancelChangesMsg')}</p>
             <div className="flex gap-3 mt-6">
               <button 
                 onClick={() => setShowCancelEditConfirmation(false)}
-                className="flex-1 bg-revis-dark-gray border border-revis-gray/30 text-revis-light-gray font-bold py-3 rounded-xl hover:bg-revis-gray/20 transition-colors"
+                className="flex-1 glass border border-[--color-border] text-[--color-text] font-bold py-3 rounded-xl hover:bg-white/8 transition-colors"
               >
                 {t('no')}
               </button>
               <button 
                 onClick={handleConfirmCancel}
-                className="flex-1 bg-revis-alert-critical text-white font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
+                className="flex-1 bg-revis-alert-critical text-[--color-heading] font-bold py-3 rounded-xl hover:bg-opacity-90 transition-colors"
               >
                 {t('yes')}
               </button>
@@ -6603,13 +7648,13 @@ export default function App() {
       {/* Planos / Upgrade Modal */}
       {showUpgradeModal && (
         <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200 overflow-y-auto">
-          <div className="bg-revis-dark-gray rounded-2xl p-5 sm:p-6 max-w-5xl w-full border border-revis-gray/20 shadow-xl relative my-4 max-h-[92vh] overflow-y-auto">
+          <div className="plans-modal-panel rounded-2xl p-5 sm:p-6 max-w-5xl w-full border border-[--color-border] shadow-xl relative my-4 max-h-[92vh] overflow-y-auto">
             <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-revis-green via-revis-green/70 to-revis-green rounded-t-2xl" />
             <button
               type="button"
               aria-label={t('cancel')}
               onClick={() => !checkoutLoadingPlan && setShowUpgradeModal(false)}
-              className="absolute top-3 right-3 p-2 rounded-lg text-revis-gray hover:text-revis-heading hover:bg-revis-black/30 transition-colors disabled:opacity-40"
+              className="absolute top-3 right-3 p-2 rounded-lg text-[--color-revis-gray] hover:text-[--color-heading] font-display hover:bg-black/30 transition-colors disabled:opacity-40"
               disabled={!!checkoutLoadingPlan}
             >
               <X className="w-5 h-5" />
@@ -6617,8 +7662,8 @@ export default function App() {
 
             <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 mb-6 pr-8">
               <div>
-                <h3 className="text-2xl font-bold text-revis-heading">{t('plans')}</h3>
-                <p className="text-revis-gray text-sm mt-1 max-w-xl">{t('pricingPageSubtitle')}</p>
+                <h3 className="text-2xl font-bold text-[--color-heading] font-display">{t('plans')}</h3>
+                <p className="text-[--color-revis-gray] text-sm mt-1 max-w-xl">{t('pricingPageSubtitle')}</p>
                 {(normalizePlan(user?.plan) === 'plus' || normalizePlan(user?.plan) === 'premium') && (
                   <button
                     type="button"
@@ -6626,7 +7671,7 @@ export default function App() {
                       setSubscriptionManageView('menu');
                       setSubscriptionManageOpen(true);
                     }}
-                    className="mt-3 block text-xs text-revis-green/90 hover:text-revis-green font-medium underline underline-offset-2"
+                    className="mt-3 block text-xs text-[#34a06a]/90 hover:text-[#34a06a] font-medium underline underline-offset-2"
                   >
                     {t('manageSubscription')}
                   </button>
@@ -6635,7 +7680,7 @@ export default function App() {
               <div className="flex items-center gap-3 shrink-0">
                 <span
                   className={`text-xs font-semibold whitespace-nowrap ${
-                    pricingPeriod === 'monthly' ? 'text-revis-heading' : 'text-revis-gray'
+                    pricingPeriod === 'monthly' ? 'text-[--color-heading] font-display' : 'text-[--color-revis-gray]'
                   }`}
                 >
                   {t('billingMonthly')}
@@ -6650,8 +7695,8 @@ export default function App() {
                   }
                   className={`relative inline-flex h-7 w-[3.35rem] shrink-0 rounded-full transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-revis-green/70 ${
                     pricingPeriod === 'annual'
-                      ? 'bg-revis-green'
-                      : 'bg-revis-black/60 border border-revis-gray/30'
+                      ? 'bg-[#34a06a]'
+                      : 'bg-black/60 border border-[--color-border]'
                   }`}
                 >
                   <span
@@ -6662,7 +7707,7 @@ export default function App() {
                 </button>
                 <span
                   className={`text-xs font-semibold whitespace-nowrap ${
-                    pricingPeriod === 'annual' ? 'text-revis-heading' : 'text-revis-gray'
+                    pricingPeriod === 'annual' ? 'text-[--color-heading] font-display' : 'text-[--color-revis-gray]'
                   }`}
                 >
                   {t('billingAnnual')}
@@ -6774,7 +7819,7 @@ export default function App() {
                     <button
                       type="button"
                       disabled
-                      className={`${baseCls} shrink-0 bg-revis-black/35 text-revis-gray border border-revis-gray/35`}
+                      className={`${baseCls} shrink-0 bg-black/35 text-[--color-revis-gray] border border-revis-gray/35`}
                     >
                       {t('planCtaYourCurrentPlan')}
                     </button>
@@ -6796,7 +7841,7 @@ export default function App() {
                       type="button"
                       disabled={busy}
                       onClick={() => handleNativePurchase('plus', pricingPeriod)}
-                      className={`${baseCls} shrink-0 bg-revis-green text-black hover:bg-opacity-90 shadow-md shadow-black/25`}
+                      className={`${baseCls} shrink-0 bg-[#34a06a] text-black hover:bg-opacity-90 shadow-md shadow-black/25`}
                     >
                       {checkoutLoadingPlan === 'plus'
                         ? t('checkoutGeneratingLink')
@@ -6812,7 +7857,7 @@ export default function App() {
                       type="button"
                       disabled={busy}
                       onClick={() => handleNativePurchase('premium', pricingPeriod)}
-                      className={`${baseCls} shrink-0 bg-revis-black/55 text-green-400 border-2 border-green-500 hover:bg-green-500/15 shadow-md shadow-black/25`}
+                      className={`${baseCls} shrink-0 bg-black/55 text-green-400 border-2 border-green-500 hover:bg-green-500/15 shadow-md shadow-black/25`}
                     >
                       {checkoutLoadingPlan === 'premium'
                         ? t('checkoutGeneratingLink')
@@ -6838,25 +7883,25 @@ export default function App() {
                           key={plan}
                           className={`flex h-full min-h-0 flex-col rounded-xl border p-4 sm:p-5 ${
                             highlightPlus
-                              ? 'border-revis-green/50 bg-revis-green/[0.08] md:shadow-md md:shadow-revis-green/5'
+                              ? 'border-[#34a06a]/50 bg-[#34a06a]/[0.08] md:shadow-md md:shadow-revis-green/5'
                               : highlightPremium
                                 ? 'border-amber-400/35 bg-gradient-to-b from-amber-500/[0.08] to-transparent'
-                                : 'border-revis-gray/25 bg-revis-black/28'
+                                : 'border-revis-gray/25 bg-black/28'
                           }`}
                         >
                           <div className="shrink-0 flex flex-wrap items-start justify-between gap-2 mb-2">
-                            <h4 className="text-lg font-bold text-revis-heading">{t(titleKey)}</h4>
+                            <h4 className="text-lg font-bold text-[--color-heading] font-display">{t(titleKey)}</h4>
                             {tier === plan && (
-                              <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-full bg-revis-gray/25 text-revis-gray whitespace-nowrap">
+                              <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-full bg-revis-gray/25 text-[--color-revis-gray] whitespace-nowrap">
                                 {t('planBadgeCurrent')}
                               </span>
                             )}
                           </div>
 
-                          <div className="shrink-0 text-xl font-bold text-revis-green leading-tight">
+                          <div className="shrink-0 text-xl font-bold text-[#34a06a] leading-tight">
                             {headline}
                             {suffix ? (
-                              <span className="block sm:inline text-sm font-normal text-revis-gray mt-0.5 sm:mt-0 sm:ml-1">
+                              <span className="block sm:inline text-sm font-normal text-[--color-revis-gray] mt-0.5 sm:mt-0 sm:ml-1">
                                 {suffix}
                               </span>
                             ) : null}
@@ -6875,8 +7920,8 @@ export default function App() {
                                 <p
                                   className={`text-left font-medium min-w-0 ${
                                     row.excluded
-                                      ? 'text-revis-gray/55'
-                                      : 'text-revis-heading'
+                                      ? 'text-[--color-revis-gray]/55'
+                                      : 'text-[--color-heading] font-display'
                                   }`}
                                 >
                                   {row.label}
@@ -6891,7 +7936,7 @@ export default function App() {
                     })}
                   </div>
 
-                  <p className="text-[10px] text-revis-gray text-center mt-5">{t('premiumFooterNote')}</p>
+                  <p className="text-[10px] text-[--color-revis-gray] text-center mt-5">{t('premiumFooterNote')}</p>
                 </>
               );
             })()}
@@ -6905,31 +7950,31 @@ export default function App() {
           aria-modal="true"
           aria-labelledby="subscription-manage-title"
         >
-          <div className="bg-revis-dark-gray rounded-2xl p-6 max-w-md w-full border border-revis-gray/25 shadow-xl">
-            <h3 id="subscription-manage-title" className="text-lg font-bold text-revis-heading mb-4">
+          <div className="glass rounded-2xl p-6 max-w-md w-full border border-revis-gray/25 shadow-xl">
+            <h3 id="subscription-manage-title" className="text-lg font-bold text-[--color-heading] font-display mb-4">
               {t('subscriptionManageTitle')}
             </h3>
 
             {subscriptionManageView === 'menu' && (
               <div className="space-y-4">
-                <p className="text-sm text-revis-gray">{t('subscriptionManagePickTitle')}</p>
+                <p className="text-sm text-[--color-revis-gray]">{t('subscriptionManagePickTitle')}</p>
                 <button
                   type="button"
-                  className="w-full py-3 rounded-xl bg-revis-black/40 border border-revis-gray/25 text-revis-heading font-semibold text-sm hover:bg-revis-black/55"
+                  className="w-full py-3 rounded-xl bg-black/40 border border-revis-gray/25 text-[--color-heading] font-display font-semibold text-sm hover:bg-black/55"
                   onClick={() => setSubscriptionManageView('changePlan')}
                 >
                   {t('subscriptionChangePlan')}
                 </button>
                 <button
                   type="button"
-                  className="w-full py-3 rounded-xl bg-revis-black/40 border border-revis-gray/25 text-revis-heading font-semibold text-sm hover:bg-revis-black/55"
+                  className="w-full py-3 rounded-xl bg-black/40 border border-revis-gray/25 text-[--color-heading] font-display font-semibold text-sm hover:bg-black/55"
                   onClick={() => setSubscriptionManageView('cancelInfo')}
                 >
                   {t('subscriptionCancelPlan')}
                 </button>
                 <button
                   type="button"
-                  className="w-full py-3 text-revis-gray text-sm font-medium"
+                  className="w-full py-3 text-[--color-revis-gray] text-sm font-medium"
                   onClick={() => setSubscriptionManageOpen(false)}
                 >
                   {t('subscriptionManageClose')}
@@ -6939,7 +7984,7 @@ export default function App() {
 
             {subscriptionManageView === 'changePlan' && (
               <div className="space-y-4">
-                <p className="text-sm text-revis-light-gray leading-relaxed">
+                <p className="text-sm text-[--color-text] leading-relaxed">
                   {user?.subscription_period_end
                     ? t('subscriptionChangePlanExplain').replace(
                         '{date}',
@@ -6949,7 +7994,7 @@ export default function App() {
                 </p>
                 <button
                   type="button"
-                  className="w-full py-3 rounded-xl bg-revis-alert-critical/90 text-white font-bold text-sm"
+                  className="w-full py-3 rounded-xl bg-revis-alert-critical/90 text-[--color-heading] font-bold text-sm"
                   onClick={() =>
                     window.open(mercadoPagoSubscriptionsPortalUrl(), '_blank', 'noopener,noreferrer')
                   }
@@ -6958,7 +8003,7 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className="w-full py-3 rounded-xl bg-revis-green text-black font-bold text-sm"
+                  className="w-full py-3 rounded-xl bg-[#34a06a] text-black font-bold text-sm"
                   onClick={() => {
                     setSubscriptionManageOpen(false);
                     setShowUpgradeModal(false);
@@ -6972,10 +8017,10 @@ export default function App() {
 
             {subscriptionManageView === 'cancelInfo' && (
               <div className="space-y-4">
-                <p className="text-sm text-revis-light-gray leading-relaxed">{t('subscriptionCancelExplain')}</p>
+                <p className="text-sm text-[--color-text] leading-relaxed">{t('subscriptionCancelExplain')}</p>
                 <button
                   type="button"
-                  className="w-full py-3 rounded-xl bg-revis-green text-black font-bold text-sm"
+                  className="w-full py-3 rounded-xl bg-[#34a06a] text-black font-bold text-sm"
                   onClick={() =>
                     window.open(mercadoPagoSubscriptionsPortalUrl(), '_blank', 'noopener,noreferrer')
                   }
@@ -6984,7 +8029,7 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className="w-full py-3 text-revis-gray text-sm font-medium"
+                  className="w-full py-3 text-[--color-revis-gray] text-sm font-medium"
                   onClick={() => setSubscriptionManageOpen(false)}
                 >
                   {t('subscriptionManageClose')}
@@ -7003,7 +8048,7 @@ export default function App() {
             className={`rounded-xl px-4 py-3 text-sm font-medium shadow-lg border pointer-events-auto ${
               appToast.tone === 'warning'
                 ? 'bg-amber-500/15 border-amber-400/40 text-amber-100'
-                : 'bg-revis-dark-gray border-revis-gray/30 text-revis-heading'
+                : 'glass border-[--color-border] text-[--color-heading] font-display'
             }`}
           >
             {appToast.message}

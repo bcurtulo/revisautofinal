@@ -24,6 +24,8 @@ export interface MileageLog {
   mileage: number;
   valor?: number | null;
   litros?: number | null;
+  notes?: string;
+  attachment_path?: string | null;
 }
 
 export interface Vehicle {
@@ -37,6 +39,8 @@ export interface Vehicle {
   last_service_date: string;
   nickname?: string;
   color?: string;
+  plate?: string;
+  document_path?: string | null;
   mileage_history?: MileageLog[];
   status?: 'active' | 'archived';
   deleted_at?: string;
@@ -51,6 +55,8 @@ export interface MaintenanceLog {
   cost: number;
   photo_path?: string;
   provider?: string;
+  notes?: string;
+  attachment_path?: string | null;
 }
 
 export interface FinancialRecord {
@@ -63,6 +69,7 @@ export interface FinancialRecord {
   status: 'Pago' | 'Em aberto' | 'Atrasado';
   payment_date?: string;
   notes?: string;
+  attachment_path?: string | null;
 }
 
 export interface ChatSession {
