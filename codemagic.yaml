@@ -19,7 +19,7 @@ workflows:
           include: true
     scripts:
       - name: Instalar dependências do projeto
-        script: npm install
+        script: npm install --legacy-peer-deps
       - name: Compilar o site (build) com a URL de produção
         script: npm run build
       - name: Sincronizar o projeto iOS do Capacitor
