@@ -1,0 +1,66 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "revisauto",
+  "main": "server.ts",
+
+  // node:http exige compatibility_date posterior a 2025-08-15.
+  "compatibility_date": "2026-07-01",
+
+  // nodejs_compat  -> node:crypto, node:buffer, node:stream etc.
+  // enable_nodejs_http_server_modules -> http.createServer, exigido pelo Express.
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    // Saída do `vite build`.
+    "directory": "./dist",
+
+    // Qualquer rota que não seja um arquivo real devolve index.html.
+    // É o que faz /checkout/return e /reset-password funcionarem.
+    "not_found_handling": "single-page-application",
+
+    // As rotas de API vão para o Worker ANTES de tentar servir um arquivo.
+    // Sem isto, /api/login cairia no fallback e devolveria o index.html.
+    "run_worker_first": ["/api/*"]
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  // Rate limiting nativo do Workers — recurso gratuito do próprio runtime,
+  // não é o produto de WAF (que é pago). Protege contra força bruta no
+  // login, spam de e-mail na recuperação de senha, e abuso de custo no
+  // chat com IA. period só aceita 10 ou 60 (segundos), por limitação da API.
+  "ratelimits": [
+    {
+      "name": "LOGIN_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 5, "period": 60 }
+    },
+    {
+      "name": "PASSWORD_RESET_RATE_LIMITER",
+      "namespace_id": "1002",
+      "simple": { "limit": 3, "period": 60 }
+    },
+    {
+      "name": "AI_CHAT_RATE_LIMITER",
+      "namespace_id": "1003",
+      "simple": { "limit": 10, "period": 60 }
+    }
+  ]
+
+  // Segredos NÃO ficam aqui — este arquivo vai para o Git.
+  // Cadastre com:  npx wrangler secret put NOME_DA_VARIAVEL
+  //
+  //   VITE_SUPABASE_URL
+  //   VITE_SUPABASE_ANON_KEY
+  //   SUPABASE_SERVICE_ROLE_KEY
+  //   GEMINI_API_KEY
+  //   MP_ACCESS_TOKEN
+  //   MP_WEBHOOK_SECRET
+  //   MP_BACK_URL
+  //   VITE_APP_URL
+  //   PUBLIC_APP_RESET_URL
+  //
+  // Para desenvolvimento local, use um arquivo .dev.vars (já no .gitignore).
+}

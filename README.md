@@ -1,20 +1,59 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# RevisAuto — Webapp
 
-# Run and deploy your AI Studio app
+Gestão de manutenção, gastos e documentação de veículos.
+Vite + React 19 + TypeScript + Tailwind 4, com backend Express e Supabase.
 
-This contains everything you need to run your app locally.
+Versão web do app anteriormente empacotado com Capacitor para Android.
 
-View your app in AI Studio: https://ai.studio/apps/086c2253-e55b-43e8-9a52-342ccd3df189
+## Stack
 
-## Run Locally
+- **Front:** Vite, React 19, TypeScript, Tailwind CSS 4, lucide-react, motion
+- **Back:** Express rodando em Cloudflare Workers (node:http)
+- **Banco/Auth:** Supabase
+- **IA:** Google Gemini (assistente "Dr. Graxa")
+- **Pagamentos:** Mercado Pago (assinaturas)
+- **Biometria:** WebAuthn (Face ID / Touch ID / digital / Windows Hello)
 
-**Prerequisites:**  Node.js
+## Rodando localmente
 
+```bash
+npm install
+cp .dev.vars.example .dev.vars   # preencha as chaves
+npm run build
+npm run dev
+```
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+Tudo em `http://localhost:8787`.
+
+## Scripts
+
+| Comando | O que faz |
+|---|---|
+| `npm run dev` | Worker local (front + API) em :8787 |
+| `npm run build` | Gera o `dist/` |
+| `npm run deploy` | Build + publica na Cloudflare |
+| `npm run tail` | Logs do Worker em tempo real |
+| `npm run lint` | Typecheck com `tsc --noEmit` |
+
+## Deploy
+
+Veja **[GUIA-DEPLOY-CLOUDFLARE.md](GUIA-DEPLOY-CLOUDFLARE.md)** para o passo a
+passo completo, incluindo variáveis de ambiente, configuração do Mercado Pago
+e do Supabase, e checklist pós-deploy.
+
+## Estrutura
+
+```
+src/
+  App.tsx           # aplicação (telas, estado, chamadas de API)
+  biometric.ts      # desbloqueio local via WebAuthn
+  plans.ts          # regras de plano (free/plus/premium) e limites
+  translations.ts   # PT-BR, PT-PT, EN, ES
+  constants.ts      # marcas e modelos de veículos
+  types.ts          # tipos compartilhados com o backend
+  utils/format.ts   # datas, moeda, locale
+server.ts           # API Express (roda no Worker)
+mp.ts               # cliente REST do Mercado Pago
+wrangler.jsonc      # configuração do Cloudflare Worker
+supabase/migrations # esquema do banco
+```
