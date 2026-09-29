@@ -1,0 +1,43 @@
+workflows:
+  ios-workflow:
+    name: RevisAuto - iOS App Store
+    max_build_duration: 60
+    integrations:
+      app_store_connect: revisauto_asc
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: br.com.revisautoapp
+      vars:
+        VITE_API_URL: "https://app.revisautoapp.com.br"
+        XCODE_WORKSPACE: "ios/App/App.xcworkspace"
+        XCODE_SCHEME: "App"
+      node: 20
+      xcode: latest
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+    scripts:
+      - name: Instalar dependências do projeto
+        script: npm install
+      - name: Compilar o site (build) com a URL de produção
+        script: npm run build
+      - name: Sincronizar o projeto iOS do Capacitor
+        script: npx cap sync ios
+      - name: Configurar assinatura automática do app
+        script: xcode-project use-profiles
+      - name: Gerar o arquivo .ipa para a App Store
+        script: |
+          xcode-project build-ipa \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
