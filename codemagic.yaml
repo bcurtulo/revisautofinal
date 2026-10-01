@@ -9,6 +9,8 @@ workflows:
         VITE_API_URL: "https://app.revisautoapp.com.br"
         XCODE_WORKSPACE: "ios/App/App.xcworkspace"
         XCODE_SCHEME: "App"
+      groups:
+        - ios_signing
       node: 20
       xcode: latest
     triggering:
