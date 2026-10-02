@@ -7,7 +7,7 @@ workflows:
     environment:
       vars:
         VITE_API_URL: "https://app.revisautoapp.com.br"
-        XCODE_WORKSPACE: "ios/App/App.xcworkspace"
+        XCODE_PROJECT: "ios/App/App.xcodeproj"
         XCODE_SCHEME: "App"
       groups:
         - ios_signing
@@ -37,7 +37,7 @@ workflows:
       - name: Gerar o arquivo .ipa para a App Store
         script: |
           xcode-project build-ipa \
-            --workspace "$XCODE_WORKSPACE" \
+            --project "$XCODE_PROJECT" \
             --scheme "$XCODE_SCHEME"
     artifacts:
       - build/ios/ipa/*.ipa
